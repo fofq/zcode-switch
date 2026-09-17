@@ -13,7 +13,7 @@ use axum::routing::{get, post};
 use axum::Router;
 use serde_json::{json, Value};
 use std::collections::HashMap;
-use std::io::Read;
+use std::io::{BufRead, Read};
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
@@ -258,7 +258,7 @@ async fn chat_completions(State(st): State<Arc<SharedState>>, body: axum::body::
         Ok(r) => r,
         Err(e) => return err_json(StatusCode::BAD_REQUEST, &e),
     };
-    let (api_key, base_url) = match resolve::resolve(st) {
+    let (api_key, base_url) = match resolve::resolve(&st) {
         Ok(x) => x,
         Err(e) => {
             stats().errors.fetch_add(1, Ordering::Relaxed);
