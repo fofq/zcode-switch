@@ -1258,7 +1258,7 @@ pub fn all_account_api_keys(paths: &Paths) -> Result<Vec<AccountKeyLine>, String
             let info = local_api_key(a, &paths.home);
             AccountKeyLine {
                 name: a.name.clone(),
-                api_key: info.map(|i| i.api_key).unwrap_or_default(),
+                api_key: info.as_ref().map(|i| i.api_key.clone()).unwrap_or_default(),
                 has_key: info.is_some(),
             }
         })
