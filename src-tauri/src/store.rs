@@ -1198,6 +1198,29 @@ pub fn account_api_key(paths: &Paths, id: &str) -> Result<Option<ApiKeyInfo>, St
             }
         }
     }
+    // 配置快照里没有现成 key：像登录/热切换那样现场解析（上游会自动创建 zcode-api-key）
+    let provider = cred_plain(&acc.credentials, "oauth:active_provider", &paths.home)
+        .filter(|p| p == "bigmodel" || p == "zai");
+    if let Some(provider) = provider {
+        let access = cred_plain(
+            &acc.credentials,
+            &format!("oauth:{provider}:access_token"),
+            &paths.home,
+        ).unwrap_or_default();
+        let key = match provider.as_str() {
+            "zai" => oauth::resolve_zai_business_token(&access)
+                .and_then(|biz| oauth::resolve_biz_api_key(oauth::ZAI_API_BASE, &format!("Bearer {biz}"), true)),
+            _ => oauth::resolve_biz_api_key(oauth::BIGMODEL_BIZ_BASE, &access, false),
+        };
+        if let Some(key) = key.filter(|k| k.trim().len() > 20) {
+            let base = if provider == "zai" { oauth::ZAI_ANTHROPIC_BASE } else { oauth::BIGMODEL_ANTHROPIC_BASE };
+            return Ok(Some(ApiKeyInfo {
+                label: "Coding Plan".into(),
+                api_key: key.trim().to_string(),
+                base_url: base.into(),
+            }));
+        }
+    }
     // 回退：start-plan JWT + 固定端点
     if let Some(jwt) = cred_plain(&acc.credentials, "zcodejwttoken", &paths.home) {
         if jwt.trim().len() > 20 {

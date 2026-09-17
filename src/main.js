@@ -468,6 +468,7 @@ function twoApiFormHtml() {
   const st = state || {};
   const on = !!st.two_api_on;
   const port = st.two_api_port || 8117;
+  const base = `http://127.0.0.1:${port}`;
   const token = st.two_api_token || "";
   const tokenShown = !token ? t("two.tokenEmpty") : twoShowToken ? token : token.slice(0, 10) + "••••••••";
   const acctOpts = [
@@ -1296,8 +1297,8 @@ const actions = {
   async copyApiKey(id) {
     try {
       const r = await invoke("account_api_key", { id });
-      if (!r?.api_key) { toast(t("list.apiKeyNone"), "warn"); return; }
-      if (await copyText(r.api_key)) toast(t("list.apiKeyCopied"));
+      if (!r?.apiKey) { toast(t("list.apiKeyNone"), "warn"); return; }
+      if (await copyText(r.apiKey)) toast(t("list.apiKeyCopied"));
       else toast(t("list.copyFail"), "err");
     } catch (e) { toast(stripErr(e), "err"); }
   },
