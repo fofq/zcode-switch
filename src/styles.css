@@ -1365,7 +1365,10 @@ input:focus-visible,
 .hdot.fail { background: #8a6a6a; }
 .hdot.unknown { background: #4a4e57; }
 
-.rq { display: flex; align-items: center; gap: 7px; flex: 0 1 152px; min-width: 86px; }
+.rq { display: flex; align-items: center; gap: 7px; flex: 1; min-width: 0; }
+/* 行右侧信息区（临期 chip + 额度小条）：紧凑模式下悬停时被操作按钮替换 */
+.row-info { display: flex; align-items: center; gap: 8px; flex: 0 1 152px; min-width: 86px; }
+.row-info:empty { display: none; }
 .rq-bar { flex: 1; height: 6px; border-radius: 3px; background: #2b2e36; overflow: hidden; }
 .rq-bar > i { display: block; height: 100%; background: var(--mint); border-radius: 3px; transition: width .3s ease; }
 .rq.low .rq-bar > i { background: var(--amber); }
@@ -1388,8 +1391,24 @@ input:focus-visible,
 .row.slim { padding: 7px 10px 7px 12px; margin-bottom: 5px; }
 .row.slim .row-top { gap: 8px; }
 .row.slim .row-name { font-size: 15.5px; overflow: hidden; }
-.row.slim .row-top > .meta-chip { flex: none; margin-right: 2px; }
+.row.slim .row-info .meta-chip { flex: none; }
 .row.slim .row-meta { display: none; }
+.row.slim .row-tools { display: none; }
+/* 悬停 / 键盘聚焦时：额度信息区让位给操作按钮（visibility 占位避免跳动） */
+.row.slim:hover .row-info, .row.slim:focus-within .row-info { visibility: hidden; }
+.row.slim:hover .row-tools, .row.slim:focus-within .row-tools {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  animation: rowToolsIn .14s ease;
+}
+@keyframes rowToolsIn { from { opacity: 0; transform: translateX(4px); } }
+@media (hover: none) {
+  .row.slim .row-tools { display: flex; align-items: center; gap: 6px; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .row.slim:hover .row-tools, .row.slim:focus-within .row-tools { animation: none; }
+}
 .row.slim .icon-btn { width: 26px; height: 26px; }
 .row.slim .btn-switch { height: 26px; padding: 0 10px; font-size: 13.5px; }
 .row.slim .tag-grp, .row.slim .tag-use, .row.slim .tag-relogin, .row.slim .tier-b { font-size: 11px; line-height: 16px; }

@@ -168,6 +168,11 @@ function pctLabel(h) {
   if (m && h.modelMatched) return t("list.modelPct", { model: m, pct: Math.round(h.remainingPct) });
   return t("list.pctLeft", { pct: Math.round(h.remainingPct) });
 }
+// 紧凑行额度小条用的短文案：不带模型名（模型名进 tooltip 和明细区）
+function pctShortLabel(h) {
+  if (h.remainingPct == null) return t("list.pctUnknown");
+  return t("list.pctLeft", { pct: Math.round(h.remainingPct) });
+}
 function healthDotHtml(h) {
   const p = h.remainingPct == null ? "" : " · " + pctLabel(h);
   return `<span class="hdot ${h.level}" title="${esc(healthLabel(h.level) + p)}"></span>`;
@@ -177,11 +182,20 @@ function quotaChipHtml(id, h) {
   const q = acctQuota[id];
   const pct = h.remainingPct;
   const w = pct == null ? 0 : Math.round(pct);
-  const txt = q?.busy && !q?.data ? t("list.querying") : pctLabel(h);
+  const txt = q?.busy && !q?.data ? t("list.querying") : pctShortLabel(h);
   return `<div class="rq ${h.level}" title="${esc(healthLabel(h.level) + (pct == null ? "" : " · " + pctLabel(h)))}">
       <span class="rq-bar"><i style="width:${w}%"></i></span>
       <span class="rq-pct">${esc(txt)}</span>
     </div>`;
+}
+// 紧凑行的临期提示：空间有限只留“今日到期 / 09-17 到期”，完整时间放 title
+function expSoonLabel(exp) {
+  const day = String(exp.text).slice(0, 10);
+  const now = new Date();
+  const pad = (n) => String(n).padStart(2, "0");
+  const todayStr = `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}`;
+  if (day === todayStr) return t("list.expToday");
+  return t("list.expShort", { date: day.slice(5) });
 }
 function groupTagHtml(a) {
   const g = acctGroup(a);
@@ -1647,8 +1661,13 @@ function render() {
     const showChip = slim || !hasQuotaDetail(a.id);
     // 紧凑模式隐藏了 meta，这里只把“快到期”单独顶出来，避免漏看
     const expSoon = slim && exp?.warn
-      ? `<span class="meta-chip warn" title="${esc(t("q.validUntil", { date: exp.text }))}">${esc(t("q.validUntilShort", { date: exp.text }))}</span>`
+      ? `<span class="meta-chip warn" title="${esc(t("q.validUntil", { date: exp.text }))}">${esc(expSoonLabel(exp))}</span>`
       : "";
+    // 无名账号回退：先试身份信息（邮箱/用户名），再兜底“未命名”
+    const baseName = nameText(a);
+    const displayName = (baseName && baseName.trim())
+      || (ident ? (ui.hideInfo && looksSecret(ident) ? t("list.hidden") : ident) : "")
+      || t("list.unnamed");
     return `
     <div class="row${isActive ? " active" : ""}${checked ? " picked" : ""}${slim ? " slim" : ""}" data-id="${a.id}">
       <div class="row-top">
@@ -1656,17 +1675,18 @@ function render() {
         ${healthDotHtml(h)}
         ${slim ? "" : `<span class="notch" style="background:${notchColor(a.id)}"></span>`}
         <div class="row-main"${ui.density === "compact" ? ` click="actions.toggleRow(event)" title="${esc(slim ? t("list.expandTitle") : t("list.collapseTitle"))}"` : ""}>
-          <div class="row-name">${ui.density === "compact" ? `<span class="row-chev${slim ? "" : " open"}">${ic("chevDown", 12)}</span>` : ""}${tierBadgeFor(a.id)}<span class="rn-text" title="${esc(a.name)}">${esc(nameText(a))}</span>${groupTagHtml(a)}${isActive ? `<span class="tag-use">${t("btn.inUse")}</span>` : ""}${a.has_user_info === false ? `<span class="tag-relogin" title="${esc(t("btn.reloginTitle"))}">${t("btn.relogin")}</span>` : ""}</div>
+          <div class="row-name">${ui.density === "compact" ? `<span class="row-chev${slim ? "" : " open"}">${ic("chevDown", 12)}</span>` : ""}${tierBadgeFor(a.id)}<span class="rn-text" title="${esc(displayName)}">${esc(displayName)}</span>${groupTagHtml(a)}${isActive ? `<span class="tag-use">${t("btn.inUse")}</span>` : ""}${a.has_user_info === false ? `<span class="tag-relogin" title="${esc(t("btn.reloginTitle"))}">${t("btn.relogin")}</span>` : ""}</div>
           <div class="row-meta">${meta}</div>
         </div>
-        ${expSoon}
-        ${showChip ? quotaChipHtml(a.id, h) : ""}
+        <div class="row-info">${expSoon}${showChip ? quotaChipHtml(a.id, h) : ""}</div>
         <div class="row-actions">
-          <button class="icon-btn" title="${t("btn.group")}" aria-label="${t("btn.group")}" click="actions.setGroup('${a.id}')">${ic("folder", 15)}</button>
-          <button class="icon-btn" title="${t("btn.refreshQuota")}" aria-label="${t("btn.refreshQuota")}" click="actions.acctQuota('${a.id}')">${ic("refresh", 15)}</button>
-          <button class="icon-btn" title="${t("btn.rename")}" aria-label="${t("btn.rename")}" click="actions.rename('${a.id}')">${ic("pen", 15)}</button>
-          <button class="icon-btn" title="${t("btn.export")}" aria-label="${t("btn.export")}" click="actions.exportOne('${a.id}')">${ic("export", 15)}</button>
-          <button class="icon-btn danger" title="${t("btn.delete")}" aria-label="${t("btn.delete")}" click="actions.delete('${a.id}')">${ic("x", 15)}</button>
+          <span class="row-tools">
+            <button class="icon-btn" title="${t("btn.group")}" aria-label="${t("btn.group")}" click="actions.setGroup('${a.id}')">${ic("folder", 15)}</button>
+            <button class="icon-btn" title="${t("btn.refreshQuota")}" aria-label="${t("btn.refreshQuota")}" click="actions.acctQuota('${a.id}')">${ic("refresh", 15)}</button>
+            <button class="icon-btn" title="${t("btn.rename")}" aria-label="${t("btn.rename")}" click="actions.rename('${a.id}')">${ic("pen", 15)}</button>
+            <button class="icon-btn" title="${t("btn.export")}" aria-label="${t("btn.export")}" click="actions.exportOne('${a.id}')">${ic("export", 15)}</button>
+            <button class="icon-btn danger" title="${t("btn.delete")}" aria-label="${t("btn.delete")}" click="actions.delete('${a.id}')">${ic("x", 15)}</button>
+          </span>
           <button class="btn-switch has-ic" click="actions.askSwitch('${a.id}')" ${isActive ? "disabled" : ""}>
             ${isActive ? ic("check", 14) + " " + t("btn.current") : ic("swap", 14) + " " + t("btn.switch")}
           </button>
