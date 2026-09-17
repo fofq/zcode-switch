@@ -208,10 +208,16 @@ export function openProviderModal(m) {
   const mask = document.createElement("div");
   mask.className = "pv-mask";
   const displayOf = (p) => has(`prov.${p.id}`) ? t(`prov.${p.id}`) : p.display;
+  let mode = m.browser === false ? "window" : "browser";
   mask.innerHTML = `
     <div class="pv-panel">
       <div class="pv-title">${t("prov.title")}</div>
       <div class="pv-sub">${t("prov.sub")}</div>
+      <div class="pv-modes" role="radiogroup" aria-label="${t("prov.modeLabel")}">
+        <button class="pv-mode" role="radio" aria-checked="false" data-mode="browser">${ic("browser", 14)} <span>${t("prov.modeBrowser")}</span></button>
+        <button class="pv-mode" role="radio" aria-checked="false" data-mode="window">${ic("browser", 14)} <span>${t("prov.modeWindow")}</span></button>
+      </div>
+      <div class="pv-hint">${ic("browser", 13)}<span class="pv-hint-text"></span></div>
       <div class="pv-list">
         ${(m.providers || []).map((p) => `
           <button class="pv-item" data-id="${esc(p.id)}">
@@ -224,8 +230,24 @@ export function openProviderModal(m) {
   document.body.appendChild(mask);
   const onKey = (e) => { if (e.key === "Escape") close(); };
   const close = () => { mask.remove(); document.removeEventListener("keydown", onKey); };
+  const hintEl = mask.querySelector(".pv-hint-text");
+  const modeBtns = Array.from(mask.querySelectorAll(".pv-mode"));
+  const syncMode = () => {
+    for (const b of modeBtns) {
+      const on = b.dataset.mode === mode;
+      b.classList.toggle("on", on);
+      b.setAttribute("aria-checked", on ? "true" : "false");
+    }
+    if (hintEl) hintEl.textContent = t(mode === "browser" ? "prov.viaBrowser" : "prov.viaWindow");
+  };
+  for (const b of modeBtns) b.addEventListener("click", () => { mode = b.dataset.mode; syncMode(); });
+  syncMode();
   mask.querySelectorAll(".pv-item").forEach((b) => {
-    b.addEventListener("click", () => { close(); m.onPick?.(b.dataset.id); });
+    b.addEventListener("click", () => {
+      const browser = mode === "browser";
+      close();
+      m.onPick?.(b.dataset.id, browser);
+    });
   });
   mask.querySelector(".pv-cancel").addEventListener("click", close);
   document.addEventListener("keydown", onKey);

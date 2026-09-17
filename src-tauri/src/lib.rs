@@ -377,7 +377,7 @@ async fn oauth_providers() -> Result<Vec<oauth::OAuthProvider>, String> {
 }
 
 #[tauri::command]
-async fn oauth_begin(app: AppHandle, provider: String) -> Result<serde_json::Value, String> {
+async fn oauth_begin(app: AppHandle, provider: String, browser: Option<bool>) -> Result<serde_json::Value, String> {
     if !oauth::OAUTH_PROVIDERS.iter().any(|p| p.id == provider) {
         return Err(i18n::trf("err.oauth.unknown_provider", &[("provider", &provider)]));
     }
@@ -435,6 +435,20 @@ async fn oauth_begin(app: AppHandle, provider: String) -> Result<serde_json::Val
         state: init.state.clone(),
         flow: flow.clone(),
     });
+
+    // 系统默认浏览器模式：不开内嵌登录窗，靠服务端下发的 poll_token 轮询拿结果。
+    // （不注册 zcode:// 协议，避免抢占 ZCode 客户端自己的深链；授权后浏览器
+    //  可能提示无法打开链接，属正常，本工具会自动捕获）
+    if browser.unwrap_or_else(|| load_settings(&Paths::detect()).oauth_browser()) {
+        if let Err(e) = store::open_url(&url) {
+            *pending_oauth_guard() = None;
+            flowlog::log(&flow, "browser-open-fail", &e);
+            return Err(i18n::trf("err.oauth.browser_open", &[("e", &e)]));
+        }
+        flowlog::log(&flow, "browser-opened", "");
+        spawn_poll_loop(app.clone(), provider.clone(), flow.clone(), mid, poll_cfg);
+        return Ok(json!({ "opened": true, "provider": provider, "browser": true }));
+    }
 
     let login_root = app
         .path()
@@ -852,6 +866,7 @@ async fn set_behavior(
     hot_switch: Option<bool>,
     auto_claim: Option<bool>,
     grouped: Option<bool>,
+    oauth_browser: Option<bool>,
 ) -> Result<(), String> {
     let _guard = store_guard();
     let paths = Paths::detect();
@@ -870,6 +885,9 @@ async fn set_behavior(
     }
     if let Some(v) = grouped {
         s.grouped = Some(v);
+    }
+    if let Some(v) = oauth_browser {
+        s.oauth_browser = Some(v);
     }
     let r = save_settings(&paths, &s);
     rebuild_tray(&app);

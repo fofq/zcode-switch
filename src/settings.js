@@ -60,6 +60,14 @@ const actions = {
     });
   },
 
+  async toggleOauthBrowser() {
+    await guard(async () => {
+      await invoke("set_behavior", { oauthBrowser: !state.oauth_browser });
+      await refresh(); render();
+      toast(t("s.savedToast"));
+    });
+  },
+
   async toggleBehavior(key) {
     await guard(async () => {
       await invoke("set_behavior", {
@@ -188,6 +196,7 @@ function render() {
       ${toggle(s.hot_switch, "actions.toggleBehavior('hot')", t("s.hotSwitch"), t("s.hotSwitchDesc"))}
       ${toggle(s.grouped, "actions.toggleGrouped()", t("s.grouped"), t("s.groupedDesc"))}
       <label style="margin-top:14px">${t("s.authLabel")}</label>
+      ${toggle(s.oauth_browser, "actions.toggleOauthBrowser()", t("s.oauthBrowser"), t("s.oauthBrowserDesc"))}
       ${toggle(s.auth_proxy_on, "actions.toggleAuthProxy()", t("s.proxyToggle"), t("s.proxyToggleDesc"))}
       <div class="path-line" style="margin-top:6px">
         <input class="zcode-path auth-proxy" type="text" value="${esc(s.auth_proxy_url || "")}"

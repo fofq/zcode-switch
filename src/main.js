@@ -73,15 +73,34 @@ const ui = {
   health: "all",
   sort: SORTS.includes(savedPrefs.sort) ? savedPrefs.sort : "quota",
   density: savedPrefs.density === "detail" ? "detail" : "compact",
+  hideInfo: savedPrefs.hideInfo === true,
   selected: new Set(),
   expanded: new Set(),
   collapsedSections: new Set(),
 };
-let quotaSweep = { running: false, done: 0, total: 0, cancel: false };
+let quotaSweep = { running: false, phase: "quota", eligibility: false, done: 0, total: 0, cancel: false };
+// 领取资格刷新很重，节流到至少 10 分钟一次，避免触发风控
+const ELIGIBILITY_MIN_GAP_MS = 10 * 60 * 1000;
+let lastEligibilityAt = 0;
+function canRefreshEligibility() {
+  return Date.now() - lastEligibilityAt >= ELIGIBILITY_MIN_GAP_MS
+    && !refreshClaim.running && !claimAllRunning && !autoClaimRunning && !claimActive;
+}
+// 顶部「刷新」按钮当前应显示的提示（资格阶段 / 额度阶段）
+function refreshAllTitle() {
+  if (!quotaSweep.running) return t("btn.refreshAllTitle");
+  if (quotaSweep.phase === "elig") return t("btn.refreshAllRunningElig", { done: refreshClaim.done, total: refreshClaim.total });
+  return t("btn.refreshAllRunning", { done: quotaSweep.done, total: quotaSweep.total });
+}
+function refreshAllBadge() {
+  if (!quotaSweep.running) return "";
+  const n = quotaSweep.phase === "elig" ? refreshClaim.done : quotaSweep.done;
+  return n > 0 ? `<span class="tb-badge">${n}</span>` : "";
+}
 
 function savePrefs() {
   try {
-    localStorage.setItem(UI_PREFS_KEY, JSON.stringify({ sort: ui.sort, density: ui.density }));
+    localStorage.setItem(UI_PREFS_KEY, JSON.stringify({ sort: ui.sort, density: ui.density, hideInfo: ui.hideInfo }));
   } catch { /* 忽略 */ }
 }
 
@@ -93,6 +112,15 @@ function isTyping() {
 
 function acctGroup(a) {
   return String(a?.group || "").trim();
+}
+
+// 看起来像邮箱/手机号的名称，在“隐藏账号信息”时也一并打码
+function looksSecret(s) {
+  const v = String(s || "");
+  return v.includes("@") || /^\+?[\d][\d\s-]{6,}$/.test(v);
+}
+function nameText(a) {
+  return ui.hideInfo && looksSecret(a.name) ? "••••••" : a.name;
 }
 
 // 额度查询的鉴权类错误由后端带上语言无关的错误码（见 quota.rs 的 coded()）
@@ -224,6 +252,7 @@ function listHeadHtml(s, sum, visible) {
         <button class="sel-all" title="${esc(t("list.selectAllVisible"))}" click="actions.selectAllVisible()">
           <span class="rchk sm${allOn ? " on" : ""}" aria-hidden="true">${ic("check", 11)}</span>${t("list.selectAll")}
         </button>
+        <button class="icon-btn sm" title="${esc(ui.hideInfo ? t("list.showInfo") : t("list.hideInfo"))}" aria-pressed="${ui.hideInfo}" click="actions.toggleHideInfo()">${ic(ui.hideInfo ? "eyeOff" : "eye", 14)}</button>
         <select class="mini-sel" change="actions.setSort(event)" aria-label="${esc(t("list.sortLabel"))}">
           ${SORTS.map((v) => `<option value="${v}"${ui.sort === v ? " selected" : ""}>${esc(t(SORT_PREFIX + v))}</option>`).join("")}
         </select>
@@ -402,6 +431,12 @@ const actions = {
     render();
   },
 
+  toggleHideInfo() {
+    ui.hideInfo = !ui.hideInfo;
+    savePrefs();
+    render();
+  },
+
   toggleRow(ev) {
     const id = ev?.target?.closest?.(".row")?.dataset?.id;
     if (!id) return;
@@ -487,18 +522,24 @@ const actions = {
     });
   },
 
-  /** 逐个账号刷新额度（再点一下 = 停止）；健康度依赖它 */
-  async refreshAllQuota() {
+  /** 刷新额度（顺带按节流刷新领取资格）；再点一次 = 停止 */
+  async refreshAll(quotaOnly) {
     if (quotaSweep.running) {
       quotaSweep.cancel = true;
       return;
     }
     const ids = (state?.accounts || []).map((a) => a.id);
     if (!ids.length) return;
-    quotaSweep = { running: true, done: 0, total: ids.length, cancel: false };
+    const withElig = !quotaOnly && canRefreshEligibility();
+    if (withElig) lastEligibilityAt = Date.now();
+    quotaSweep = { running: true, phase: withElig ? "elig" : "quota", eligibility: withElig, done: 0, total: ids.length, cancel: false };
     render();
     let cancelled = false;
     try {
+      if (withElig) {
+        await actions.refreshClaim();
+        quotaSweep.phase = "quota";
+      }
       for (const id of ids) {
         if (quotaSweep.cancel) { cancelled = true; break; }
         await loadAcctQuota(id);
@@ -508,9 +549,11 @@ const actions = {
       }
     } finally {
       const done = quotaSweep.done;
+      const elig = quotaSweep.eligibility;
       cancelled = cancelled || quotaSweep.cancel;
-      quotaSweep = { running: false, done: 0, total: 0, cancel: false };
-      toast(cancelled ? t("list.toastSweepCancelled", { n: done }) : t("list.toastSweepDone", { n: done }));
+      quotaSweep = { running: false, phase: "quota", eligibility: false, done: 0, total: 0, cancel: false };
+      if (cancelled) toast(t("list.toastSweepCancelled", { n: done }));
+      else toast(elig ? t("list.toastRefreshAllBoth", { n: done }) : t("list.toastSweepDone", { n: done }));
       render();
     }
   },
@@ -656,12 +699,15 @@ const actions = {
     let providers;
     try { providers = await invoke("oauth_providers"); }
     catch (e) { toast(stripErr(e), "err"); return; }
+    const inBrowser = state?.oauth_browser !== false;
     openProviderModal({
       providers,
-      onPick: async (id) => {
+      browser: inBrowser,
+      onPick: async (id, inBrowser) => {
         try {
-          await invoke("oauth_begin", { provider: id });
-          toast(t("m.loginWindowOpened"), "ok", t("m.loginWindowDetail"));
+          const r = await invoke("oauth_begin", { provider: id, browser: !!inBrowser });
+          if (r?.browser) toast(t("m.loginBrowserOpened"), "ok", t("m.loginBrowserDetail"));
+          else toast(t("m.loginWindowOpened"), "ok", t("m.loginWindowDetail"));
         } catch (e) {
           toast(stripErr(e), "err");
         }
@@ -1147,7 +1193,7 @@ function render() {
     if (exp) {
         meta += `<span class="${exp.warn ? "warn-line" : ""}">${esc(t("q.validUntil", { date: exp.text }))}</span>`;
     }
-    if (ident) meta += `${meta ? " · " : ""}${esc(ident)}`;
+    if (ident) meta += `${meta ? " · " : ""}${ui.hideInfo ? `<span class="masked">${esc(t("list.hidden"))}</span>` : esc(ident)}`;
     const checked = ui.selected.has(a.id);
     const slim = ui.density === "compact" && !ui.expanded.has(a.id);
     return `
@@ -1157,7 +1203,7 @@ function render() {
         ${healthDotHtml(h)}
         ${slim ? "" : `<span class="notch" style="background:${notchColor(a.id)}"></span>`}
         <div class="row-main"${ui.density === "compact" ? ` click="actions.toggleRow(event)" title="${esc(slim ? t("list.expandTitle") : t("list.collapseTitle"))}"` : ""}>
-          <div class="row-name">${ui.density === "compact" ? `<span class="row-chev${slim ? "" : " open"}">${ic("chevDown", 12)}</span>` : ""}${esc(a.name)}${groupTagHtml(a)}${tierBadgeFor(a.id)}${isActive ? `<span class="tag-use">${t("btn.inUse")}</span>` : ""}${a.has_user_info === false ? `<span class="tag-relogin" title="${esc(t("btn.reloginTitle"))}">${t("btn.relogin")}</span>` : ""}</div>
+          <div class="row-name">${ui.density === "compact" ? `<span class="row-chev${slim ? "" : " open"}">${ic("chevDown", 12)}</span>` : ""}${esc(nameText(a))}${groupTagHtml(a)}${tierBadgeFor(a.id)}${isActive ? `<span class="tag-use">${t("btn.inUse")}</span>` : ""}${a.has_user_info === false ? `<span class="tag-relogin" title="${esc(t("btn.reloginTitle"))}">${t("btn.relogin")}</span>` : ""}</div>
           <div class="row-meta">${meta}</div>
         </div>
         ${quotaChipHtml(a.id, h)}
@@ -1208,50 +1254,37 @@ function render() {
 
     <section class="toolbar">
       <div class="tb-group">
-        <button class="btn-primary has-ic${unsaved ? " attention" : ""}" click="actions.capture()" ${!s.live_logged_in || active ? "disabled" : ""}
-          title="${active ? esc(t("m.saveLoginDisabledTitle", { name: active.name })) : ""}">
-          ${ic("capture", 15)} ${t("btn.saveLogin")}
+        <button class="icon-btn tb-btn tb-primary${unsaved ? " attention" : ""}" click="actions.capture()" ${!s.live_logged_in || active ? "disabled" : ""}
+          aria-label="${t("btn.saveLogin")}" title="${active ? esc(t("m.saveLoginDisabledTitle", { name: active.name })) : t("btn.saveLogin")}">
+          ${ic("capture", 17)}
         </button>
-        <button class="btn-ghost has-ic" click="actions.addAccount()" title="${t("btn.addAccountTitle")}">${ic("userPlus", 15)} ${t("btn.addAccount")}</button>
+        <button class="icon-btn tb-btn" click="actions.addAccount()" aria-label="${t("btn.addAccount")}" title="${t("btn.addAccountTitle")}">${ic("userPlus", 17)}</button>
       </div>
       <span class="tb-sep"></span>
       <div class="tb-group">
         ${claimableCount > 0
-          ? `<button class="btn-ghost has-ic claim-all" click="actions.claimAll()" ${claimAllRunning || refreshClaim.running || autoClaimRunning ? "disabled" : ""}
-              title="${t("btn.claimAllTitle")}">${ic("gift", 15)} ${t("btn.claimAll")}${claimableCount > 1 ? ` (${claimableCount})` : ""}</button>`
-          : ""}
-        <button class="tog-inline${s.auto_claim ? " on" : ""}${autoClaimRunning ? " running" : ""}"
-          role="switch" aria-checked="${s.auto_claim}" aria-label="${t("btn.autoClaim")}"
-          title="${autoPillTitle(s)}"
-          click="actions.toggleAutoClaim()">
-          <span class="toggle${s.auto_claim ? " on" : ""}" aria-hidden="true"><span class="knob"></span></span>
-          ${t("btn.autoClaim")}
-        </button>
-        ${(s.accounts.length > 0)
-          ? `<button class="btn-ghost has-ic" click="actions.refreshClaim()"
-              ${refreshClaim.running || claimAllRunning || Date.now() < refreshClaim.cooldownUntil ? "disabled" : ""}
-              title="${Date.now() < refreshClaim.cooldownUntil && !refreshClaim.running
-                ? esc(t("btn.refreshClaimCooldownTitle", { n: Math.ceil((refreshClaim.cooldownUntil - Date.now()) / 1000) }))
-                : esc(t("btn.refreshClaimTitle"))}">
-              ${ic("refresh", 15)} ${refreshClaim.running
-                ? esc(t("btn.refreshClaimRunning", { done: refreshClaim.done, total: refreshClaim.total }))
-                : esc(t("btn.refreshClaim"))}
+          ? `<button class="icon-btn tb-btn" click="actions.claimAll()" ${claimAllRunning || refreshClaim.running || autoClaimRunning ? "disabled" : ""}
+              aria-label="${t("btn.claimAll")}" title="${t("btn.claimAllTitle")}${claimableCount > 1 ? ` (${claimableCount})` : ""}">
+              ${ic("gift", 17)}${claimableCount > 1 ? `<span class="tb-badge">${claimableCount}</span>` : ""}
             </button>`
           : ""}
+        <button class="icon-btn tb-btn${s.auto_claim ? " on" : ""}${autoClaimRunning ? " running" : ""}"
+          role="switch" aria-checked="${s.auto_claim}" aria-label="${t("btn.autoClaim")}"
+          title="${autoPillTitle(s)}" click="actions.toggleAutoClaim()">
+          ${ic("giftRepeat", 17)}
+        </button>
         ${(s.accounts.length > 0)
-          ? `<button class="btn-ghost has-ic${quotaSweep.running ? " running" : ""}" click="actions.refreshAllQuota()"
-              title="${quotaSweep.running ? esc(t("list.sweepCancelHint")) : esc(t("list.sweepTitle"))}">
-              ${ic("refresh", 15)} ${quotaSweep.running
-                ? esc(t("list.sweepRunning", { done: quotaSweep.done, total: quotaSweep.total }))
-                : esc(t("list.sweep"))}
+          ? `<button class="icon-btn tb-btn${quotaSweep.running ? " running" : ""}" click="actions.refreshAll()"
+              aria-label="${t("btn.refreshAll")}" title="${esc(refreshAllTitle())}">
+              ${ic("refresh", 17)}${refreshAllBadge()}
             </button>`
           : ""}
       </div>
       <span class="tb-sep"></span>
       <div class="tb-group">
         ${s.zcode_running
-          ? `<button class="btn-ghost has-ic" click="actions.askKill()" title="${t("btn.killZcode")}">${ic("power", 15)} ${t("btn.killZcode")}</button>`
-          : `<button class="btn-ghost has-ic" click="actions.launch()" ${s.zcode_path_ok ? "" : "disabled"}>${ic("play", 14)} ${t("btn.launchZcode")}</button>`}
+          ? `<button class="icon-btn tb-btn danger" click="actions.askKill()" aria-label="${t("btn.killZcode")}" title="${t("btn.killZcode")}">${ic("power", 17)}</button>`
+          : `<button class="icon-btn tb-btn" click="actions.launch()" ${s.zcode_path_ok ? "" : "disabled"} aria-label="${t("btn.launchZcode")}" title="${t("btn.launchZcode")}">${ic("play", 16)}</button>`}
       </div>
     </section>
 
@@ -1387,7 +1420,7 @@ async function sweepTick() {
     enrollAccounts();
     sweepTick();
     // 启动时把额度拉全（健康度 / 筛选 / 排序都依赖它）
-    setTimeout(() => { if (!quotaSweep.running) actions.refreshAllQuota(); }, 900);
+    setTimeout(() => { if (!quotaSweep.running) actions.refreshAll(true); }, 900);
     setInterval(() => {
       invoke("get_state").then((s) => { state = s; if (s?.language) init(s.language); enrollAccounts(); if (!uiLocked()) render(); }).catch(() => {});
     }, 5000);
