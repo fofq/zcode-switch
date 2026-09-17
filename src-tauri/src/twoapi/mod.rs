@@ -22,6 +22,8 @@ use crate::store::{self, Paths};
 
 const DEFAULT_ANTHROPIC_VERSION: &str = "2023-06-01";
 const CACHE_TTL: Duration = Duration::from_secs(600);
+/// 站方标注长期免费的模型，始终并入 /v1/models（docs.z.ai/guides/overview/pricing）
+const FREE_MODELS: &[&str] = &["glm-4.7-flash", "glm-4.6v-flash", "glm-4.5-flash"];
 
 #[derive(Clone, Debug)]
 pub struct Cfg {
@@ -57,6 +59,8 @@ pub struct SharedState {
     pub account: Mutex<Option<String>>,
     pub models: Mutex<Vec<String>>,
     pub cache: Mutex<HashMap<String, (std::time::Instant, store::ApiKeyInfo)>>,
+    /// 2API 每账号累计请求数（跟随/锁定都以解析到的账号 id 计）
+    pub usage: Mutex<HashMap<String, u64>>,
 }
 
 pub struct Manager {
@@ -110,6 +114,7 @@ pub async fn sync(paths: &Paths) -> Result<(), String> {
         account: Mutex::new(cfg.account.clone()),
         models: Mutex::new(cfg.models.clone()),
         cache: Mutex::new(HashMap::new()),
+        usage: Mutex::new(HashMap::new()),
     });
     let app = router(state.clone());
     // 重启同端口时旧监听可能还没完全释放，做一小段重试
@@ -153,6 +158,8 @@ pub struct Status {
     pub requests: u64,
     pub errors: u64,
     pub last_request_at: i64,
+    /// 每账号累计请求数（id -> count）
+    pub usage: HashMap<String, u64>,
 }
 
 #[derive(serde::Serialize)]
@@ -210,10 +217,10 @@ pub async fn test_service() -> TestResult {
 
 pub fn status() -> Status {
     let mgr = MANAGER.lock().unwrap();
-    let (running, port) = mgr
+    let (running, port, usage) = mgr
         .as_ref()
-        .map(|m| (true, m.cfg.port))
-        .unwrap_or((false, 0));
+        .map(|m| (true, m.cfg.port, m.state.usage.lock().unwrap().clone()))
+        .unwrap_or((false, 0, HashMap::new()));
     let st = stats();
     Status {
         running,
@@ -221,6 +228,7 @@ pub fn status() -> Status {
         requests: st.requests.load(Ordering::Relaxed),
         errors: st.errors.load(Ordering::Relaxed),
         last_request_at: st.last_request_at.load(Ordering::Relaxed),
+        usage,
     }
 }
 
@@ -266,7 +274,12 @@ async fn health() -> impl IntoResponse {
 }
 
 async fn models(State(st): State<Arc<SharedState>>) -> impl IntoResponse {
-    let list = st.models.lock().unwrap().clone();
+    let mut list = st.models.lock().unwrap().clone();
+    for m in FREE_MODELS {
+        if !list.iter().any(|x| x.eq_ignore_ascii_case(m)) {
+            list.push(m.to_string());
+        }
+    }
     let data: Vec<Value> = list
         .into_iter()
         .map(|m| json!({"id": m, "object": "model", "owned_by": "zcode-switch"}))

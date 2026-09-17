@@ -266,6 +266,7 @@ function detectedModels() {
 // ---------- 设置弹窗（工具栏齿轮打开；替掉原来的独立设置窗口） ----------
 
 let settingsModalEl = null;
+let stOnKey = null;
 let autostartOn = false;
 
 function stToggle(key, label, desc, on, extra) {
@@ -311,7 +312,7 @@ function settingsFormHtml() {
   <div class="st-panel" role="dialog" aria-modal="true" aria-label="${esc(t("s.title"))}">
     <div class="st-head">
       <span class="st-title">${ic("sliders", 16)} ${t("s.title")}</span>
-      <button class="icon-btn st-close" title="${esc(t("common.close"))}" aria-label="${esc(t("common.close"))}">${ic("x", 15)}</button>
+      <button class="icon-btn st-close" click="actions.closeSettings()" title="${esc(t("common.close"))}" aria-label="${esc(t("common.close"))}">${ic("x", 15)}</button>
     </div>
     <div class="st-body">
       <div class="st-sec">${t("st.secAuto")}</div>
@@ -377,6 +378,10 @@ function syncSettingsModal() {
 function closeSettingsModal() {
   document.querySelector(".st-mask")?.remove();
   settingsModalEl = null;
+  if (stOnKey) {
+    document.removeEventListener("keydown", stOnKey);
+    stOnKey = null;
+  }
 }
 
 async function openSettingsModal() {
@@ -387,18 +392,22 @@ async function openSettingsModal() {
   mask.innerHTML = settingsFormHtml();
   document.body.appendChild(mask);
   settingsModalEl = mask;
-  const onKey = (e) => { if (e.key === "Escape") closeSettingsModal(); };
-  document.addEventListener("keydown", onKey);
-  mask.addEventListener("click", (e) => { if (e.target === mask) { closeSettingsModal(); document.removeEventListener("keydown", onKey); } });
-  mask.querySelector(".st-close").addEventListener("click", closeSettingsModal);
+  stOnKey = (e) => { if (e.key === "Escape") closeSettingsModal(); };
+  document.addEventListener("keydown", stOnKey);
+  mask.addEventListener("click", (e) => { if (e.target === mask) closeSettingsModal(); });
 }
 
 // ---------- 2API 服务弹窗（工具栏插头按钮打开） ----------
 
+// 站方标注长期免费的模型，始终并入 /v1/models（docs.z.ai/guides/overview/pricing）
+const FREE_MODELS = ["glm-4.7-flash", "glm-4.6v-flash", "glm-4.5-flash"];
+
 let twoApiModalEl = null;
 let twoStatusTimer = null;
+let twoOnKey = null;
 let twoShowToken = false;
 let twoLastStatus = null;
+let twoUsageMap = new Map();
 
 function twoStatusHtml() {
   const on = !!state?.two_api_on;
@@ -488,7 +497,7 @@ function twoApiFormHtml() {
   <div class="st-panel" role="dialog" aria-modal="true" aria-label="${esc(t("two.title"))}">
     <div class="st-head">
       <span class="st-title">${ic("plug", 16)} ${t("two.title")}</span>
-      <button class="icon-btn st-close" title="${esc(t("common.close"))}" aria-label="${esc(t("common.close"))}">${ic("x", 15)}</button>
+      <button class="icon-btn st-close" click="actions.closeTwoApi()" title="${esc(t("common.close"))}" aria-label="${esc(t("common.close"))}">${ic("x", 15)}</button>
     </div>
     <div class="st-body">
       ${twoStatusHtml()}
@@ -506,9 +515,13 @@ function twoApiFormHtml() {
           <select class="two-input two-account" change="actions.twoSetAccount(event)">${acctOpts}</select>
         </label>
         <label class="two-cfg wide"><span>${t("two.models")}</span>
-          <input class="two-input two-models" type="text" value="${esc(st.two_api_models || "")}" placeholder="glm-5.3-flash, glm-5.3">
+          <span class="two-models-row">
+            <input class="two-input two-models" type="text" value="${esc(st.two_api_models || "")}" placeholder="glm-5.3-flash, glm-5.3">
+            <button class="btn-ghost has-ic" click="actions.twoDetectModels()" title="${esc(t("two.detectModelsTitle"))}">${ic("refresh", 13)} ${t("two.detectModels")}</button>
+          </span>
         </label>
         <div class="two-cfg-actions">
+          <span class="two-test-result"></span>
           <button class="btn-ghost has-ic" click="actions.twoTest()">${ic("bolt", 14)} ${t("two.test")}</button>
           <button class="btn-ghost" click="actions.twoSaveConfig()">${t("common.save")}</button>
         </div>
@@ -542,8 +555,12 @@ function syncTwoApiModal() {
 }
 
 function closeTwoApiModal() {
-  document.querySelector(".two-mask")?.remove();
+  document.querySelectorAll(".two-mask").forEach((m) => m.remove());
   twoApiModalEl = null;
+  if (twoOnKey) {
+    document.removeEventListener("keydown", twoOnKey);
+    twoOnKey = null;
+  }
   if (twoStatusTimer) {
     clearInterval(twoStatusTimer);
     twoStatusTimer = null;
@@ -558,10 +575,9 @@ async function openTwoApiModal() {
   mask.innerHTML = twoApiFormHtml();
   document.body.appendChild(mask);
   twoApiModalEl = mask;
-  const onKey = (e) => { if (e.key === "Escape") closeTwoApiModal(); };
-  document.addEventListener("keydown", onKey);
-  mask.addEventListener("click", (e) => { if (e.target === mask) { closeTwoApiModal(); document.removeEventListener("keydown", onKey); } });
-  mask.querySelector(".st-close").addEventListener("click", closeTwoApiModal);
+  twoOnKey = (e) => { if (e.key === "Escape") closeTwoApiModal(); };
+  document.addEventListener("keydown", twoOnKey);
+  mask.addEventListener("click", (e) => { if (e.target === mask) closeTwoApiModal(); });
   twoStatusTimer = setInterval(async () => {
     if (!twoApiModalEl) return;
     twoLastStatus = await invoke("two_api_status").catch(() => null);
@@ -1306,6 +1322,41 @@ const actions = {
 
   openTwoApi() { openTwoApiModal(); },
 
+  closeTwoApi() { closeTwoApiModal(); },
+
+  closeSettings() { closeSettingsModal(); },
+
+  /** 模型列表一键填充：当前值 + 官方免费模型 + 本地额度里实测到的模型 */
+  twoDetectModels() {
+    const input = twoApiModalEl?.querySelector(".two-models");
+    if (!input) return;
+    const cur = input.value.split(",").map((s) => s.trim()).filter(Boolean);
+    const set = new Set([...cur, ...FREE_MODELS, ...detectedModels()]);
+    input.value = [...set].join(", ");
+    toast(t("two.detected", { n: set.size }));
+  },
+
+  /** 连通性测试：弹窗内联结果 + toast 双反馈 */
+  async twoTest() {
+    const el = twoApiModalEl?.querySelector(".two-test-result");
+    if (el) { el.textContent = t("two.testRunning"); el.className = "two-test-result running"; }
+    try {
+      const r = await invoke("two_api_test");
+      twoLastStatus = await invoke("two_api_status").catch(() => null);
+      const old = twoApiModalEl?.querySelector(".two-status");
+      if (old) old.outerHTML = twoStatusHtml();
+      const ok = !!r?.ok;
+      const text = ok
+        ? `✓ ${t("two.testOk", { ms: r.latencyMs, status: r.status })}`
+        : `✕ ${t("two.testFail", { err: r?.error || "unknown" })}`;
+      if (el) { el.textContent = text; el.className = `two-test-result ${ok ? "ok" : "err"}`; }
+      toast(ok ? t("two.testOk", { ms: r.latencyMs, status: r.status }) : t("two.testFail", { err: r?.error || "unknown" }), ok ? "ok" : "err");
+    } catch (e) {
+      if (el) { el.textContent = `✕ ${stripErr(e)}`; el.className = "two-test-result err"; }
+      toast(stripErr(e), "err");
+    }
+  },
+
   /** 一键复制所有账号的 API Key（名称 + key 逐行） */
   async copyAllKeys() {
     try {
@@ -2007,8 +2058,14 @@ function render() {
     const displayName = (baseName && baseName.trim())
       || (ident ? (ui.hideInfo && looksSecret(ident) ? t("list.hidden") : ident) : "")
       || t("list.unnamed");
+    // 2API 累计请求数（左上角小计数，0 不显示）
+    const usage = twoUsageMap.get(a.id) || 0;
+    const usageBadge = usage
+      ? `<span class="row-usage" title="${esc(t("list.usageTitle"))}">${usage > 999 ? (usage / 1000).toFixed(1) + "k" : usage}</span>`
+      : "";
     return `
     <div class="row${isActive ? " active" : ""}${checked ? " picked" : ""}${slim ? " slim" : ""}" data-id="${a.id}">
+      ${usageBadge}
       <div class="row-top">
         <span class="rchk" role="checkbox" aria-checked="${checked}" title="${esc(t("list.selectHint"))}" click="actions.toggleSelect('${a.id}')">${ic("check", 11)}</span>
         ${healthDotHtml(h)}
@@ -2316,7 +2373,16 @@ async function sweepTick() {
     // 启动时把额度拉全（健康度 / 筛选 / 排序都依赖它）
     setTimeout(() => { if (!quotaSweep.running) actions.refreshAll(true); }, 900);
     setInterval(() => {
-      invoke("get_state").then((s) => { state = s; if (s?.language) init(s.language); enrollAccounts(); if (!uiLocked()) render(); }).catch(() => {});
+      Promise.all([
+        invoke("get_state"),
+        invoke("two_api_status").catch(() => null),
+      ]).then(([s, st]) => {
+        state = s;
+        if (s?.language) init(s.language);
+        enrollAccounts();
+        if (st?.usage) twoUsageMap = new Map(Object.entries(st.usage));
+        if (!uiLocked()) render();
+      }).catch(() => {});
     }, 5000);
     setInterval(sweepTick, TICK_MS);
     setInterval(autoSwitchTick, AUTO_SWITCH_CHECK_MS);

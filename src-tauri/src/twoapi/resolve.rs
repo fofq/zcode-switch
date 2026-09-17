@@ -15,6 +15,12 @@ pub fn resolve(st: &SharedState) -> Result<(String, String), String> {
         Some(id) => id,
         None => store::active_account_id(&st.paths).ok_or("没有正在使用的账号，请先在主界面切换或保存一个账号")?,
     };
+    // 每次解析对应一次真实请求，记入该账号的累计计数
+    if let Some(c) = st.usage.lock().unwrap().get_mut(&id) {
+        *c += 1;
+    } else {
+        st.usage.lock().unwrap().insert(id.clone(), 1);
+    }
     {
         let cache = st.cache.lock().unwrap();
         if let Some((at, info)) = cache.get(&id) {
