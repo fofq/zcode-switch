@@ -214,6 +214,7 @@ export const en = {
   "q.validUntil": "Valid until {date}",
   "q.validUntilShort": "until {date}",
   "q.noCfg": "No config snapshot (existing config stays after switching)",
+  "q.noCfgShort": "No config snapshot",
   "q.countShort": "Prompts",
   "q.monthlyShort": "Monthly",
   "q.win.hours": "Every {n}h",

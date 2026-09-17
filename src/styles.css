@@ -324,8 +324,16 @@ input:focus-visible,
   display: flex;
   align-items: center;
   gap: 7px;
+  min-width: 0;
   white-space: nowrap;
+}
+.row:not(.slim) .row-name { flex-wrap: wrap; white-space: normal; }
+.rn-text {
+  min-width: 0;
+  max-width: 100%;
   overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 .tag-use {
   font-family: var(--mono);
@@ -369,8 +377,36 @@ input:focus-visible,
   font-family: var(--mono);
   font-size: 12.5px;
   color: var(--ink-mute);
-  margin-top: 2px;
+  margin-top: 3px;
   letter-spacing: .03em;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+.meta-chip {
+  flex: none;
+  padding: 0 5px;
+  border: 1px solid var(--hairline);
+  border-radius: 3px;
+  font-family: var(--mono);
+  font-size: 11.5px;
+  line-height: 17px;
+  color: var(--ink-mute);
+  white-space: nowrap;
+}
+.meta-chip.warn {
+  color: var(--amber);
+  border-color: var(--amber-deep);
+  background: rgba(232, 163, 61, .07);
+}
+.meta-id {
+  min-width: 0;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .row-actions {

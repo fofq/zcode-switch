@@ -214,6 +214,7 @@ export const zh = {
   "q.validUntil": "有效期至 {date}",
   "q.validUntilShort": "至 {date}",
   "q.noCfg": "无 config 快照（切换后沿用现有 config）",
+  "q.noCfgShort": "无 config 快照",
   "q.countShort": "次数",
   "q.monthlyShort": "月度",
   "q.win.hours": "每 {n} 小时",

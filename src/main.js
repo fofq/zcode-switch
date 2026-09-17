@@ -1402,26 +1402,52 @@ function balRowHtml(it) {
   </div>`;
 }
 
-function tierChipHtml(tier, code) {
-  const c = String(code || "").toLowerCase();
+const TIER_RANK = { max: 0, pro: 1, lite: 2, start: 3, trial: 4, other: 9 };
+
+/** 套餐等级归一：有 tier_code 时以它为准，否则回退到名称文本 */
+function tierKind(tier, code) {
+  const c = String(code || "").trim().toLowerCase();
+  if (c === "max" || c === "pro" || c === "lite" || c === "start" || c === "trial") return c;
   const s = String(tier || "").toLowerCase();
-  let label, cls;
-  if (c === "max" || (!c && s.includes("max"))) { label = "Max"; cls = "max"; }
-  else if (c === "pro" || (!c && s.includes("pro"))) { label = "Pro"; cls = "pro"; }
-  else if (c === "lite" || (!c && s.includes("lite"))) { label = "Lite"; cls = "lite"; }
-  else if (c === "start") { label = "Start"; cls = "trial"; }
-  else if (c === "trial" || (!c && (s.includes("trial") || String(tier || "").includes("体验")))) { label = t("q.trial"); cls = "trial"; }
-  else { label = tier; cls = "other"; }
+  if (s.includes("max")) return "max";
+  if (s.includes("pro")) return "pro";
+  if (s.includes("lite")) return "lite";
+  if (s.includes("start")) return "start";
+  if (s.includes("trial") || String(tier || "").includes("体验")) return "trial";
+  return "other";
+}
+
+function tierChipHtml(tier, code) {
+  const kind = tierKind(tier, code);
+  const label = kind === "max" ? "Max"
+    : kind === "pro" ? "Pro"
+      : kind === "lite" ? "Lite"
+        : kind === "start" ? "Start"
+          : kind === "trial" ? t("q.trial")
+            : (tier || t("q.other"));
+  const cls = kind === "other" ? "other" : kind === "start" ? "trial" : kind;
   return `<span class="tier-b ${cls}">${esc(label)}</span>`;
 }
+
+/** 行内套餐标签：同一等级只显示一次（Start Plan 常有多个 plan 条目），按等级从高到低 */
 function tierBadgeFor(id) {
   const q = acctQuota[id];
   if (!q?.data) return "";
   const plans = q.data.plans || [];
-  const pairs = plans.map((p) => [p.tier, p.tier_code]);
-  const list = (pairs.length ? pairs : q.data.plan_tier ? [[q.data.plan_tier, null]] : []).slice(0, 2);
-  if (!list.length) return `<span class="tier-b free">Free</span>`;
-  return list.map(([tier, code]) => tierChipHtml(tier, code)).join("");
+  const list = plans.length
+    ? plans.map((p) => [p.tier, p.tier_code])
+    : (q.data.plan_tier ? [[q.data.plan_tier, null]] : []);
+  if (!list.length) return q.data.is_empty ? "" : `<span class="tier-b free">Free</span>`;
+  const seen = new Map();
+  for (const [tier, code] of list) {
+    const kind = tierKind(tier, code);
+    if (!seen.has(kind)) seen.set(kind, tier);
+  }
+  return [...seen.entries()]
+    .sort((a, b) => (TIER_RANK[a[0]] ?? 9) - (TIER_RANK[b[0]] ?? 9))
+    .slice(0, 2)
+    .map(([kind, tier]) => tierChipHtml(tier, kind))
+    .join("");
 }
 
 function grantLabel(plan) {
@@ -1600,16 +1626,25 @@ function render() {
     const ident = [a.identity?.username, a.identity?.email].filter(Boolean).join(" · ");
     const q = acctQuota[a.id];
     let meta = "";
-    if (!a.has_config) meta += `<span class="no-cfg">${t("q.noCfg")}</span>`;
+    if (!a.has_config) meta += `<span class="meta-chip warn" title="${esc(t("q.noCfg"))}">${esc(t("q.noCfgShort"))}</span>`;
     const exp = expireInfo(q?.data?.plan_expire);
     if (exp) {
-        meta += `<span class="${exp.warn ? "warn-line" : ""}">${esc(t("q.validUntil", { date: exp.text }))}</span>`;
+      meta += `<span class="meta-chip${exp.warn ? " warn" : ""}" title="${esc(t("q.validUntil", { date: exp.text }))}">${esc(t("q.validUntilShort", { date: exp.text }))}</span>`;
     }
-    if (ident) meta += `${meta ? " · " : ""}${ui.hideInfo ? `<span class="masked">${esc(t("list.hidden"))}</span>` : esc(ident)}`;
+    // 名称本身就是邮箱/手机号时不再重复展示
+    if (ident && ident.toLowerCase() !== String(a.name || "").trim().toLowerCase()) {
+      meta += ui.hideInfo
+        ? `<span class="meta-id masked">${esc(t("list.hidden"))}</span>`
+        : `<span class="meta-id" title="${esc(ident)}">${esc(ident)}</span>`;
+    }
     const checked = ui.selected.has(a.id);
     const slim = ui.density === "compact" && !ui.expanded.has(a.id);
     // 详细（或已展开）且明细区有内容时，行内不再重复展示额度小条
     const showChip = slim || !hasQuotaDetail(a.id);
+    // 紧凑模式隐藏了 meta，这里只把“快到期”单独顶出来，避免漏看
+    const expSoon = slim && exp?.warn
+      ? `<span class="meta-chip warn" title="${esc(t("q.validUntil", { date: exp.text }))}">${esc(t("q.validUntilShort", { date: exp.text }))}</span>`
+      : "";
     return `
     <div class="row${isActive ? " active" : ""}${checked ? " picked" : ""}${slim ? " slim" : ""}" data-id="${a.id}">
       <div class="row-top">
@@ -1617,7 +1652,7 @@ function render() {
         ${healthDotHtml(h)}
         ${slim ? "" : `<span class="notch" style="background:${notchColor(a.id)}"></span>`}
         <div class="row-main"${ui.density === "compact" ? ` click="actions.toggleRow(event)" title="${esc(slim ? t("list.expandTitle") : t("list.collapseTitle"))}"` : ""}>
-          <div class="row-name">${ui.density === "compact" ? `<span class="row-chev${slim ? "" : " open"}">${ic("chevDown", 12)}</span>` : ""}${esc(nameText(a))}${groupTagHtml(a)}${tierBadgeFor(a.id)}${isActive ? `<span class="tag-use">${t("btn.inUse")}</span>` : ""}${a.has_user_info === false ? `<span class="tag-relogin" title="${esc(t("btn.reloginTitle"))}">${t("btn.relogin")}</span>` : ""}</div>
+          <div class="row-name">${ui.density === "compact" ? `<span class="row-chev${slim ? "" : " open"}">${ic("chevDown", 12)}</span>` : ""}${tierBadgeFor(a.id)}<span class="rn-text" title="${esc(a.name)}">${esc(nameText(a))}</span>${groupTagHtml(a)}${isActive ? `<span class="tag-use">${t("btn.inUse")}</span>` : ""}${a.has_user_info === false ? `<span class="tag-relogin" title="${esc(t("btn.reloginTitle"))}">${t("btn.relogin")}</span>` : ""}${expSoon}</div>
           <div class="row-meta">${meta}</div>
         </div>
         ${showChip ? quotaChipHtml(a.id, h) : ""}
