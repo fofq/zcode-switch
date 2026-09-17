@@ -417,7 +417,7 @@ async fn chat_completions(State(st): State<Arc<SharedState>>, body: axum::body::
         Ok(r) => r,
         Err(e) => return err_json(StatusCode::BAD_REQUEST, &e),
     };
-    let (api_key, base_url) = match resolve::resolve(st) {
+    let (api_key, base_url) = match resolve::resolve(&st) {
         Ok(x) => x,
         Err(e) => {
             stats().errors.fetch_add(1, Ordering::Relaxed);
