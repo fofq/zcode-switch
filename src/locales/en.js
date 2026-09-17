@@ -172,6 +172,7 @@ export const en = {
   "list.density.compact": "Compact",
   "list.density.detail": "Detailed",
   "list.expandTitle": "Click to expand quota details",
+  "list.collapseTitle": "Click to collapse quota details",
   "list.noMatch": "No matching accounts",
   "list.clearFilters": "Clear filters",
   "list.sweep": "Refresh quota",

@@ -172,6 +172,7 @@ export const zh = {
   "list.density.compact": "紧凑",
   "list.density.detail": "详细",
   "list.expandTitle": "点击展开额度明细",
+  "list.collapseTitle": "点击收起额度明细",
   "list.noMatch": "没有匹配的账号",
   "list.clearFilters": "清空筛选",
   "list.sweep": "刷新额度",

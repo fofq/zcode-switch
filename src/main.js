@@ -397,6 +397,7 @@ const actions = {
 
   setDensity(v) {
     ui.density = v === "detail" ? "detail" : "compact";
+    ui.expanded.clear();
     savePrefs();
     render();
   },
@@ -592,6 +593,7 @@ const actions = {
         if (r.config_stale) bits.push(t("m.bitConfigStale"));
         toast(t("m.toastSwitched", { name: r.name }), r.config_stale ? "warn" : "ok", bits.join(t("common.listSep")));
       }
+      ui.expanded.delete(id);
       await refresh(); render();
       pokeAccount(id);
     });
@@ -1103,6 +1105,10 @@ function render() {
     return;
   }
   const s = state;
+  // 清理已删除账号残留的展开态
+  for (const id of [...ui.expanded]) {
+    if (!s.accounts.some((a) => a.id === id)) ui.expanded.delete(id);
+  }
   const active = s.accounts.find((a) => a.is_active) || null;
   const unsaved = s.live_logged_in && !active;
 
@@ -1150,8 +1156,8 @@ function render() {
         <span class="rchk" role="checkbox" aria-checked="${checked}" title="${esc(t("list.selectHint"))}" click="actions.toggleSelect('${a.id}')">${ic("check", 11)}</span>
         ${healthDotHtml(h)}
         ${slim ? "" : `<span class="notch" style="background:${notchColor(a.id)}"></span>`}
-        <div class="row-main"${slim ? ` click="actions.toggleRow(event)" title="${esc(t("list.expandTitle"))}"` : ""}>
-          <div class="row-name">${esc(a.name)}${groupTagHtml(a)}${tierBadgeFor(a.id)}${isActive ? `<span class="tag-use">${t("btn.inUse")}</span>` : ""}${a.has_user_info === false ? `<span class="tag-relogin" title="${esc(t("btn.reloginTitle"))}">${t("btn.relogin")}</span>` : ""}</div>
+        <div class="row-main"${ui.density === "compact" ? ` click="actions.toggleRow(event)" title="${esc(slim ? t("list.expandTitle") : t("list.collapseTitle"))}"` : ""}>
+          <div class="row-name">${ui.density === "compact" ? `<span class="row-chev${slim ? "" : " open"}">${ic("chevDown", 12)}</span>` : ""}${esc(a.name)}${groupTagHtml(a)}${tierBadgeFor(a.id)}${isActive ? `<span class="tag-use">${t("btn.inUse")}</span>` : ""}${a.has_user_info === false ? `<span class="tag-relogin" title="${esc(t("btn.reloginTitle"))}">${t("btn.relogin")}</span>` : ""}</div>
           <div class="row-meta">${meta}</div>
         </div>
         ${quotaChipHtml(a.id, h)}
@@ -1191,53 +1197,62 @@ function render() {
   $app.innerHTML = `
     <header class="topbar">
       <div class="wordmark">Z·SWITCH${appVer ? ` <span class="ver">v${esc(appVer)}</span>` : ""}</div>
-      <div class="top-status${unsaved ? " unsaved" : ""}">
-        <span class="status-dot ${dotCls}"></span>
-        <span class="status-text">${esc(statusText)}</span>
+      <div class="top-right">
+        <div class="top-status${unsaved ? " unsaved" : ""}">
+          <span class="status-dot ${dotCls}"></span>
+          <span class="status-text">${esc(statusText)}</span>
+        </div>
+        <button class="btn-ghost tb-gear has-ic" click="actions.openSettings()" aria-label="${t("common.settings")}" title="${t("common.settings")}">${ic("sliders", 15)}</button>
       </div>
     </header>
 
     <section class="toolbar">
-      <button class="btn-primary has-ic${unsaved ? " attention" : ""}" click="actions.capture()" ${!s.live_logged_in || active ? "disabled" : ""}
-        title="${active ? esc(t("m.saveLoginDisabledTitle", { name: active.name })) : ""}">
-        ${ic("capture", 16)} ${t("btn.saveLogin")}
-      </button>
-      ${claimableCount > 0
-        ? `<button class="btn-ghost has-ic claim-all" click="actions.claimAll()" ${claimAllRunning || refreshClaim.running || autoClaimRunning ? "disabled" : ""}
-            title="${t("btn.claimAllTitle")}">${ic("gift", 16)} ${t("btn.claimAll")}${claimableCount > 1 ? ` (${claimableCount})` : ""}</button>`
-        : ""}
-      ${(s.accounts.length > 0)
-        ? `<button class="btn-ghost has-ic" click="actions.refreshClaim()"
-            ${refreshClaim.running || claimAllRunning || Date.now() < refreshClaim.cooldownUntil ? "disabled" : ""}
-            title="${Date.now() < refreshClaim.cooldownUntil && !refreshClaim.running
-              ? esc(t("btn.refreshClaimCooldownTitle", { n: Math.ceil((refreshClaim.cooldownUntil - Date.now()) / 1000) }))
-              : esc(t("btn.refreshClaimTitle"))}">
-            ${ic("refresh", 16)} ${refreshClaim.running
-              ? esc(t("btn.refreshClaimRunning", { done: refreshClaim.done, total: refreshClaim.total }))
-              : esc(t("btn.refreshClaim"))}
-          </button>`
-        : ""}
-      ${(s.accounts.length > 0)
-        ? `<button class="btn-ghost has-ic${quotaSweep.running ? " running" : ""}" click="actions.refreshAllQuota()"
-            title="${quotaSweep.running ? esc(t("list.sweepCancelHint")) : esc(t("list.sweepTitle"))}">
-            ${ic("refresh", 16)} ${quotaSweep.running
-              ? esc(t("list.sweepRunning", { done: quotaSweep.done, total: quotaSweep.total }))
-              : esc(t("list.sweep"))}
-          </button>`
-        : ""}
-      <button class="tog-inline${s.auto_claim ? " on" : ""}${autoClaimRunning ? " running" : ""}"
-        role="switch" aria-checked="${s.auto_claim}" aria-label="${t("btn.autoClaim")}"
-        title="${autoPillTitle(s)}"
-        click="actions.toggleAutoClaim()">
-        <span class="toggle${s.auto_claim ? " on" : ""}" aria-hidden="true"><span class="knob"></span></span>
-        ${t("btn.autoClaim")}
-      </button>
-      <button class="btn-ghost has-ic" click="actions.addAccount()" title="${t("btn.addAccountTitle")}">${ic("userPlus", 16)} ${t("btn.addAccount")}</button>
-      ${s.zcode_running
-        ? `<button class="btn-ghost has-ic" click="actions.askKill()" title="${t("btn.killZcode")}">${ic("power", 16)} ${t("btn.killZcode")}</button>`
-        : `<button class="btn-ghost has-ic" click="actions.launch()" ${s.zcode_path_ok ? "" : "disabled"}>${ic("play", 14)} ${t("btn.launchZcode")}</button>`}
-      <span class="tb-spacer"></span>
-      <button class="btn-ghost tb-gear has-ic" click="actions.openSettings()" aria-label="${t("common.settings")}" title="${t("common.settings")}">${ic("sliders", 16)}</button>
+      <div class="tb-group">
+        <button class="btn-primary has-ic${unsaved ? " attention" : ""}" click="actions.capture()" ${!s.live_logged_in || active ? "disabled" : ""}
+          title="${active ? esc(t("m.saveLoginDisabledTitle", { name: active.name })) : ""}">
+          ${ic("capture", 15)} ${t("btn.saveLogin")}
+        </button>
+        <button class="btn-ghost has-ic" click="actions.addAccount()" title="${t("btn.addAccountTitle")}">${ic("userPlus", 15)} ${t("btn.addAccount")}</button>
+      </div>
+      <span class="tb-sep"></span>
+      <div class="tb-group">
+        ${claimableCount > 0
+          ? `<button class="btn-ghost has-ic claim-all" click="actions.claimAll()" ${claimAllRunning || refreshClaim.running || autoClaimRunning ? "disabled" : ""}
+              title="${t("btn.claimAllTitle")}">${ic("gift", 15)} ${t("btn.claimAll")}${claimableCount > 1 ? ` (${claimableCount})` : ""}</button>`
+          : ""}
+        <button class="tog-inline${s.auto_claim ? " on" : ""}${autoClaimRunning ? " running" : ""}"
+          role="switch" aria-checked="${s.auto_claim}" aria-label="${t("btn.autoClaim")}"
+          title="${autoPillTitle(s)}"
+          click="actions.toggleAutoClaim()">
+          <span class="toggle${s.auto_claim ? " on" : ""}" aria-hidden="true"><span class="knob"></span></span>
+          ${t("btn.autoClaim")}
+        </button>
+        ${(s.accounts.length > 0)
+          ? `<button class="btn-ghost has-ic" click="actions.refreshClaim()"
+              ${refreshClaim.running || claimAllRunning || Date.now() < refreshClaim.cooldownUntil ? "disabled" : ""}
+              title="${Date.now() < refreshClaim.cooldownUntil && !refreshClaim.running
+                ? esc(t("btn.refreshClaimCooldownTitle", { n: Math.ceil((refreshClaim.cooldownUntil - Date.now()) / 1000) }))
+                : esc(t("btn.refreshClaimTitle"))}">
+              ${ic("refresh", 15)} ${refreshClaim.running
+                ? esc(t("btn.refreshClaimRunning", { done: refreshClaim.done, total: refreshClaim.total }))
+                : esc(t("btn.refreshClaim"))}
+            </button>`
+          : ""}
+        ${(s.accounts.length > 0)
+          ? `<button class="btn-ghost has-ic${quotaSweep.running ? " running" : ""}" click="actions.refreshAllQuota()"
+              title="${quotaSweep.running ? esc(t("list.sweepCancelHint")) : esc(t("list.sweepTitle"))}">
+              ${ic("refresh", 15)} ${quotaSweep.running
+                ? esc(t("list.sweepRunning", { done: quotaSweep.done, total: quotaSweep.total }))
+                : esc(t("list.sweep"))}
+            </button>`
+          : ""}
+      </div>
+      <span class="tb-sep"></span>
+      <div class="tb-group">
+        ${s.zcode_running
+          ? `<button class="btn-ghost has-ic" click="actions.askKill()" title="${t("btn.killZcode")}">${ic("power", 15)} ${t("btn.killZcode")}</button>`
+          : `<button class="btn-ghost has-ic" click="actions.launch()" ${s.zcode_path_ok ? "" : "disabled"}>${ic("play", 14)} ${t("btn.launchZcode")}</button>`}
+      </div>
     </section>
 
     ${listHeadHtml(s, sum, visible)}
