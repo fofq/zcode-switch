@@ -222,3 +222,55 @@ export function openProviderModal(m) {
   const first = mask.querySelector(".pv-item");
   if (first) first.focus();
 }
+
+export function openGroupModal(m) {
+  document.querySelector(".pv-mask")?.remove();
+  const mask = document.createElement("div");
+  mask.className = "pv-mask";
+  const cur = (m.current || "").trim();
+  const itemOf = (g, label, isCur) => `
+    <button class="pv-item gm-item" data-g="${g ? esc(JSON.stringify(g)) : ""}">
+      <span class="pv-name">${ic("folder", 14)} <span class="gm-gname">${esc(label)}</span></span>
+      ${isCur ? `<span class="gm-cur">${ic("check", 13)}</span>` : `<span class="pv-arrow">→</span>`}
+    </button>`;
+  const items = [
+    itemOf("", t("grp.none"), !cur),
+    ...(m.groups || []).map((g) => itemOf(g, g, g === cur)),
+  ].join("");
+  mask.innerHTML = `
+    <div class="pv-panel">
+      <div class="pv-title">${t("grp.modalTitle", { name: esc(m.name) })}</div>
+      <div class="pv-sub">${t("grp.modalSub")}</div>
+      <div class="pv-list">${items}</div>
+      <div class="gm-newrow">
+        <input class="gm-input" type="text" maxlength="40" placeholder="${t("grp.newPh")}" autocomplete="off">
+        <button class="btn-ghost gm-create">${t("grp.create")}</button>
+      </div>
+      <div class="pv-actions"><button class="btn-ghost pv-cancel">${t("common.cancel")}</button></div>
+    </div>`;
+  document.body.appendChild(mask);
+  const onKey = (e) => { if (e.key === "Escape") close(); };
+  const close = () => { mask.remove(); document.removeEventListener("keydown", onKey); };
+  const input = mask.querySelector(".gm-input");
+  const create = () => {
+    const v = input.value.trim();
+    if (!v) return;
+    close();
+    m.onCreate?.(v);
+  };
+  input.addEventListener("keydown", (e) => { if (e.key === "Enter") create(); });
+  mask.querySelector(".gm-create").addEventListener("click", create);
+  mask.querySelectorAll(".gm-item").forEach((b) => {
+    b.addEventListener("click", () => {
+      let g = b.dataset.g;
+      g = g ? JSON.parse(g) : null;
+      if ((g || "").trim() === cur) { close(); return; }
+      close();
+      m.onPick?.(g);
+    });
+  });
+  mask.querySelector(".pv-cancel").addEventListener("click", close);
+  mask.addEventListener("click", (e) => { if (e.target === mask) close(); });
+  document.addEventListener("keydown", onKey);
+  input.focus();
+}

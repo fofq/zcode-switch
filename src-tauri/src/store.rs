@@ -89,6 +89,8 @@ pub struct Account {
     pub virtual_device_mid: Option<String>,
     #[serde(default)]
     pub virtual_arms_uid: Option<String>,
+    #[serde(default)]
+    pub group: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
@@ -106,6 +108,8 @@ pub struct Settings {
     pub language: Option<String>,
     #[serde(default)]
     pub auto_claim: Option<bool>,
+    #[serde(default)]
+    pub grouped: Option<bool>,
 }
 
 impl Settings {
@@ -113,6 +117,7 @@ impl Settings {
     pub fn close_to_tray(&self) -> bool { self.close_to_tray.unwrap_or(true) }
     pub fn hot_switch(&self) -> bool { self.hot_switch.unwrap_or(false) }
     pub fn auto_claim(&self) -> bool { self.auto_claim.unwrap_or(false) }
+    pub fn grouped(&self) -> bool { self.grouped.unwrap_or(true) }
     pub fn auth_proxy(&self) -> Option<&str> {
         if self.auth_proxy_on.unwrap_or(false) {
             self.auth_proxy_url.as_deref().map(str::trim).filter(|s| !s.is_empty())
@@ -132,6 +137,7 @@ pub struct AccountSummary {
     pub has_config: bool,
     pub has_user_info: bool,
     pub identity: zcrypto::Identity,
+    pub group: Option<String>,
 }
 
 #[derive(Serialize, Clone, Debug)]
@@ -150,6 +156,7 @@ pub struct AppState {
     pub close_to_tray: bool,
     pub hot_switch: bool,
     pub auto_claim: bool,
+    pub grouped: bool,
     pub auth_proxy_on: bool,
     pub auth_proxy_url: Option<String>,
     pub language: String,
@@ -547,6 +554,7 @@ pub fn capture_current(paths: &Paths, name: Option<String>) -> Result<Account, S
         config,
         virtual_device_mid: None,
         virtual_arms_uid: None,
+        group: None,
     };
     adopt_virtual_device_mid(paths, &mut acc)?;
     adopt_virtual_arms_uid(paths, &mut acc)?;
@@ -590,6 +598,7 @@ fn auto_preserve(paths: &Paths, accounts: &[Account], target_hash: &str) -> Resu
         config: read_live_config(paths),
         virtual_device_mid: None,
         virtual_arms_uid: None,
+        group: None,
     };
     adopt_virtual_device_mid(paths, &mut acc)?;
     adopt_virtual_arms_uid(paths, &mut acc)?;
@@ -967,6 +976,20 @@ pub fn rename_account(paths: &Paths, id: &str, new_name: &str) -> Result<Account
     Ok(acc)
 }
 
+pub fn set_account_group(paths: &Paths, id: &str, group: Option<&str>) -> Result<Account, String> {
+    let mut acc = load_account(paths, id)?;
+    let g = group.map(str::trim).filter(|s| !s.is_empty()).map(String::from);
+    if let Some(ref s) = g {
+        if s.chars().count() > 40 {
+            return Err(tr("err.group.too_long"));
+        }
+    }
+    acc.group = g;
+    acc.updated_at = now_ts();
+    save_account(paths, &acc)?;
+    Ok(acc)
+}
+
 pub fn delete_account(paths: &Paths, id: &str) -> Result<(), String> {
     if id.is_empty() || !id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
         return Err(tr("err.store.bad_id"));
@@ -1291,11 +1314,12 @@ pub fn export_bundle_value(accounts: &[Account]) -> Value {
             "createdAt": a.created_at,
             "credentials": a.credentials,
             "config": a.config,
+            "group": a.group.clone().map(|g| json!(g)),
         })).collect::<Vec<_>>(),
     })
 }
 
-type ImportCandidate = (Option<String>, Value, Option<Value>);
+type ImportCandidate = (Option<String>, Value, Option<Value>, Option<String>);
 
 fn import_candidates(v: &Value) -> Result<Vec<ImportCandidate>, String> {
     if v.get("format").and_then(|f| f.as_str()) == Some("zcode-accounts-bundle") {
@@ -1310,6 +1334,7 @@ fn import_candidates(v: &Value) -> Result<Vec<ImportCandidate>, String> {
                 item.get("name").and_then(|n| n.as_str()).map(String::from),
                 creds,
                 item.get("config").cloned(),
+                item.get("group").and_then(|g| g.as_str()).map(String::from),
             ));
         }
         return Ok(out);
@@ -1331,7 +1356,7 @@ pub fn import_values(paths: &Paths, files: &[(String, Value)]) -> Result<ImportR
                 continue;
             }
         };
-        for (name_opt, creds, config_opt) in cands {
+        for (name_opt, creds, config_opt, group_opt) in cands {
             if !is_logged_in(&creds) {
                 report.skipped.push(trf("err.import.no_creds", &[("fname", fname.as_str())]));
                 continue;
@@ -1347,6 +1372,7 @@ pub fn import_values(paths: &Paths, files: &[(String, Value)]) -> Result<ImportR
             });
             let name = unique_name(&accounts, &base_name);
             let ts = now_ts();
+            let group = group_opt.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
             let acc = Account {
                 id: Uuid::new_v4().to_string(),
                 name: name.clone(),
@@ -1357,6 +1383,7 @@ pub fn import_values(paths: &Paths, files: &[(String, Value)]) -> Result<ImportR
                 config: config_opt,
                 virtual_device_mid: None,
                 virtual_arms_uid: None,
+                group,
             };
             new_accounts.push(acc);
             report.added.push(name);
@@ -1394,6 +1421,7 @@ pub fn get_state(paths: &Paths) -> Result<AppState, String> {
             has_config: a.config.is_some(),
             has_user_info: crate::claim::telemetry_user_id(&paths.home, &a.credentials).is_some(),
             identity: zcrypto::account_identity(&a.credentials, &paths.home),
+            group: a.group.clone(),
         })
         .collect();
     Ok(AppState {
@@ -1411,6 +1439,7 @@ pub fn get_state(paths: &Paths) -> Result<AppState, String> {
         close_to_tray: settings.close_to_tray(),
         hot_switch: settings.hot_switch(),
         auto_claim: settings.auto_claim(),
+        grouped: settings.grouped(),
         auth_proxy_on: settings.auth_proxy_on.unwrap_or(false),
         auth_proxy_url: settings.auth_proxy_url.clone(),
         language: crate::i18n::current().as_str().to_string(),

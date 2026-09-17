@@ -702,6 +702,7 @@ fn persist_oauth_account(
         config: Some(config),
         virtual_device_mid: Some(mid.to_string()),
         virtual_arms_uid: Some(store::new_arms_uid()),
+        group: None,
     };
     if !flow_still_ours() {
         return Err("__superseded__".into());
@@ -838,12 +839,19 @@ async fn kill_zcode(app: AppHandle) -> Result<(), String> {
 }
 
 #[tauri::command]
+async fn set_account_group(id: String, group: Option<String>) -> Result<Account, String> {
+    let _guard = store_guard();
+    store::set_account_group(&Paths::detect(), &id, group.as_deref())
+}
+
+#[tauri::command]
 async fn set_behavior(
     app: AppHandle,
     launch_after_switch: Option<bool>,
     close_to_tray: Option<bool>,
     hot_switch: Option<bool>,
     auto_claim: Option<bool>,
+    grouped: Option<bool>,
 ) -> Result<(), String> {
     let _guard = store_guard();
     let paths = Paths::detect();
@@ -859,6 +867,9 @@ async fn set_behavior(
     }
     if let Some(v) = auto_claim {
         s.auto_claim = Some(v);
+    }
+    if let Some(v) = grouped {
+        s.grouped = Some(v);
     }
     let r = save_settings(&paths, &s);
     rebuild_tray(&app);
@@ -1138,6 +1149,7 @@ pub fn run() {
             app_version,
             capture_current,
             rename_account,
+            set_account_group,
             delete_account,
             update_account_from_live,
             switch_to,

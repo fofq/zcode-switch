@@ -1,0 +1,61 @@
+name: Build
+
+# 仅为「试装/自测」产出构建产物（上传 Artifacts，不发 Release）。
+# 正式发版请打 v* tag，走 release.yml。
+on:
+  workflow_dispatch:
+    inputs:
+      bundles:
+        description: 'tauri --bundles 参数（默认 nsis）'
+        required: false
+        default: nsis
+  push:
+    branches:
+      - 'feat/**'
+      - 'build/**'
+
+jobs:
+  windows:
+    name: Build Windows artifacts
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: Install frontend deps
+        run: npm ci
+
+      - name: Check i18n keys
+        run: npm run check:i18n
+
+      - name: Build (前端 + Rust + NSIS)
+        run: npm run tauri build -- --bundles ${{ github.event.inputs.bundles || 'nsis' }}
+
+      - name: Collect artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+          VER=$(node -p "require('./package.json').version")
+          SHA=$(git rev-parse --short HEAD)
+          mkdir -p out
+          cp "src-tauri/target/release/zcode-switch.exe" "out/zcode-switch_${VER}_${SHA}_portable.exe"
+          cp src-tauri/target/release/bundle/nsis/*-setup.exe "out/"
+          (cd out && sha256sum * > checksums.txt)
+          ls -l out
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: zcode-switch-windows-x64
+          path: out/*
+          if-no-files-found: error
+          retention-days: 14

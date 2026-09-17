@@ -52,6 +52,14 @@ const actions = {
     });
   },
 
+  async toggleGrouped() {
+    await guard(async () => {
+      await invoke("set_behavior", { grouped: !state.grouped });
+      await refresh(); render();
+      toast(t("s.savedToast"));
+    });
+  },
+
   async toggleBehavior(key) {
     await guard(async () => {
       await invoke("set_behavior", {
@@ -178,6 +186,7 @@ function render() {
       ${toggle(s.launch_after_switch, "actions.toggleBehavior('launch')", t("s.launchAfter"), t("s.launchAfterDesc"))}
       ${toggle(s.close_to_tray, "actions.toggleBehavior('tray')", t("s.closeTray"), t("s.closeTrayDesc"))}
       ${toggle(s.hot_switch, "actions.toggleBehavior('hot')", t("s.hotSwitch"), t("s.hotSwitchDesc"))}
+      ${toggle(s.grouped, "actions.toggleGrouped()", t("s.grouped"), t("s.groupedDesc"))}
       <label style="margin-top:14px">${t("s.authLabel")}</label>
       ${toggle(s.auth_proxy_on, "actions.toggleAuthProxy()", t("s.proxyToggle"), t("s.proxyToggleDesc"))}
       <div class="path-line" style="margin-top:6px">

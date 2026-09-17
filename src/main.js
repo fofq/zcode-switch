@@ -1,6 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { esc, toast, openPwModal, openConfirmModal, openProviderModal, installDelegation, dismissSplash } from "./ui.js";
+import { esc, toast, openPwModal, openConfirmModal, openProviderModal, openGroupModal, installDelegation, dismissSplash } from "./ui.js";
 import { ic } from "./icons.js";
 import { init, t, has, lang, localeTag, stripErr } from "./i18n.js";
 
@@ -52,6 +52,62 @@ function fmtNum(v) {
 function idLabel(id) {
   if (!id) return null;
   return id.display_name || id.username || id.email || null;
+}
+
+let collapsedSections = new Set();
+
+function acctGroup(a) {
+  return String(a?.group || "").trim();
+}
+function acctStatusKey(a) {
+  if (a.is_active) return "active";
+  if (a.has_user_info === false) return "relogin";
+  return "normal";
+}
+const STATUS_ORDER = ["active", "relogin", "normal"];
+function statusLabel(key) {
+  return key === "active" ? t("grp.status.active")
+    : key === "relogin" ? t("grp.status.relogin")
+      : t("grp.status.normal");
+}
+function customGroups(accounts) {
+  const set = new Set();
+  for (const a of accounts) {
+    const g = acctGroup(a);
+    if (g) set.add(g);
+  }
+  return [...set].sort((x, y) => x.localeCompare(y, localeTag(), { sensitivity: "base" }));
+}
+function groupTagHtml(a) {
+  const g = acctGroup(a);
+  if (!g) return "";
+  return `<span class="tag-grp" title="${esc(t("grp.tagTitle", { group: g }))}">${ic("folder", 11)} ${esc(g)}</span>`;
+}
+function groupedListHtml(accounts, rowHtml) {
+  const buckets = new Map();
+  for (const a of accounts) {
+    const g = acctGroup(a);
+    const key = g ? `g:${g}` : `s:${acctStatusKey(a)}`;
+    if (!buckets.has(key)) buckets.set(key, { label: g || statusLabel(acctStatusKey(a)), rows: [] });
+    buckets.get(key).rows.push(rowHtml(a));
+  }
+  const custom = [...buckets.keys()]
+    .filter((k) => k.startsWith("g:"))
+    .sort((x, y) => x.slice(2).localeCompare(y.slice(2), localeTag(), { sensitivity: "base" }));
+  const status = STATUS_ORDER.map((s) => `s:${s}`).filter((k) => buckets.has(k));
+  return [...custom, ...status].map((k) => {
+    const b = buckets.get(k);
+    const collapsed = collapsedSections.has(k);
+    return `
+    <section class="grp-sec${collapsed ? " collapsed" : ""}" data-sec="${esc(k)}">
+      <button class="grp-head" click="actions.toggleSection(event)" aria-expanded="${collapsed ? "false" : "true"}">
+        <span class="grp-chev">${ic("chevDown", 13)}</span>
+        <span class="grp-title">${esc(b.label)}</span>
+        <span class="grp-num">${t("grp.count", { count: b.rows.length })}</span>
+      </button>
+      ${collapsed ? "" : `<div class="grp-body">${b.rows.join("")}</div>`}
+    </section>`;
+  }).join("");
 }
 
 async function refresh() {
@@ -176,6 +232,47 @@ const actions = {
     window.__renameBlurTimer = setTimeout(() => {
       if (renaming === id && !window.__renameSaving) actions.cancelRename();
     }, 180);
+  },
+
+  async setGrouped(on) {
+    if (!!state?.grouped === !!on) return;
+    await guard(async () => {
+      await invoke("set_behavior", { grouped: on });
+      await refresh(); render();
+    });
+  },
+
+  toggleSection(ev) {
+    const key = ev?.target?.closest?.(".grp-sec")?.dataset?.sec;
+    if (!key) return;
+    if (collapsedSections.has(key)) collapsedSections.delete(key);
+    else collapsedSections.add(key);
+    render();
+  },
+
+  setGroup(id) {
+    const a = state?.accounts.find((x) => x.id === id);
+    if (!a) return;
+    openGroupModal({
+      name: a.name,
+      current: acctGroup(a),
+      groups: customGroups(state?.accounts || []),
+      onPick: (g) => actions.applyGroup(id, g),
+      onCreate: (g) => actions.applyGroup(id, g),
+    });
+  },
+
+  async applyGroup(id, group) {
+    const a = state?.accounts.find((x) => x.id === id);
+    const next = String(group || "").trim();
+    if (next === acctGroup(a)) return;
+    await guard(async () => {
+      const r = await invoke("set_account_group", { id, group: next || null });
+      const applied = acctGroup(r);
+      if (applied) toast(t("grp.toastGrouped", { name: a?.name, group: applied }), "ok");
+      else toast(t("grp.toastUngrouped", { name: a?.name }));
+      await refresh(); render();
+    });
   },
 
   async delete(id) {
@@ -750,7 +847,7 @@ function render() {
       ? unsaved ? t("m.status.unsaved") : t("m.status.safe")
       : t("m.status.loggedOut");
 
-  const rows = s.accounts.map((a) => {
+  const rowHtml = (a) => {
     const isActive = a.is_active;
     if (renaming === a.id) {      return `
       <div class="row${isActive ? " active" : ""}" data-id="${a.id}">
@@ -780,10 +877,11 @@ function render() {
       <div class="row-top">
         <span class="notch" style="background:${notchColor(a.id)}"></span>
         <div class="row-main">
-          <div class="row-name">${esc(a.name)}${tierBadgeFor(a.id)}${isActive ? `<span class="tag-use">${t("btn.inUse")}</span>` : ""}${a.has_user_info === false ? `<span class="tag-relogin" title="${esc(t("btn.reloginTitle"))}">${t("btn.relogin")}</span>` : ""}</div>
+          <div class="row-name">${esc(a.name)}${groupTagHtml(a)}${tierBadgeFor(a.id)}${isActive ? `<span class="tag-use">${t("btn.inUse")}</span>` : ""}${a.has_user_info === false ? `<span class="tag-relogin" title="${esc(t("btn.reloginTitle"))}">${t("btn.relogin")}</span>` : ""}</div>
           <div class="row-meta">${meta}</div>
         </div>
         <div class="row-actions">
+          <button class="icon-btn" title="${t("btn.group")}" aria-label="${t("btn.group")}" click="actions.setGroup('${a.id}')">${ic("folder", 16)}</button>
           <button class="icon-btn" title="${t("btn.quota")}" aria-label="${t("btn.quota")}" click="actions.acctQuota('${a.id}')">${ic("gauge", 16)}</button>
           <button class="icon-btn" title="${t("btn.rename")}" aria-label="${t("btn.rename")}" click="actions.rename('${a.id}')">${ic("pen", 16)}</button>
           <button class="icon-btn" title="${t("btn.export")}" aria-label="${t("btn.export")}" click="actions.exportOne('${a.id}')">${ic("export", 16)}</button>
@@ -795,7 +893,7 @@ function render() {
       </div>
       ${acctQuotaSlot(a.id)}
     </div>`;
-  }).join("");
+  };
 
   const listHtml = s.accounts.length === 0
     ? `<div class="empty">
@@ -803,7 +901,9 @@ function render() {
          ${t("m.emptyTitle")}<br>
          ${t("m.emptyBody")}
        </div>`
-    : rows;
+    : s.grouped
+      ? groupedListHtml(s.accounts, rowHtml)
+      : s.accounts.map(rowHtml).join("");
 
   const claimableCount = s.accounts.filter((a) => (claimable[a.id]?.plans || []).length > 0).length;
 
@@ -853,7 +953,13 @@ function render() {
 
     <div class="section-head">
       <h2>${t("m.accounts")}</h2>
-      <span class="count">${t("m.count", { count: s.accounts.length })}</span>
+      <div class="sh-right">
+        <div class="view-seg" role="group" aria-label="${t("grp.viewLabel")}">
+          <button class="vs-opt${s.grouped ? "" : " on"}" aria-pressed="${!s.grouped}" click="actions.setGrouped(false)">${t("grp.flat")}</button>
+          <button class="vs-opt${s.grouped ? " on" : ""}" aria-pressed="${!!s.grouped}" click="actions.setGrouped(true)">${t("grp.grouped")}</button>
+        </div>
+        <span class="count">${t("m.count", { count: s.accounts.length })}</span>
+      </div>
     </div>
 
     <main class="list">${listHtml}</main>
