@@ -473,7 +473,20 @@ function twoSnippet(name, st) {
   }
 }
 
-function twoApiFormHtml() {
+  /** 默认模型列表：套餐模型（本地额度实测，小写化）+ 官方免费模型 */
+  function autoModelList() {
+    const set = new Map();
+    for (const m of detectedModels()) {
+      const k = m.toLowerCase();
+      if (!set.has(k)) set.set(k, k);
+    }
+    for (const m of FREE_MODELS) {
+      if (!set.has(m)) set.set(m, m);
+    }
+    return [...set.values()].join(", ");
+  }
+
+  function twoApiFormHtml() {
   const st = state || {};
   const on = !!st.two_api_on;
   const port = st.two_api_port || 8117;
@@ -516,7 +529,7 @@ function twoApiFormHtml() {
         </label>
         <label class="two-cfg wide"><span>${t("two.models")}</span>
           <span class="two-models-row">
-            <input class="two-input two-models" type="text" value="${esc(st.two_api_models || "")}" placeholder="glm-5.3-flash, glm-5.3">
+            <input class="two-input two-models" type="text" value="${esc(st.two_api_models || autoModelList())}" placeholder="${esc(autoModelList())}">
             <button class="btn-ghost has-ic" click="actions.twoDetectModels()" title="${esc(t("two.detectModelsTitle"))}">${ic("refresh", 13)} ${t("two.detectModels")}</button>
           </span>
         </label>
@@ -1326,17 +1339,23 @@ const actions = {
 
   closeSettings() { closeSettingsModal(); },
 
-  /** 模型列表一键填充：当前值 + 官方免费模型 + 本地额度里实测到的模型 */
+  /** 模型列表一键填充：套餐模型（本地实测，统一小写）+ 官方免费模型；大小写不敏感去重 */
   twoDetectModels() {
     const input = twoApiModalEl?.querySelector(".two-models");
     if (!input) return;
-    const cur = input.value.split(",").map((s) => s.trim()).filter(Boolean);
-    const set = new Set([...cur, ...FREE_MODELS, ...detectedModels()]);
-    input.value = [...set].join(", ");
+    const set = new Map();
+    for (const m of detectedModels()) {
+      const k = m.toLowerCase();
+      if (!set.has(k)) set.set(k, k);
+    }
+    for (const m of FREE_MODELS) {
+      if (!set.has(m)) set.set(m, m);
+    }
+    input.value = [...set.values()].join(", ");
     toast(t("two.detected", { n: set.size }));
   },
 
-  /** 连通性测试：弹窗内联结果 + toast 双反馈 */
+  /** 连通性测试：本地服务 + 免费模型 E2E 实测（走真实上游转发），内联两行结果 + toast */
   async twoTest() {
     const el = twoApiModalEl?.querySelector(".two-test-result");
     if (el) { el.textContent = t("two.testRunning"); el.className = "two-test-result running"; }
@@ -1345,12 +1364,17 @@ const actions = {
       twoLastStatus = await invoke("two_api_status").catch(() => null);
       const old = twoApiModalEl?.querySelector(".two-status");
       if (old) old.outerHTML = twoStatusHtml();
-      const ok = !!r?.ok;
-      const text = ok
-        ? `✓ ${t("two.testOk", { ms: r.latencyMs, status: r.status })}`
-        : `✕ ${t("two.testFail", { err: r?.error || "unknown" })}`;
-      if (el) { el.textContent = text; el.className = `two-test-result ${ok ? "ok" : "err"}`; }
-      toast(ok ? t("two.testOk", { ms: r.latencyMs, status: r.status }) : t("two.testFail", { err: r?.error || "unknown" }), ok ? "ok" : "err");
+      const localLine = r?.localOk
+        ? `✓ ${t("two.tLocal")} ${r.localMs}ms`
+        : `✕ ${t("two.tLocal")}：${r?.error || "unknown"}`;
+      const upLine = r?.e2eOk
+        ? `✓ ${t("two.tUpstream")} ${r.e2eMs}ms`
+        : `✕ ${t("two.tUpstream")}：${r?.error || "unknown"}`;
+      if (el) {
+        el.textContent = `${localLine}\n${upLine}`;
+        el.className = `two-test-result ${r?.ok ? "ok" : "err"}`;
+      }
+      toast(r?.ok ? `${localLine} · ${upLine}` : `${localLine} | ${upLine}`, r?.ok ? "ok" : "err");
     } catch (e) {
       if (el) { el.textContent = `✕ ${stripErr(e)}`; el.className = "two-test-result err"; }
       toast(stripErr(e), "err");
@@ -1385,7 +1409,7 @@ const actions = {
   async twoSaveConfig() {
     try {
       const raw = Number(document.querySelector(".two-port")?.value);
-      const models = document.querySelector(".two-models")?.value || "";
+      const models = (document.querySelector(".two-models")?.value || "").trim() || autoModelList();
       await invoke("set_two_api", {
         on: !!state?.two_api_on,
         port: Number.isFinite(raw) && raw > 0 ? raw : 8117,
@@ -1432,17 +1456,6 @@ const actions = {
   async twoCopySnippet(name) {
     const ok = await copyText(twoSnippet(name, state || {}));
     toast(ok ? t("two.copied") : t("list.copyFail"), ok ? "ok" : "err");
-  },
-
-  async twoTest() {
-    try {
-      const r = await invoke("two_api_test");
-      twoLastStatus = await invoke("two_api_status").catch(() => null);
-      const old = twoApiModalEl?.querySelector(".two-status");
-      if (old) old.outerHTML = twoStatusHtml();
-      if (r?.ok) toast(t("two.testOk", { ms: r.latencyMs, status: r.status }));
-      else toast(t("two.testFail", { err: r?.error || "unknown" }), "err");
-    } catch (e) { toast(stripErr(e), "err"); }
   },
 
   async twoRegenToken() {

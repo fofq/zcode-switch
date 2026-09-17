@@ -1,5 +1,9 @@
 //! 2API：本地 Anthropic/OpenAI 兼容服务，把账号额度暴露给其它编程工具。
-//! 路由与鉴权在本文件；账号→(apiKey, baseURL) 解析在 resolve.rs；OpenAI↔Anthropic 翻译在 openai_map.rs。
+//! 路由策略（按模型分流）：
+//! - 套餐模型（glm-5.3 / glm-5.3-flash 等）→ 账号 coding endpoint（anthropic 格式）透传，走账号套餐额度；
+//! - 官方长期免费模型（4.5-flash / 4.7-flash / 4.6v-flash）→ 标准 OpenAI 兼容端点 paas/v4，
+//!   Bearer 鉴权 + 全账号 key 池智能轮询（免费不耗额度但有速率限制，轮询摊平）。
+//! Anthropic 入站请求免费模型时做 请求/响应/SSE 双向翻译。
 
 pub mod openai_map;
 pub mod resolve;
@@ -22,8 +26,16 @@ use crate::store::{self, Paths};
 
 const DEFAULT_ANTHROPIC_VERSION: &str = "2023-06-01";
 const CACHE_TTL: Duration = Duration::from_secs(600);
-/// 站方标注长期免费的模型，始终并入 /v1/models（docs.z.ai/guides/overview/pricing）
+const POOL_TTL: Duration = Duration::from_secs(300);
+/// 站方标注长期免费的模型（docs.z.ai/guides/overview/pricing），走 paas/v4 标准端点
 const FREE_MODELS: &[&str] = &["glm-4.7-flash", "glm-4.6v-flash", "glm-4.5-flash"];
+const ZAI_PAAS_BASE: &str = "https://api.z.ai/api/paas/v4";
+const BIGMODEL_PAAS_BASE: &str = "https://open.bigmodel.cn/api/paas/v4";
+
+pub fn is_free_model(m: &str) -> bool {
+    let l = m.to_lowercase();
+    FREE_MODELS.iter().any(|f| *f == l)
+}
 
 #[derive(Clone, Debug)]
 pub struct Cfg {
@@ -53,6 +65,12 @@ fn stats() -> &'static Arc<Stats> {
     STATS.get_or_init(|| Arc::new(Stats::default()))
 }
 
+#[derive(Clone, Debug)]
+pub struct PoolKey {
+    pub api_key: String,
+    pub paas_base: String,
+}
+
 pub struct SharedState {
     pub paths: Paths,
     pub token: Mutex<String>,
@@ -61,6 +79,10 @@ pub struct SharedState {
     pub cache: Mutex<HashMap<String, (std::time::Instant, store::ApiKeyInfo)>>,
     /// 2API 每账号累计请求数（跟随/锁定都以解析到的账号 id 计）
     pub usage: Mutex<HashMap<String, u64>>,
+    /// 免费模型 key 池（全账号平台 key）缓存
+    pub pool: Mutex<Option<(std::time::Instant, Vec<PoolKey>)>>,
+    /// 轮询游标
+    pub rr: AtomicU64,
 }
 
 pub struct Manager {
@@ -115,6 +137,8 @@ pub async fn sync(paths: &Paths) -> Result<(), String> {
         models: Mutex::new(cfg.models.clone()),
         cache: Mutex::new(HashMap::new()),
         usage: Mutex::new(HashMap::new()),
+        pool: Mutex::new(None),
+        rr: AtomicU64::new(0),
     });
     let app = router(state.clone());
     // 重启同端口时旧监听可能还没完全释放，做一小段重试
@@ -162,59 +186,6 @@ pub struct Status {
     pub usage: HashMap<String, u64>,
 }
 
-#[derive(serde::Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct TestResult {
-    pub ok: bool,
-    pub latency_ms: u64,
-    pub status: u16,
-    pub error: Option<String>,
-}
-
-/// 连通性测试：实际请求本机 /v1/models（带令牌），返回延迟与 HTTP 状态。
-pub async fn test_service() -> TestResult {
-    let (port, token) = {
-        let mgr = MANAGER.lock().unwrap();
-        match mgr.as_ref() {
-            Some(m) => (m.cfg.port, m.state.token.lock().unwrap().clone()),
-            None => (0, String::new()),
-        }
-    };
-    if port == 0 {
-        return TestResult { ok: false, latency_ms: 0, status: 0, error: Some("服务未运行".into()) };
-    }
-    tauri::async_runtime::spawn_blocking(move || {
-        let started = std::time::Instant::now();
-        let url = format!("http://127.0.0.1:{port}/v1/models");
-        let mut req = upstream_agent().get(&url);
-        if !token.is_empty() {
-            req = req.set("Authorization", &format!("Bearer {token}"));
-        }
-        match req.call() {
-            Ok(resp) => TestResult {
-                ok: true,
-                latency_ms: started.elapsed().as_millis() as u64,
-                status: resp.status(),
-                error: None,
-            },
-            Err(ureq::Error::Status(code, _)) => TestResult {
-                ok: true,
-                latency_ms: started.elapsed().as_millis() as u64,
-                status: code,
-                error: None,
-            },
-            Err(e) => TestResult {
-                ok: false,
-                latency_ms: started.elapsed().as_millis() as u64,
-                status: 0,
-                error: Some(format!("{e}")),
-            },
-        }
-    })
-    .await
-    .unwrap_or(TestResult { ok: false, latency_ms: 0, status: 0, error: Some("内部任务失败".into()) })
-}
-
 pub fn status() -> Status {
     let mgr = MANAGER.lock().unwrap();
     let (running, port, usage) = mgr
@@ -230,6 +201,78 @@ pub fn status() -> Status {
         last_request_at: st.last_request_at.load(Ordering::Relaxed),
         usage,
     }
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TestResult {
+    pub ok: bool,
+    pub local_ok: bool,
+    pub local_ms: u64,
+    pub e2e_ok: bool,
+    pub e2e_ms: u64,
+    pub status: u16,
+    pub error: Option<String>,
+}
+
+fn upstream_agent() -> ureq::Agent {
+    ureq::AgentBuilder::new()
+        .timeout_connect(Duration::from_secs(10))
+        .build()
+}
+
+/// 连通性测试：1) 本地 /v1/models；2) 用免费模型真实走一遍 chat/completions（E2E 验证鉴权与上游转发）。
+pub async fn test_service() -> TestResult {
+    let (port, token) = {
+        let mgr = MANAGER.lock().unwrap();
+        match mgr.as_ref() {
+            Some(m) => (m.cfg.port, m.state.token.lock().unwrap().clone()),
+            None => (0, String::new()),
+        }
+    };
+    if port == 0 {
+        return TestResult { ok: false, local_ok: false, local_ms: 0, e2e_ok: false, e2e_ms: 0, status: 0, error: Some("服务未运行".into()) };
+    }
+    tauri::async_runtime::spawn_blocking(move || {
+        // 阶段 1：本地服务
+        let t0 = std::time::Instant::now();
+        let mut req = upstream_agent().get(&format!("http://127.0.0.1:{port}/v1/models"));
+        if !token.is_empty() {
+            req = req.set("Authorization", &format!("Bearer {token}"));
+        }
+        let local_ok = req.call().is_ok();
+        let local_ms = t0.elapsed().as_millis() as u64;
+        if !local_ok {
+            return TestResult { ok: false, local_ok: false, local_ms, e2e_ok: false, e2e_ms: 0, status: 0, error: Some("本地服务无响应".into()) };
+        }
+        // 阶段 2：E2E——免费模型真实转发（不耗套餐额度）
+        let t1 = std::time::Instant::now();
+        let body = json!({
+            "model": "glm-4.5-flash",
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 1,
+        });
+        let resp = upstream_agent()
+            .post(&format!("http://127.0.0.1:{port}/v1/chat/completions"))
+            .set("Authorization", &format!("Bearer {token}"))
+            .set("Content-Type", "application/json")
+            .send_string(&body.to_string());
+        let e2e_ms = t1.elapsed().as_millis() as u64;
+        match resp {
+            Ok(r) => TestResult { ok: true, local_ok: true, local_ms, e2e_ok: true, e2e_ms, status: r.status(), error: None },
+            Err(ureq::Error::Status(code, r)) => {
+                let text = r.into_string().unwrap_or_default();
+                let msg = serde_json::from_str::<Value>(&text)
+                    .ok()
+                    .and_then(|v| v.pointer("/error/message").and_then(|m| m.as_str()).map(String::from))
+                    .unwrap_or_else(|| format!("HTTP {code}"));
+                TestResult { ok: false, local_ok: true, local_ms, e2e_ok: false, e2e_ms, status: code, error: Some(msg) }
+            }
+            Err(e) => TestResult { ok: false, local_ok: true, local_ms, e2e_ok: false, e2e_ms, status: 0, error: Some(format!("{e}")) },
+        }
+    })
+    .await
+    .unwrap_or(TestResult { ok: false, local_ok: false, local_ms: 0, e2e_ok: false, e2e_ms: 0, status: 0, error: Some("内部任务失败".into()) })
 }
 
 fn router(state: Arc<SharedState>) -> Router {
@@ -288,10 +331,45 @@ async fn models(State(st): State<Arc<SharedState>>) -> impl IntoResponse {
 }
 
 async fn messages(State(st): State<Arc<SharedState>>, headers: HeaderMap, body: axum::body::Bytes) -> Response {
+    // 解析出模型名以分流；解析失败按套餐模型透传（上游会给明确错误）
+    let parsed: Option<Value> = serde_json::from_slice(&body).ok();
+    let model = parsed
+        .as_ref()
+        .and_then(|v| v.get("model"))
+        .and_then(|m| m.as_str())
+        .unwrap_or("")
+        .to_string();
+    if !model.is_empty() && is_free_model(&model) {
+        let stream = parsed.as_ref().and_then(|v| v.get("stream")).and_then(|s| s.as_bool()).unwrap_or(false);
+        let Some(v) = parsed else { return err_json(StatusCode::BAD_REQUEST, "请求不是合法 JSON") };
+        let mut translated = match openai_map::translate_request(&v) {
+            Ok(r) => r,
+            Err(e) => return err_json(StatusCode::BAD_REQUEST, &e),
+        };
+        translated["model"] = json!(model.to_lowercase());
+        let mode = if stream {
+            PumpMode::AnthropicFromOpenAiSse(model)
+        } else {
+            PumpMode::AnthropicFromOpenAiJson(model)
+        };
+        return free_call(&st, translated.to_string().into_bytes(), mode).await;
+    }
     relay_anthropic(&st, &headers, &body, "/v1/messages").await
 }
 
 async fn messages_count_tokens(State(st): State<Arc<SharedState>>, headers: HeaderMap, body: axum::body::Bytes) -> Response {
+    let parsed: Option<Value> = serde_json::from_slice(&body).ok();
+    let model = parsed
+        .as_ref()
+        .and_then(|v| v.get("model"))
+        .and_then(|m| m.as_str())
+        .unwrap_or("")
+        .to_string();
+    if !model.is_empty() && is_free_model(&model) {
+        // paas/v4 无对应的 count 端点，用文本长度粗略估算（免费模型，仅用于客户端显示）
+        let est = estimate_tokens(&parsed.unwrap_or(Value::Null));
+        return (StatusCode::OK, axum::Json(json!({"input_tokens": est}))).into_response();
+    }
     relay_anthropic(&st, &headers, &body, "/v1/messages/count_tokens").await
 }
 
@@ -310,7 +388,13 @@ async fn relay_anthropic(st: &Arc<SharedState>, headers: &HeaderMap, body: &[u8]
         .unwrap_or(DEFAULT_ANTHROPIC_VERSION)
         .to_string();
     let url = format!("{}{}", base_url.trim_end_matches('/'), path);
-    pump_response(url, api_key, version, body, PumpMode::Raw).await
+    pump_request(
+        url,
+        AuthStyle::Anthropic { key: api_key, version },
+        body.to_vec(),
+        PumpMode::Raw,
+    )
+    .await
 }
 
 async fn chat_completions(State(st): State<Arc<SharedState>>, body: axum::body::Bytes) -> Response {
@@ -320,11 +404,20 @@ async fn chat_completions(State(st): State<Arc<SharedState>>, body: axum::body::
     };
     let stream = v.get("stream").and_then(|s| s.as_bool()).unwrap_or(false);
     let model = v.get("model").and_then(|m| m.as_str()).unwrap_or("").to_string();
+
+    // 免费模型 → paas/v4 标准 OpenAI 端点（格式相同，纯透传 + key 池轮询）
+    if is_free_model(&model) {
+        let mut b = v.clone();
+        b["model"] = json!(model.to_lowercase());
+        return free_call(&st, b.to_string().into_bytes(), PumpMode::Raw).await;
+    }
+
+    // 套餐模型 → anthropic coding endpoint（账号套餐额度）
     let translated = match openai_map::translate_request(&v) {
         Ok(r) => r,
         Err(e) => return err_json(StatusCode::BAD_REQUEST, &e),
     };
-    let (api_key, base_url) = match resolve::resolve(&st) {
+    let (api_key, base_url) = match resolve::resolve(st) {
         Ok(x) => x,
         Err(e) => {
             stats().errors.fetch_add(1, Ordering::Relaxed);
@@ -332,40 +425,100 @@ async fn chat_completions(State(st): State<Arc<SharedState>>, body: axum::body::
         }
     };
     let url = format!("{}/v1/messages", base_url.trim_end_matches('/'));
-    let mode = if stream { PumpMode::OpenAiStream(model.clone()) } else { PumpMode::OpenAiJson(model.clone()) };
-    pump_response(url, api_key, DEFAULT_ANTHROPIC_VERSION.to_string(), translated.to_string().as_bytes(), mode).await
+    let mode = if stream { PumpMode::OpenAiStream(model) } else { PumpMode::OpenAiJson(model) };
+    pump_request(
+        url,
+        AuthStyle::Anthropic { key: api_key, version: DEFAULT_ANTHROPIC_VERSION.to_string() },
+        translated.to_string().into_bytes(),
+        mode,
+    )
+    .await
 }
 
+#[derive(Clone)]
+enum AuthStyle {
+    Anthropic { key: String, version: String },
+    Bearer(String),
+}
+
+#[derive(Clone)]
 enum PumpMode {
-    /// 原样转发（/v1/messages 透传）
+    /// 原样转发（anthropic 透传 / 免费模型 OpenAI→OpenAI）
     Raw,
-    /// 上游 JSON → OpenAI chat.completion JSON
+    /// 上游 Anthropic JSON → OpenAI chat.completion JSON（套餐模型非流式）
     OpenAiJson(String),
-    /// 上游 Anthropic SSE → OpenAI chunk 流
+    /// 上游 Anthropic SSE → OpenAI chunk 流（套餐模型流式）
     OpenAiStream(String),
+    /// 上游 OpenAI JSON → Anthropic message JSON（免费模型，anthropic 入站非流式）
+    AnthropicFromOpenAiJson(String),
+    /// 上游 OpenAI chunk 流 → Anthropic SSE（免费模型，anthropic 入站流式）
+    AnthropicFromOpenAiSse(String),
 }
 
-fn upstream_agent() -> ureq::Agent {
-    ureq::AgentBuilder::new()
-        .timeout_connect(Duration::from_secs(10))
-        .build()
+/// 免费模型 key 池：全账号平台 key，5 分钟缓存；轮询游标摊平用量。
+fn get_pool(st: &Arc<SharedState>) -> Vec<PoolKey> {
+    {
+        let pool = st.pool.lock().unwrap();
+        if let Some((at, p)) = pool.as_ref() {
+            if at.elapsed() < POOL_TTL {
+                return p.clone();
+            }
+        }
+    }
+    let pool: Vec<PoolKey> = store::all_account_api_keys(&st.paths)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|l| l.has_key && !l.api_key.is_empty() && l.kind == "plan")
+        .filter(|l| l.provider == "zai" || l.provider == "bigmodel")
+        .map(|l| PoolKey {
+            api_key: l.api_key,
+            paas_base: if l.provider == "zai" { ZAI_PAAS_BASE.into() } else { BIGMODEL_PAAS_BASE.into() },
+        })
+        .collect();
+    *st.pool.lock().unwrap() = Some((std::time::Instant::now(), pool.clone()));
+    pool
 }
 
-async fn pump_response(url: String, api_key: String, version: String, body: &[u8], mode: PumpMode) -> Response {
-    let body = body.to_vec();
+/// 免费模型统一入口：key 池轮询，401/403/429 自动换下一个 key 重试。
+async fn free_call(st: &Arc<SharedState>, body: Vec<u8>, mode: PumpMode) -> Response {
+    let pool = get_pool(st);
+    if pool.is_empty() {
+        stats().errors.fetch_add(1, Ordering::Relaxed);
+        return err_json(StatusCode::BAD_GATEWAY, "没有可用的平台 API Key：免费模型需要账号的 API Key（先在账号详情同步配置）");
+    }
+    let n = pool.len();
+    let start = st.rr.fetch_add(1, Ordering::Relaxed) as usize;
+    let mut last: Option<Response> = None;
+    for k in 0..n {
+        let pk = &pool[(start + k) % n];
+        let url = format!("{}/chat/completions", pk.paas_base.trim_end_matches('/'));
+        let resp = pump_request(url, AuthStyle::Bearer(pk.api_key.clone()), body.clone(), mode.clone()).await;
+        let s = resp.status().as_u16();
+        if matches!(s, 401 | 403 | 429) && k + 1 < n {
+            last = Some(resp);
+            continue;
+        }
+        return resp;
+    }
+    last.unwrap_or_else(|| err_json(StatusCode::BAD_GATEWAY, "上游全部失败"))
+}
+
+async fn pump_request(url: String, auth: AuthStyle, body: Vec<u8>, mode: PumpMode) -> Response {
     let (meta_tx, meta_rx) = tokio::sync::oneshot::channel::<Result<(u16, String), String>>();
     let (body_tx, body_rx) = tokio::sync::mpsc::channel::<Result<Vec<u8>, std::io::Error>>(32);
     tauri::async_runtime::spawn_blocking(move || {
         let send_meta = |r: Result<(u16, String), String>| {
             let _ = meta_tx.send(r);
         };
-        let call = |body: &str| {
-            upstream_agent()
-                .post(&url)
-                .set("x-api-key", &api_key)
-                .set("content-type", "application/json")
-                .set("anthropic-version", &version)
-                .send_string(body)
+        let call = |b: &str| {
+            let rb = upstream_agent().post(&url).set("content-type", "application/json");
+            let rb = match &auth {
+                AuthStyle::Anthropic { key, version } => rb
+                    .set("x-api-key", key)
+                    .set("anthropic-version", version),
+                AuthStyle::Bearer(k) => rb.set("Authorization", &format!("Bearer {k}")),
+            };
+            rb.send_string(b)
         };
         match call(&String::from_utf8_lossy(&body)) {
             Ok(resp) => {
@@ -411,11 +564,7 @@ fn pump_ok(resp: ureq::Response, mode: PumpMode, tx: &tokio::sync::mpsc::Sender<
         PumpMode::OpenAiJson(model) => {
             let text = resp.into_string().unwrap_or_default();
             if status >= 400 {
-                let msg = serde_json::from_str::<Value>(&text)
-                    .ok()
-                    .and_then(|v| v.pointer("/error/message").and_then(|m| m.as_str()).map(String::from))
-                    .unwrap_or_else(|| format!("上游返回 {status}"));
-                let _ = tx.blocking_send(Ok(json!({"error": {"message": msg, "type": "upstream_error", "code": status}}).to_string().into_bytes()));
+                send_openai_error(&text, status, tx);
                 return;
             }
             match serde_json::from_str::<Value>(&text) {
@@ -429,7 +578,48 @@ fn pump_ok(resp: ureq::Response, mode: PumpMode, tx: &tokio::sync::mpsc::Sender<
             }
         }
         PumpMode::OpenAiStream(model) => pump_openai_stream(resp, &model, status, tx),
+        PumpMode::AnthropicFromOpenAiJson(model) => {
+            let text = resp.into_string().unwrap_or_default();
+            if status >= 400 {
+                send_anthropic_error(&text, status, tx);
+                return;
+            }
+            match serde_json::from_str::<Value>(&text) {
+                Ok(up) => {
+                    let out = openai_map::translate_openai_to_anthropic_response(&up, &model);
+                    let _ = tx.blocking_send(Ok(out.to_string().into_bytes()));
+                }
+                Err(e) => {
+                    let _ = tx.blocking_send(Err(std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string())));
+                }
+            }
+        }
+        PumpMode::AnthropicFromOpenAiSse(model) => pump_anthropic_from_openai_sse(resp, &model, status, tx),
     }
+}
+
+fn upstream_error_message(text: &str, status: u16) -> String {
+    serde_json::from_str::<Value>(text)
+        .ok()
+        .and_then(|v| v.pointer("/error/message").and_then(|m| m.as_str()).map(String::from))
+        .unwrap_or_else(|| {
+            if text.trim().is_empty() {
+                format!("上游返回 {status}")
+            } else {
+                text.chars().take(300).collect()
+            }
+        })
+}
+
+fn send_openai_error(text: &str, status: u16, tx: &tokio::sync::mpsc::Sender<Result<Vec<u8>, std::io::Error>>) {
+    let msg = upstream_error_message(text, status);
+    let _ = tx.blocking_send(Ok(json!({"error": {"message": msg, "type": "upstream_error", "code": status}}).to_string().into_bytes()));
+}
+
+fn send_anthropic_error(text: &str, status: u16, tx: &tokio::sync::mpsc::Sender<Result<Vec<u8>, std::io::Error>>) {
+    let msg = upstream_error_message(text, status);
+    let ev = json!({"type": "error", "error": {"type": "api_error", "message": msg}});
+    let _ = tx.blocking_send(Ok(format!("event: error\ndata: {ev}\n\n").into_bytes()));
 }
 
 fn pump_raw(resp: ureq::Response, tx: &tokio::sync::mpsc::Sender<Result<Vec<u8>, std::io::Error>>) {
@@ -454,10 +644,7 @@ fn pump_raw(resp: ureq::Response, tx: &tokio::sync::mpsc::Sender<Result<Vec<u8>,
 fn pump_openai_stream(resp: ureq::Response, model: &str, status: u16, tx: &tokio::sync::mpsc::Sender<Result<Vec<u8>, std::io::Error>>) {
     if status >= 400 {
         let text = resp.into_string().unwrap_or_default();
-        let msg = serde_json::from_str::<Value>(&text)
-            .ok()
-            .and_then(|v| v.pointer("/error/message").and_then(|m| m.as_str()).map(String::from))
-            .unwrap_or_else(|| format!("上游返回 {status}"));
+        let msg = upstream_error_message(&text, status);
         let _ = tx.blocking_send(Ok(format!("data: {}\n\n", json!({"error": {"message": msg, "type": "upstream_error", "code": status}})).into_bytes()));
         let _ = tx.blocking_send(Ok(b"data: [DONE]\n\n".to_vec()));
         return;
@@ -482,4 +669,47 @@ fn pump_openai_stream(resp: ureq::Response, model: &str, status: u16, tx: &tokio
     let mut out = Vec::new();
     tr.finish(&mut out);
     let _ = tx.blocking_send(Ok(out));
+}
+
+fn pump_anthropic_from_openai_sse(resp: ureq::Response, model: &str, status: u16, tx: &tokio::sync::mpsc::Sender<Result<Vec<u8>, std::io::Error>>) {
+    if status >= 400 {
+        let text = resp.into_string().unwrap_or_default();
+        send_anthropic_error(&text, status, tx);
+        return;
+    }
+    let reader = std::io::BufReader::new(resp.into_reader());
+    let mut tr = openai_map::OpenAiToAnthropicSse::new(model);
+    for line in reader.lines() {
+        match line {
+            Ok(l) => {
+                let mut out = Vec::new();
+                tr.push_line(&l, &mut out);
+                if !out.is_empty() && tx.blocking_send(Ok(out)).is_err() {
+                    return;
+                }
+            }
+            Err(e) => {
+                let _ = tx.blocking_send(Err(e));
+                return;
+            }
+        }
+    }
+    let mut out = Vec::new();
+    tr.finish(&mut out);
+    let _ = tx.blocking_send(Ok(out));
+}
+
+/// count_tokens 免费模型估算：所有字符串长度 / 3（paas/v4 无对应计数端点）
+fn estimate_tokens(v: &Value) -> u64 {
+    fn walk(v: &Value, chars: &mut u64) {
+        match v {
+            Value::String(s) => *chars += s.chars().count() as u64,
+            Value::Array(a) => a.iter().for_each(|x| walk(x, chars)),
+            Value::Object(o) => o.values().for_each(|x| walk(x, chars)),
+            _ => {}
+        }
+    }
+    let mut chars = 0;
+    walk(v, &mut chars);
+    chars / 3 + 1
 }

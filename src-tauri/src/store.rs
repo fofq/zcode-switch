@@ -167,7 +167,7 @@ impl Settings {
     pub fn two_api_models(&self) -> String {
         self.two_api_models
             .clone()
-            .unwrap_or_else(|| "glm-5.3-flash, glm-5.3, glm-4.6".into())
+            .unwrap_or_else(|| "glm-5.3-flash, glm-5.3".into())
     }
 }
 
@@ -1132,6 +1132,10 @@ pub struct ApiKeyInfo {
     pub label: String,
     pub api_key: String,
     pub base_url: String,
+    /// 账号所属家族：zai / bigmodel
+    pub provider: String,
+    /// key 类型：plan（套餐平台 key，可用于 paas/v4 与 coding endpoint）/ jwt（start-plan JWT）
+    pub kind: String,
 }
 
 /// 供"复制 API Key"和 2API 使用：从账号快照里解析可用的 (apiKey, baseURL)。
@@ -1190,20 +1194,28 @@ fn local_api_key(acc: &Account, home: &std::path::Path) -> Option<ApiKeyInfo> {
                     .get("name")
                     .and_then(|n| n.as_str())
                     .unwrap_or(pid.as_str());
+                let provider = if pid.contains("zai") { "zai" } else { "bigmodel" };
                 return Some(ApiKeyInfo {
                     label: label.to_string(),
                     api_key: key.trim().to_string(),
                     base_url: base.to_string(),
+                    provider: provider.into(),
+                    kind: "plan".into(),
                 });
             }
         }
     }
     if let Some(jwt) = cred_plain(&acc.credentials, "zcodejwttoken", home) {
         if jwt.trim().len() > 20 {
+            let provider = cred_plain(&acc.credentials, "oauth:active_provider", home)
+                .filter(|p| p == "bigmodel" || p == "zai")
+                .unwrap_or_else(|| "zai".into());
             return Some(ApiKeyInfo {
                 label: "Start Plan".into(),
                 api_key: jwt.trim().to_string(),
                 base_url: oauth::START_PLAN_ANTHROPIC_BASE.into(),
+                provider,
+                kind: "jwt".into(),
             });
         }
     }
@@ -1235,6 +1247,8 @@ pub fn account_api_key(paths: &Paths, id: &str) -> Result<Option<ApiKeyInfo>, St
                 label: "Coding Plan".into(),
                 api_key: key.trim().to_string(),
                 base_url: base.into(),
+                provider: provider.clone(),
+                kind: "plan".into(),
             }));
         }
     }
@@ -1247,9 +1261,11 @@ pub struct AccountKeyLine {
     pub name: String,
     pub api_key: String,
     pub has_key: bool,
+    pub provider: String,
+    pub kind: String,
 }
 
-/// 一键复制所有 API Key 用：只做本地解析，不逐个发网络请求。
+/// 一键复制所有 API Key / 免费模型 key 池用：只做本地解析，不逐个发网络请求。
 pub fn all_account_api_keys(paths: &Paths) -> Result<Vec<AccountKeyLine>, String> {
     let accounts = list_accounts(paths)?;
     Ok(accounts
@@ -1260,6 +1276,8 @@ pub fn all_account_api_keys(paths: &Paths) -> Result<Vec<AccountKeyLine>, String
                 name: a.name.clone(),
                 api_key: info.as_ref().map(|i| i.api_key.clone()).unwrap_or_default(),
                 has_key: info.is_some(),
+                provider: info.as_ref().map(|i| i.provider.clone()).unwrap_or_default(),
+                kind: info.as_ref().map(|i| i.kind.clone()).unwrap_or_default(),
             }
         })
         .collect())

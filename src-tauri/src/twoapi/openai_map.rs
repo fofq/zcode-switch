@@ -354,3 +354,206 @@ impl SseTransformer {
         out.extend_from_slice(b"data: [DONE]\n\n");
     }
 }
+
+fn map_stop_openai_to_anthropic(f: Option<&str>) -> &'static str {
+    match f {
+        Some("tool_calls") => "tool_use",
+        Some("length") => "max_tokens",
+        _ => "end_turn",
+    }
+}
+
+/// OpenAI chat.completion 响应 → Anthropic /v1/messages 响应（免费模型，anthropic 入站非流式）
+pub fn translate_openai_to_anthropic_response(v: &Value, fallback_model: &str) -> Value {
+    let model = v.get("model").and_then(|m| m.as_str()).unwrap_or(fallback_model).to_string();
+    let id = v.get("id").and_then(|i| i.as_str()).unwrap_or("msg_zsw").to_string();
+    let mut blocks: Vec<Value> = vec![];
+    let choice = v.get("choices").and_then(|c| c.as_array()).and_then(|a| a.first());
+    if let Some(ch) = choice {
+        let msg = ch.get("message");
+        if let Some(t) = msg.and_then(|m| m.get("content")).and_then(|c| c.as_str()) {
+            if !t.is_empty() {
+                blocks.push(json!({"type": "text", "text": t}));
+            }
+        }
+        for tc in msg
+            .and_then(|m| m.get("tool_calls"))
+            .and_then(|t| t.as_array())
+            .into_iter()
+            .flatten()
+        {
+            let tid = tc.get("id").and_then(|x| x.as_str()).unwrap_or("");
+            let f = tc.get("function");
+            let name = f.and_then(|f| f.get("name")).and_then(|n| n.as_str()).unwrap_or("");
+            let args_raw = f.and_then(|f| f.get("arguments")).and_then(|a| a.as_str()).unwrap_or("{}");
+            let input: Value = serde_json::from_str(args_raw).unwrap_or(json!({}));
+            let tid = if tid.is_empty() { format!("toolu_{}", blocks.len()) } else { tid.to_string() };
+            blocks.push(json!({"type": "tool_use", "id": tid, "name": name, "input": input}));
+        }
+    }
+    let stop = map_stop_openai_to_anthropic(choice.and_then(|c| c.get("finish_reason")).and_then(|f| f.as_str()));
+    let usage_in = v.pointer("/usage/prompt_tokens").and_then(|x| x.as_u64()).unwrap_or(0);
+    let usage_out = v.pointer("/usage/completion_tokens").and_then(|x| x.as_u64()).unwrap_or(0);
+    json!({
+        "id": id,
+        "type": "message",
+        "role": "assistant",
+        "model": model,
+        "content": blocks,
+        "stop_reason": stop,
+        "stop_sequence": Value::Null,
+        "usage": {"input_tokens": usage_in, "output_tokens": usage_out},
+    })
+}
+
+/// OpenAI chunk 流 → Anthropic SSE 事件流（免费模型，anthropic 入站流式）。
+/// 事件序列：message_start → (content_block_start/delta/stop)* → message_delta → message_stop。
+pub struct OpenAiToAnthropicSse {
+    model: String,
+    id: String,
+    started: bool,
+    finished: bool,
+    next_index: u64,
+    text_idx: Option<u64>,
+    tool_idx: Option<u64>,
+    usage_in: u64,
+    usage_out: u64,
+    stop: Option<String>,
+}
+
+impl OpenAiToAnthropicSse {
+    pub fn new(model: &str) -> Self {
+        Self {
+            model: model.to_string(),
+            id: format!("msg_zsw_{}", chrono::Local::now().timestamp_millis()),
+            started: false,
+            finished: false,
+            next_index: 0,
+            text_idx: None,
+            tool_idx: None,
+            usage_in: 0,
+            usage_out: 0,
+            stop: None,
+        }
+    }
+
+    fn ev(out: &mut Vec<u8>, event: &str, data: &Value) {
+        out.extend_from_slice(format!("event: {event}\ndata: {data}\n\n").as_bytes());
+    }
+
+    fn close_open_block(&mut self, out: &mut Vec<u8>) {
+        if let Some(idx) = self.text_idx.take() {
+            Self::ev(out, "content_block_stop", &json!({"type": "content_block_stop", "index": idx}));
+        }
+        if let Some(idx) = self.tool_idx.take() {
+            Self::ev(out, "content_block_stop", &json!({"type": "content_block_stop", "index": idx}));
+        }
+    }
+
+    pub fn push_line(&mut self, line: &str, out: &mut Vec<u8>) {
+        if self.finished {
+            return;
+        }
+        let line = line.trim();
+        if !line.starts_with("data:") {
+            return;
+        }
+        let payload = line[5..].trim();
+        if payload.is_empty() {
+            return;
+        }
+        if payload == "[DONE]" {
+            self.finish(out);
+            return;
+        }
+        let Ok(v) = serde_json::from_str::<Value>(payload) else { return };
+        if !self.started {
+            self.started = true;
+            if let Some(id) = v.get("id").and_then(|x| x.as_str()) {
+                self.id = id.to_string();
+            }
+            if let Some(m) = v.get("model").and_then(|x| x.as_str()) {
+                self.model = m.to_string();
+            }
+            self.usage_in = v.pointer("/usage/prompt_tokens").and_then(|x| x.as_u64()).unwrap_or(0);
+            Self::ev(out, "message_start", &json!({
+                "type": "message_start",
+                "message": {
+                    "id": self.id, "type": "message", "role": "assistant", "model": self.model,
+                    "content": [], "stop_reason": Value::Null, "stop_sequence": Value::Null,
+                    "usage": {"input_tokens": self.usage_in, "output_tokens": 0},
+                }
+            }));
+        }
+        let Some(choice) = v.get("choices").and_then(|c| c.as_array()).and_then(|a| a.first()) else { return };
+        let delta = choice.get("delta");
+        if let Some(t) = delta.and_then(|d| d.get("content")).and_then(|c| c.as_str()) {
+            if !t.is_empty() {
+                if self.text_idx.is_none() && self.tool_idx.is_none() {
+                    let idx = self.next_index;
+                    self.next_index += 1;
+                    self.text_idx = Some(idx);
+                    Self::ev(out, "content_block_start", &json!({"type": "content_block_start", "index": idx, "content_block": {"type": "text", "text": ""}}));
+                }
+                if let Some(idx) = self.text_idx {
+                    Self::ev(out, "content_block_delta", &json!({"type": "content_block_delta", "index": idx, "delta": {"type": "text_delta", "text": t}}));
+                }
+            }
+        }
+        if let Some(tcs) = delta.and_then(|d| d.get("tool_calls")).and_then(|t| t.as_array()) {
+            for tc in tcs {
+                let tid = tc.get("id").and_then(|x| x.as_str()).unwrap_or("");
+                let fname = tc.pointer("/function/name").and_then(|x| x.as_str()).unwrap_or("");
+                if !tid.is_empty() || !fname.is_empty() {
+                    self.close_open_block(out);
+                    let idx = self.next_index;
+                    self.next_index += 1;
+                    self.tool_idx = Some(idx);
+                    Self::ev(out, "content_block_start", &json!({"type": "content_block_start", "index": idx, "content_block": {"type": "tool_use", "id": tid, "name": fname, "input": {}}}));
+                }
+                if let Some(args) = tc.pointer("/function/arguments").and_then(|x| x.as_str()) {
+                    if !args.is_empty() {
+                        if let Some(idx) = self.tool_idx {
+                            Self::ev(out, "content_block_delta", &json!({"type": "content_block_delta", "index": idx, "delta": {"type": "input_json_delta", "partial_json": args}}));
+                        }
+                    }
+                }
+            }
+        }
+        if let Some(u) = v.get("usage") {
+            if let Some(x) = u.get("prompt_tokens").and_then(|x| x.as_u64()) {
+                self.usage_in = x;
+            }
+            if let Some(x) = u.get("completion_tokens").and_then(|x| x.as_u64()) {
+                self.usage_out = x;
+            }
+        }
+        if let Some(f) = choice.get("finish_reason").and_then(|x| x.as_str()) {
+            self.stop = Some(map_stop_openai_to_anthropic(Some(f)).to_string());
+        }
+    }
+
+    pub fn finish(&mut self, out: &mut Vec<u8>) {
+        if self.finished {
+            return;
+        }
+        self.finished = true;
+        if !self.started {
+            Self::ev(out, "message_start", &json!({
+                "type": "message_start",
+                "message": {
+                    "id": self.id, "type": "message", "role": "assistant", "model": self.model,
+                    "content": [], "stop_reason": Value::Null, "stop_sequence": Value::Null,
+                    "usage": {"input_tokens": 0, "output_tokens": 0},
+                }
+            }));
+        }
+        self.close_open_block(out);
+        Self::ev(out, "message_delta", &json!({
+            "type": "message_delta",
+            "delta": {"stop_reason": self.stop.clone().unwrap_or_else(|| "end_turn".into()), "stop_sequence": Value::Null},
+            "usage": {"output_tokens": self.usage_out},
+        }));
+        Self::ev(out, "message_stop", &json!({"type": "message_stop"}));
+    }
+}
