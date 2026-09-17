@@ -1195,12 +1195,14 @@ fn local_api_key(acc: &Account, home: &std::path::Path) -> Option<ApiKeyInfo> {
                     .and_then(|n| n.as_str())
                     .unwrap_or(pid.as_str());
                 let provider = if pid.contains("zai") { "zai" } else { "bigmodel" };
+                // start-plan 条目存的是 JWT，只对 coding endpoint 有效，不能进 paas/v4 key 池
+                let kind = if pid.contains("start-plan") { "jwt" } else { "plan" };
                 return Some(ApiKeyInfo {
                     label: label.to_string(),
                     api_key: key.trim().to_string(),
                     base_url: base.to_string(),
                     provider: provider.into(),
-                    kind: "plan".into(),
+                    kind: kind.into(),
                 });
             }
         }
@@ -1281,6 +1283,35 @@ pub fn all_account_api_keys(paths: &Paths) -> Result<Vec<AccountKeyLine>, String
             }
         })
         .collect())
+}
+
+/// 免费模型 key 池（2API 用）：返回 (provider, api_key) 列表，已按 key 去重。
+/// 先扫全部账号的本地 plan key；不足时对前 `max_resolve` 个账号现场解析
+/// （上游会自动创建 zcode-api-key，网络调用，调用方须放在阻塞线程里）。
+pub fn free_key_pool(paths: &Paths, max_resolve: usize) -> Vec<(String, String)> {
+    let accounts = list_accounts(paths).unwrap_or_default();
+    let mut out: Vec<(String, String)> = vec![];
+    let mut need_network: Vec<String> = vec![];
+    for a in &accounts {
+        match local_api_key(a, &paths.home) {
+            Some(info) if info.kind == "plan" && (info.provider == "zai" || info.provider == "bigmodel") => {
+                if !out.iter().any(|(_, k)| k == &info.api_key) {
+                    out.push((info.provider.clone(), info.api_key.clone()));
+                }
+            }
+            _ => need_network.push(a.id.clone()),
+        }
+    }
+    for id in need_network.into_iter().take(max_resolve) {
+        if let Ok(Some(info)) = account_api_key(paths, &id) {
+            if info.kind == "plan" && (info.provider == "zai" || info.provider == "bigmodel")
+                && !out.iter().any(|(_, k)| k == &info.api_key)
+            {
+                out.push((info.provider.clone(), info.api_key.clone()));
+            }
+        }
+    }
+    out
 }
 
 fn ensure_virtual_device_mid_locked(paths: &Paths, id: &str) -> Result<String, String> {

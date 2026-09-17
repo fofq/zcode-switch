@@ -81,6 +81,8 @@ pub struct SharedState {
     pub usage: Mutex<HashMap<String, u64>>,
     /// 免费模型 key 池（全账号平台 key）缓存
     pub pool: Mutex<Option<(std::time::Instant, Vec<PoolKey>)>>,
+    /// 激活账号 id 短缓存（避免每个请求全量解密账号）
+    pub active_cache: Mutex<Option<(std::time::Instant, Option<String>)>>,
     /// 轮询游标
     pub rr: AtomicU64,
 }
@@ -138,6 +140,7 @@ pub async fn sync(paths: &Paths) -> Result<(), String> {
         cache: Mutex::new(HashMap::new()),
         usage: Mutex::new(HashMap::new()),
         pool: Mutex::new(None),
+        active_cache: Mutex::new(None),
         rr: AtomicU64::new(0),
     });
     let app = router(state.clone());
@@ -221,6 +224,14 @@ fn upstream_agent() -> ureq::Agent {
         .build()
 }
 
+/// 测试专用：带总超时，避免上游挂起时测试一直不返回
+fn test_agent() -> ureq::Agent {
+    ureq::AgentBuilder::new()
+        .timeout_connect(Duration::from_secs(10))
+        .timeout(Duration::from_secs(25))
+        .build()
+}
+
 /// 连通性测试：1) 本地 /v1/models；2) 用免费模型真实走一遍 chat/completions（E2E 验证鉴权与上游转发）。
 pub async fn test_service() -> TestResult {
     let (port, token) = {
@@ -236,7 +247,7 @@ pub async fn test_service() -> TestResult {
     tauri::async_runtime::spawn_blocking(move || {
         // 阶段 1：本地服务
         let t0 = std::time::Instant::now();
-        let mut req = upstream_agent().get(&format!("http://127.0.0.1:{port}/v1/models"));
+        let mut req = test_agent().get(&format!("http://127.0.0.1:{port}/v1/models"));
         if !token.is_empty() {
             req = req.set("Authorization", &format!("Bearer {token}"));
         }
@@ -252,7 +263,7 @@ pub async fn test_service() -> TestResult {
             "messages": [{"role": "user", "content": "hi"}],
             "max_tokens": 1,
         });
-        let resp = upstream_agent()
+        let resp = test_agent()
             .post(&format!("http://127.0.0.1:{port}/v1/chat/completions"))
             .set("Authorization", &format!("Bearer {token}"))
             .set("Content-Type", "application/json")
@@ -375,7 +386,7 @@ async fn messages_count_tokens(State(st): State<Arc<SharedState>>, headers: Head
 
 /// Anthropic 格式纯透传：只替换鉴权，逐字节转发（含 SSE）。
 async fn relay_anthropic(st: &Arc<SharedState>, headers: &HeaderMap, body: &[u8], path: &str) -> Response {
-    let (api_key, base_url) = match resolve::resolve(st) {
+    let (api_key, base_url) = match resolve::resolve(st).await {
         Ok(x) => x,
         Err(e) => {
             stats().errors.fetch_add(1, Ordering::Relaxed);
@@ -417,7 +428,7 @@ async fn chat_completions(State(st): State<Arc<SharedState>>, body: axum::body::
         Ok(r) => r,
         Err(e) => return err_json(StatusCode::BAD_REQUEST, &e),
     };
-    let (api_key, base_url) = match resolve::resolve(&st) {
+    let (api_key, base_url) = match resolve::resolve(&st).await {
         Ok(x) => x,
         Err(e) => {
             stats().errors.fetch_add(1, Ordering::Relaxed);
@@ -455,8 +466,9 @@ enum PumpMode {
     AnthropicFromOpenAiSse(String),
 }
 
-/// 免费模型 key 池：全账号平台 key，5 分钟缓存；轮询游标摊平用量。
-fn get_pool(st: &Arc<SharedState>) -> Vec<PoolKey> {
+/// 免费模型 key 池：全账号平台 key（本地优先，不足时现场向上游申请），5 分钟缓存。
+/// 解密与网络都放进阻塞线程，绝不占用异步运行时。
+async fn get_pool(st: &Arc<SharedState>) -> Vec<PoolKey> {
     {
         let pool = st.pool.lock().unwrap();
         if let Some((at, p)) = pool.as_ref() {
@@ -465,14 +477,16 @@ fn get_pool(st: &Arc<SharedState>) -> Vec<PoolKey> {
             }
         }
     }
-    let pool: Vec<PoolKey> = store::all_account_api_keys(&st.paths)
-        .unwrap_or_default()
+    let pairs = tauri::async_runtime::spawn_blocking(move || {
+        store::free_key_pool(&Paths::detect(), 6)
+    })
+    .await
+    .unwrap_or_default();
+    let pool: Vec<PoolKey> = pairs
         .into_iter()
-        .filter(|l| l.has_key && !l.api_key.is_empty() && l.kind == "plan")
-        .filter(|l| l.provider == "zai" || l.provider == "bigmodel")
-        .map(|l| PoolKey {
-            api_key: l.api_key,
-            paas_base: if l.provider == "zai" { ZAI_PAAS_BASE.into() } else { BIGMODEL_PAAS_BASE.into() },
+        .map(|(provider, api_key)| PoolKey {
+            api_key,
+            paas_base: if provider == "zai" { ZAI_PAAS_BASE.into() } else { BIGMODEL_PAAS_BASE.into() },
         })
         .collect();
     *st.pool.lock().unwrap() = Some((std::time::Instant::now(), pool.clone()));
@@ -481,10 +495,10 @@ fn get_pool(st: &Arc<SharedState>) -> Vec<PoolKey> {
 
 /// 免费模型统一入口：key 池轮询，401/403/429 自动换下一个 key 重试。
 async fn free_call(st: &Arc<SharedState>, body: Vec<u8>, mode: PumpMode) -> Response {
-    let pool = get_pool(st);
+    let pool = get_pool(st).await;
     if pool.is_empty() {
         stats().errors.fetch_add(1, Ordering::Relaxed);
-        return err_json(StatusCode::BAD_GATEWAY, "没有可用的平台 API Key：免费模型需要账号的 API Key（先在账号详情同步配置）");
+        return err_json(StatusCode::BAD_GATEWAY, "没有可用的平台 API Key：免费模型需要账号的 API Key（已尝试现场申请仍失败，请检查账号登录状态）");
     }
     let n = pool.len();
     let start = st.rr.fetch_add(1, Ordering::Relaxed) as usize;
