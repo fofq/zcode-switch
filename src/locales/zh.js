@@ -6,6 +6,7 @@ export const zh = {
   "common.settings": "设置",
   "common.loadFail": "加载失败：{e}",
   "common.listSep": "、",
+  "common.close": "关闭",
 
   "pw.exportTitle": "导出「{name}」",
   "pw.exportAllTitle": "导出全部（{count} 个账号）",
@@ -229,6 +230,15 @@ export const zh = {
   "q.period.one_time": "一次性",
 
   "s.title": "设置",
+  "st.secAuto": "AUTOMATION · 自动化",
+  "st.secBehavior": "BEHAVIOR · 行为",
+  "st.autoClaimDesc": "定时自动检测可领套餐并领取（每号先激活一次活动资格）",
+  "st.autoSwitchDesc": "当前账号额度低于阈值时自动切到额度更多的账号；ZCode 运行中需开启热切换",
+  "st.model": "关注模型",
+  "st.modelAll": "按总额度（不指定模型）",
+  "st.modelCustom": "手动输入…",
+  "st.modelDesc": "已读到 {n} 个模型；选中后列表健康度与低额度自动切换都只看它",
+  "st.modelNone": "还没读到模型额度：先点工具栏「刷新」拉取，或选「手动输入…」自己填",
   "s.behaviorLabel": "行为",
   "s.langLabel": "LANGUAGE · 语言",
   "s.langZh": "中文",

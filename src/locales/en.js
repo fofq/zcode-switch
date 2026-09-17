@@ -6,6 +6,7 @@ export const en = {
   "common.settings": "Settings",
   "common.loadFail": "Failed to load: {e}",
   "common.listSep": ", ",
+  "common.close": "Close",
 
   "pw.exportTitle": "Export \"{name}\"",
   "pw.exportAllTitle": "Export all ({count} accounts)",
@@ -229,6 +230,15 @@ export const en = {
   "q.period.one_time": "One-time",
 
   "s.title": "Settings",
+  "st.secAuto": "AUTOMATION",
+  "st.secBehavior": "BEHAVIOR",
+  "st.autoClaimDesc": "Periodically checks for claimable plans and claims them (activates eligibility once per account first)",
+  "st.autoSwitchDesc": "Switches to an account with more quota when the current one drops below the threshold; hot switch is required while ZCode is running",
+  "st.model": "Focus model",
+  "st.modelAll": "Total quota (no specific model)",
+  "st.modelCustom": "Type manually…",
+  "st.modelDesc": "{n} model(s) detected; the list health and low-quota auto-switch will only look at it",
+  "st.modelNone": "No model quota read yet: click \"Refresh\" in the toolbar, or pick \"Type manually…\"",
   "s.behaviorLabel": "Behavior",
   "s.langLabel": "LANGUAGE · Language",
   "s.langZh": "中文",

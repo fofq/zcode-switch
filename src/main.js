@@ -74,6 +74,7 @@ const ui = {
   sort: SORTS.includes(savedPrefs.sort) ? savedPrefs.sort : "quota",
   density: savedPrefs.density === "detail" ? "detail" : "compact",
   hideInfo: savedPrefs.hideInfo === true,
+  modelCustom: false,
   selected: new Set(),
   expanded: new Set(),
   collapsedSections: new Set(),
@@ -186,6 +187,156 @@ function groupTagHtml(a) {
   if (!g) return "";
   return `<span class="tag-grp" title="${esc(t("grp.tagTitle", { group: g }))}">${ic("folder", 11)} ${esc(g)}</span>`;
 }
+/** 从已读到的额度数据里汇总可用模型（只取“额度池/模型”条目，跳过 提示次数/使用时长 这类窗口） */
+function detectedModels() {
+  const set = new Set();
+  const collect = (items) => {
+    for (const it of items || []) {
+      if (!it || typeof it.name !== "string") continue;
+      if (itemKind(it) !== "raw") continue;
+      const n = it.name.trim();
+      if (n) set.add(n);
+    }
+  };
+  for (const id of Object.keys(acctQuota)) {
+    const d = acctQuota[id]?.data;
+    if (!d) continue;
+    collect(d.items);
+    for (const p of d.plans || []) collect(p.items);
+  }
+  return [...set].sort((a, b) => a.localeCompare(b, localeTag(), { sensitivity: "base" }));
+}
+
+// ---------- 设置弹窗（工具栏齿轮打开；替掉原来的独立设置窗口） ----------
+
+let settingsModalEl = null;
+let autostartOn = false;
+
+function stToggle(key, label, desc, on, extra) {
+  return `
+  <div class="tog-row">
+    <div class="tog-info"><div class="tog-label">${esc(label)}</div><div class="tog-desc">${esc(desc)}</div></div>
+    <button class="toggle${on ? " on" : ""}" role="switch" aria-checked="${on}" aria-label="${esc(label)}" click="actions.stToggle('${key}')"><span class="knob"></span></button>
+  </div>${extra || ""}`;
+}
+
+function stAutoSwitchExtra() {
+  const cur = focusModel();
+  const models = detectedModels();
+  const isCustom = ui.modelCustom || (!!cur && !models.includes(cur)) || !models.length;
+  const opts = [
+    `<option value=""${!cur ? " selected" : ""}>${esc(t("st.modelAll"))}</option>`,
+    ...models.map((m) => `<option value="${esc(m)}"${m === cur ? " selected" : ""}>${esc(m)}</option>`),
+    `<option value="__custom__"${isCustom ? " selected" : ""}>${esc(t("st.modelCustom"))}</option>`,
+  ].join("");
+  return `
+  <div class="st-sub">
+    <div class="st-row">
+      <div class="st-lab">${t("s.autoSwitchThr")}</div>
+      <div class="st-ctl">
+        <input class="auto-switch-thr" type="number" min="1" max="90" step="1" value="${state?.auto_switch_threshold ?? 10}" change="actions.stSetThreshold(event)">
+        <span class="thr-pct">%</span>
+      </div>
+    </div>
+    <div class="st-row">
+      <div class="st-lab">${t("st.model")}</div>
+      <div class="st-ctl">
+        <select class="st-model" aria-label="${esc(t("st.model"))}" change="actions.stSetModel(event)">${opts}</select>
+        ${isCustom ? `<input class="focus-model" type="text" maxlength="40" placeholder="${esc(t("s.focusModelPh"))}" value="${esc(models.includes(cur) ? "" : cur)}" change="actions.stSetModelCustom(event)">` : ""}
+      </div>
+    </div>
+    <div class="st-note">${models.length ? t("st.modelDesc", { n: models.length }) : t("st.modelNone")}</div>
+  </div>`;
+}
+
+function settingsFormHtml() {
+  const s = state;
+  return `
+  <div class="st-panel" role="dialog" aria-modal="true" aria-label="${esc(t("s.title"))}">
+    <div class="st-head">
+      <span class="st-title">${ic("sliders", 16)} ${t("s.title")}</span>
+      <button class="icon-btn st-close" title="${esc(t("common.close"))}" aria-label="${esc(t("common.close"))}">${ic("x", 15)}</button>
+    </div>
+    <div class="st-body">
+      <div class="st-sec">${t("st.secAuto")}</div>
+      ${stToggle("autoClaim", t("btn.autoClaim"), t("st.autoClaimDesc"), !!s.auto_claim)}
+      ${stToggle("autoSwitch", t("as.label"), t("st.autoSwitchDesc"), !!s.auto_switch, stAutoSwitchExtra())}
+
+      <div class="st-sec">${t("st.secBehavior")}</div>
+      ${stToggle("autostart", t("s.autostart"), t("s.autostartDesc"), !!autostartOn)}
+      ${stToggle("launch", t("s.launchAfter"), t("s.launchAfterDesc"), !!s.launch_after_switch)}
+      ${stToggle("tray", t("s.closeTray"), t("s.closeTrayDesc"), !!s.close_to_tray)}
+      ${stToggle("hot", t("s.hotSwitch"), t("s.hotSwitchDesc"), !!s.hot_switch)}
+      ${stToggle("grouped", t("s.grouped"), t("s.groupedDesc"), s.grouped !== false)}
+
+      <div class="st-sec">${t("s.authLabel")}</div>
+      ${stToggle("oauthBrowser", t("s.oauthBrowser"), t("s.oauthBrowserDesc"), s.oauth_browser !== false)}
+      ${stToggle("proxy", t("s.proxyToggle"), t("s.proxyToggleDesc"), !!s.auth_proxy_on)}
+      <div class="st-row">
+        <div class="st-ctl wide">
+          <input class="st-input proxy" type="text" value="${esc(s.auth_proxy_url || "")}" placeholder="${esc(t("s.proxyPh"))}" keydown="onProxyKey(event)">
+          <button class="btn-ghost" click="actions.stSaveProxy()">${t("common.save")}</button>
+        </div>
+      </div>
+
+      <div class="st-sec">${t("s.libLabel")}</div>
+      <div class="st-row">
+        <div class="st-ctl">
+          <button class="btn-ghost has-ic" click="actions.stImport()">${ic("import", 14)} ${t("s.importBtn")}</button>
+          <button class="btn-ghost has-ic" click="actions.stExportAll()" ${s.accounts.length ? "" : "disabled"}>${ic("exportAll", 14)} ${t("s.exportAllBtn")}</button>
+        </div>
+      </div>
+
+      <div class="st-sec">${t("s.langLabel")}</div>
+      <div class="st-row">
+        <div class="lang-seg" role="radiogroup" aria-label="${esc(t("s.langLabel"))}">
+          <button class="lang-opt${lang() === "zh" ? " on" : ""}" role="radio" aria-checked="${lang() === "zh"}" click="actions.stSetLang('zh')">${t("s.langZh")}</button>
+          <button class="lang-opt${lang() === "en" ? " on" : ""}" role="radio" aria-checked="${lang() === "en"}" click="actions.stSetLang('en')">${t("s.langEn")}</button>
+        </div>
+      </div>
+
+      <div class="st-sec">${t("s.pathLabel")}</div>
+      <div class="st-row">
+        <div class="st-ctl wide">
+          <input class="st-input path" type="text" value="${esc(s.zcode_path)}" placeholder="C:\\Program Files\\ZCode\\ZCode.exe" keydown="onPathKey(event)">
+          <button class="btn-ghost" click="actions.stBrowsePath()">${t("s.browse")}</button>
+          <button class="btn-ghost" click="actions.stSavePath()">${t("common.save")}</button>
+        </div>
+      </div>
+
+      <div class="st-hint">${t("s.hint")}</div>
+      <div class="gh-row">
+        <a class="gh-link" href="https://github.com/pjpv/zcode-switch" target="_blank" rel="noopener" click="actions.openGitHub()">${t("s.githubLink")}</a>
+        ${appVer ? `<span class="ver">v${esc(appVer)}</span>` : ""}
+      </div>
+    </div>
+  </div>`;
+}
+
+function syncSettingsModal() {
+  if (!settingsModalEl) return;
+  settingsModalEl.innerHTML = settingsFormHtml();
+}
+
+function closeSettingsModal() {
+  document.querySelector(".st-mask")?.remove();
+  settingsModalEl = null;
+}
+
+async function openSettingsModal() {
+  closeSettingsModal();
+  autostartOn = await invoke("autostart_status").catch(() => false);
+  const mask = document.createElement("div");
+  mask.className = "st-mask pv-mask";
+  mask.innerHTML = settingsFormHtml();
+  document.body.appendChild(mask);
+  settingsModalEl = mask;
+  const onKey = (e) => { if (e.key === "Escape") closeSettingsModal(); };
+  document.addEventListener("keydown", onKey);
+  mask.addEventListener("click", (e) => { if (e.target === mask) { closeSettingsModal(); document.removeEventListener("keydown", onKey); } });
+  mask.querySelector(".st-close").addEventListener("click", closeSettingsModal);
+}
+
 function customGroups(accounts) {
   const set = new Set();
   for (const a of accounts) {
@@ -710,8 +861,172 @@ const actions = {
     });
   },
 
-  async openSettings() {
-    try { await invoke("open_settings"); }
+  openSettings() {
+    return openSettingsModal().catch((e) => {
+      console.warn("settings modal failed:", e);
+      toast(stripErr(e), "err");
+    });
+  },
+
+  async applySetting(patch, msg) {
+    await guard(async () => {
+      await invoke("set_behavior", patch);
+      await refresh();
+      render();
+      syncSettingsModal();
+      if (msg) toast(msg);
+    });
+  },
+
+  async stToggle(key) {
+    const s = state;
+    if (key === "autostart") {
+      await guard(async () => {
+        autostartOn = await invoke("autostart_set", { enable: !autostartOn }).catch(() => autostartOn);
+        syncSettingsModal();
+        toast(autostartOn ? t("s.autostartOnToast") : t("s.autostartOffToast"));
+      });
+      return;
+    }
+    if (key === "proxy") {
+      await actions.stToggleProxy();
+      return;
+    }
+    const map = {
+      launch: ["launchAfterSwitch", !!s?.launch_after_switch],
+      tray: ["closeToTray", !!s?.close_to_tray],
+      hot: ["hotSwitch", !!s?.hot_switch],
+      grouped: ["grouped", s?.grouped !== false],
+      oauthBrowser: ["oauthBrowser", s?.oauth_browser !== false],
+      autoClaim: ["autoClaim", !!s?.auto_claim],
+      autoSwitch: ["autoSwitch", !!s?.auto_switch],
+    };
+    const hit = map[key];
+    if (!hit) return;
+    await actions.applySetting({ [hit[0]]: !hit[1] });
+  },
+
+  async stToggleProxy() {
+    const input = document.querySelector(".st-panel .st-input.proxy");
+    const url = (input?.value || "").trim() || state?.auth_proxy_url || null;
+    await guard(async () => {
+      try {
+        await invoke("set_auth_proxy", { on: !state?.auth_proxy_on, url });
+        await refresh(); render(); syncSettingsModal();
+        toast(state.auth_proxy_on ? t("s.proxyOnToast") : t("s.proxyOffToast"), "ok", t("s.proxyOnDetail"));
+      } catch (e) { toast(stripErr(e), "err"); }
+    });
+  },
+
+  async stSaveProxy() {
+    const input = document.querySelector(".st-panel .st-input.proxy");
+    if (!input) return;
+    await guard(async () => {
+      try {
+        await invoke("set_auth_proxy", { on: !!state?.auth_proxy_on, url: input.value.trim() });
+        await refresh(); render(); syncSettingsModal();
+        toast(t("s.proxySaved"), "ok", state.auth_proxy_on ? t("s.proxySavedOn") : t("s.proxySavedOff"));
+      } catch (e) { toast(stripErr(e), "err"); }
+    });
+  },
+
+  async stSetThreshold(ev) {
+    const raw = Number(ev?.target?.value);
+    if (!isFinite(raw)) { syncSettingsModal(); return; }
+    const v = Math.max(1, Math.min(90, Math.round(raw)));
+    await actions.applySetting({ autoSwitchThreshold: v });
+  },
+
+  async stSetModel(ev) {
+    const v = String(ev?.target?.value || "");
+    if (v === "__custom__") {
+      ui.modelCustom = true;
+      syncSettingsModal();
+      document.querySelector(".st-panel .focus-model")?.focus();
+      return;
+    }
+    ui.modelCustom = false;
+    await actions.applySetting(
+      { autoSwitchModel: v },
+      v ? t("s.focusModelSaved", { model: v }) : t("s.focusModelCleared"),
+    );
+  },
+
+  async stSetModelCustom(ev) {
+    const v = String(ev?.target?.value || "").trim();
+    ui.modelCustom = true;
+    await actions.applySetting(
+      { autoSwitchModel: v },
+      v ? t("s.focusModelSaved", { model: v }) : t("s.focusModelCleared"),
+    );
+  },
+
+  async stSetLang(l) {
+    if (l === lang()) return;
+    await guard(async () => {
+      await invoke("set_language", { lang: l });
+      await refresh(); render(); syncSettingsModal();
+    });
+  },
+
+  async stBrowsePath() {
+    await guard(async () => {
+      const r = await invoke("pick_zcode_path");
+      if (!r.picked) return;
+      await invoke("set_zcode_path", { path: r.path });
+      toast(t("s.pathUpdated"));
+      await refresh(); render(); syncSettingsModal();
+    });
+  },
+
+  async stSavePath() {
+    const input = document.querySelector(".st-panel .st-input.path");
+    if (!input) return;
+    const v = input.value.trim();
+    await guard(async () => {
+      await invoke("set_zcode_path", { path: v });
+      toast(v ? t("s.pathUpdated") : t("s.pathAuto"));
+      await refresh(); render(); syncSettingsModal();
+    });
+  },
+
+  async stExportAll() {
+    await guard(async () => {
+      const p = await invoke("export_all_pick_path");
+      if (!p.picked) { toast(t("m.exportCanceled")); return; }
+      openPwModal({ mode: "exportAll", path: p.path, count: p.count, onDone: () => actions.refresh() });
+    });
+  },
+
+  async stImport() {
+    await guard(async () => {
+      const p = await invoke("import_pick_files");
+      if (!p.picked) return;
+      const sealed = p.sealed || [];
+      const preErrors = p.errors || [];
+      if (sealed.length) {
+        openPwModal({ mode: "import", files: sealed, preErrors, onDone: (rep) => actions.stFinishImport(rep) });
+        return;
+      }
+      actions.stFinishImport({ added: [], skipped: [], errors: preErrors });
+    });
+  },
+
+  stFinishImport(report) {
+    if (report.added.length === 0 && report.skipped.length === 0) {
+      toast(t("s.importNone"), "err", report.errors.join(t("common.listSep")) || undefined);
+    } else {
+      const parts = [];
+      if (report.added.length) parts.push(t("s.importAdded", { count: report.added.length, names: report.added.join(t("common.listSep")) }));
+      if (report.skipped.length) parts.push(t("s.importSkipped", { count: report.skipped.length }));
+      if (report.errors.length) parts.push(t("s.importFailed", { count: report.errors.length }));
+      toast(parts[0], report.errors.length ? "err" : "ok", parts.slice(1).join(t("common.listSep")));
+    }
+    refresh().then(() => { render(); syncSettingsModal(); }).catch(() => {});
+  },
+
+  async openGitHub() {
+    try { await invoke("open_external", { url: "https://github.com/pjpv/zcode-switch" }); }
     catch (e) { toast(stripErr(e), "err"); }
   },
   acctQuota(id) {
@@ -1302,7 +1617,6 @@ function render() {
           <span class="status-dot ${dotCls}"></span>
           <span class="status-text">${esc(statusText)}</span>
         </div>
-        <button class="btn-ghost tb-gear has-ic" click="actions.openSettings()" aria-label="${t("common.settings")}" title="${t("common.settings")}">${ic("sliders", 15)}</button>
       </div>
     </header>
 
@@ -1344,6 +1658,7 @@ function render() {
         ${s.zcode_running
           ? `<button class="icon-btn tb-btn danger" click="actions.askKill()" aria-label="${t("btn.killZcode")}" title="${t("btn.killZcode")}">${ic("power", 17)}</button>`
           : `<button class="icon-btn tb-btn" click="actions.launch()" ${s.zcode_path_ok ? "" : "disabled"} aria-label="${t("btn.launchZcode")}" title="${t("btn.launchZcode")}">${ic("play", 16)}</button>`}
+        <button class="icon-btn tb-btn" click="actions.openSettings()" aria-label="${t("common.settings")}" title="${t("common.settings")}">${ic("sliders", 17)}</button>
       </div>
     </section>
 
@@ -1364,6 +1679,8 @@ function render() {
 }
 
 window.actions = actions;
+window.onProxyKey = (e) => { if (e.key === "Enter") actions.stSaveProxy(); };
+window.onPathKey = (e) => { if (e.key === "Enter") actions.stSavePath(); };
 window.onRenameKey = (e, id) => {
   if (e.key === "Enter") actions.doRename(id);
   if (e.key === "Escape") actions.cancelRename();

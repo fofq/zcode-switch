@@ -921,7 +921,7 @@ async fn set_language(app: AppHandle, lang: String) -> Result<(), String> {
     }
     i18n::set(l);
     rebuild_tray(&app);
-    for (label, key) in [("settings", "title.settings"), ("captcha", "title.captcha"), ("login", "title.login")] {
+    for (label, key) in [("captcha", "title.captcha"), ("login", "title.login")] {
         if let Some(w) = app.get_webview_window(label) {
             let _ = w.set_title(&i18n::tr(key));
         }
@@ -934,37 +934,6 @@ async fn set_language(app: AppHandle, lang: String) -> Result<(), String> {
 async fn reveal_main(app: AppHandle) -> Result<(), String> {
     let win = app.get_webview_window("main").ok_or_else(|| i18n::tr("err.main.missing"))?;
     win.show().map_err(|e| e.to_string())?;
-    let _ = win.set_focus();
-    Ok(())
-}
-
-#[tauri::command]
-async fn open_settings(app: AppHandle) -> Result<(), String> {
-    let (w, h) = (520.0, 700.0);
-    if let Some(win) = app.get_webview_window("settings") {
-        center_over_main(&app, &win, w, h);
-        let _ = win.show();
-        let _ = win.unminimize();
-        let _ = win.set_focus();
-        return Ok(());
-    }
-    let win = tauri::WebviewWindowBuilder::new(
-        &app,
-        "settings",
-        tauri::WebviewUrl::App("settings.html".into()),
-    )
-    .title(i18n::tr("title.settings"))
-    .theme(Some(tauri::Theme::Dark))
-    .background_color(tauri::window::Color(10, 10, 12, 255))
-    .inner_size(w, h)
-    .min_inner_size(440.0, 540.0)
-    .resizable(true)
-    .additional_browser_args("--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection --no-proxy-server")
-    .visible(false)
-    .build()
-    .map_err(|e| e.to_string())?;
-    center_over_main(&app, &win, w, h);
-    let _ = win.show();
     let _ = win.set_focus();
     Ok(())
 }
@@ -1210,7 +1179,6 @@ pub fn run() {
             set_zcode_path,
             launch_zcode,
             open_external,
-            open_settings,
             reveal_main,
         ])
         .on_window_event(|window, event| {
