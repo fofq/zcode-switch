@@ -75,6 +75,16 @@ export function installDelegation() {
     if (!el) return;
     runAttr(el.getAttribute("blur") || "", e);
   }, true);
+  document.addEventListener("input", (e) => {
+    const el = e.target.closest("[input]");
+    if (!el) return;
+    runAttr(el.getAttribute("input") || "", e);
+  });
+  document.addEventListener("change", (e) => {
+    const el = e.target.closest("[change]");
+    if (!el) return;
+    runAttr(el.getAttribute("change") || "", e);
+  });
 }
 
 export function openConfirmModal(m) {

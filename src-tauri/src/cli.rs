@@ -35,7 +35,18 @@ fn ok(v: Value) -> String {
 }
 
 fn err(e: &str) -> String {
-    serde_json::to_string_pretty(&json!({ "ok": false, "error": e })).unwrap()
+    // 可能带语言无关的错误码前缀（code:文案），CLI 输出里剥掉、另以 code 字段暴露
+    let (code, msg) = match crate::i18n::code_of(e) {
+        Some(c) => (c, e.split_once(':').map(|(_, rest)| rest).unwrap_or(e)),
+        None => ("", e),
+    };
+    let mut m = serde_json::Map::new();
+    m.insert("ok".into(), Value::Bool(false));
+    m.insert("error".into(), Value::String(msg.to_string()));
+    if !code.is_empty() {
+        m.insert("code".into(), Value::String(code.to_string()));
+    }
+    serde_json::to_string_pretty(&Value::Object(m)).unwrap()
 }
 
 pub fn run(args: &[String]) -> (String, i32) {

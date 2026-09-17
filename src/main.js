@@ -2,7 +2,8 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { esc, toast, openPwModal, openConfirmModal, openProviderModal, openGroupModal, installDelegation, dismissSplash } from "./ui.js";
 import { ic } from "./icons.js";
-import { init, t, has, lang, localeTag, stripErr } from "./i18n.js";
+import { init, t, has, lang, localeTag, stripErr, errCode } from "./i18n.js";
+import { HEALTH_ORDER, healthOf, filterAccounts, sortAccounts, bucketAccounts, summarize } from "./list.js";
 
 const $app = document.getElementById("app");
 let state = null;
@@ -54,21 +55,85 @@ function idLabel(id) {
   return id.display_name || id.username || id.email || null;
 }
 
-let collapsedSections = new Set();
+// ---------- 列表视图状态（搜索 / 筛选 / 排序 / 密度 / 选择） ----------
+
+const UI_PREFS_KEY = "zsw-list-prefs";
+const SORTS = ["quota", "name", "created", "updated"];
+
+function loadPrefs() {
+  try {
+    const v = JSON.parse(localStorage.getItem(UI_PREFS_KEY) || "null");
+    return v && typeof v === "object" ? v : {};
+  } catch { return {}; }
+}
+const savedPrefs = loadPrefs();
+
+const ui = {
+  search: "",
+  health: "all",
+  sort: SORTS.includes(savedPrefs.sort) ? savedPrefs.sort : "quota",
+  density: savedPrefs.density === "detail" ? "detail" : "compact",
+  selected: new Set(),
+  expanded: new Set(),
+  collapsedSections: new Set(),
+};
+let quotaSweep = { running: false, done: 0, total: 0, cancel: false };
+
+function savePrefs() {
+  try {
+    localStorage.setItem(UI_PREFS_KEY, JSON.stringify({ sort: ui.sort, density: ui.density }));
+  } catch { /* 忽略 */ }
+}
+
+function isTyping() {
+  const el = document.activeElement;
+  const tag = el?.tagName;
+  return tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT";
+}
 
 function acctGroup(a) {
   return String(a?.group || "").trim();
 }
-function acctStatusKey(a) {
-  if (a.is_active) return "active";
-  if (a.has_user_info === false) return "relogin";
-  return "normal";
+
+// 额度查询的鉴权类错误由后端带上语言无关的错误码（见 quota.rs 的 coded()）
+const AUTH_CODES = new Set(["token_expired", "token_biz401", "token_http401", "quota_no_token"]);
+function isAuthErr(q) {
+  return !!q?.code && AUTH_CODES.has(q.code);
 }
-const STATUS_ORDER = ["active", "relogin", "normal"];
-function statusLabel(key) {
-  return key === "active" ? t("grp.status.active")
-    : key === "relogin" ? t("grp.status.relogin")
-      : t("grp.status.normal");
+
+const HEALTH_PREFIX = "grp.health.";
+const SORT_PREFIX = "list.sort.";
+function healthLabel(level) {
+  return t(HEALTH_PREFIX + level);
+}
+function healthMapOf() {
+  const map = new Map();
+  for (const a of state?.accounts || []) map.set(a.id, healthOf(a, acctQuota[a.id], isAuthErr));
+  return map;
+}
+function pctLabel(h) {
+  if (h.remainingPct == null) return t("list.pctUnknown");
+  return t("list.pctLeft", { pct: Math.round(h.remainingPct) });
+}
+function healthDotHtml(h) {
+  const p = h.remainingPct == null ? "" : " · " + pctLabel(h);
+  return `<span class="hdot ${h.level}" title="${esc(healthLabel(h.level) + p)}"></span>`;
+}
+// 紧凑行的额度小条（剩余比例）
+function quotaChipHtml(id, h) {
+  const q = acctQuota[id];
+  const pct = h.remainingPct;
+  const w = pct == null ? 0 : Math.round(pct);
+  const txt = q?.busy && !q?.data ? t("list.querying") : pctLabel(h);
+  return `<div class="rq ${h.level}" title="${esc(healthLabel(h.level) + (pct == null ? "" : " · " + pctLabel(h)))}">
+      <span class="rq-bar"><i style="width:${w}%"></i></span>
+      <span class="rq-pct">${esc(txt)}</span>
+    </div>`;
+}
+function groupTagHtml(a) {
+  const g = acctGroup(a);
+  if (!g) return "";
+  return `<span class="tag-grp" title="${esc(t("grp.tagTitle", { group: g }))}">${ic("folder", 11)} ${esc(g)}</span>`;
 }
 function customGroups(accounts) {
   const set = new Set();
@@ -78,36 +143,97 @@ function customGroups(accounts) {
   }
   return [...set].sort((x, y) => x.localeCompare(y, localeTag(), { sensitivity: "base" }));
 }
-function groupTagHtml(a) {
-  const g = acctGroup(a);
-  if (!g) return "";
-  return `<span class="tag-grp" title="${esc(t("grp.tagTitle", { group: g }))}">${ic("folder", 11)} ${esc(g)}</span>`;
+function selectedIds() {
+  const all = new Set((state?.accounts || []).map((a) => a.id));
+  return [...ui.selected].filter((id) => all.has(id));
 }
-function groupedListHtml(accounts, rowHtml) {
-  const buckets = new Map();
-  for (const a of accounts) {
-    const g = acctGroup(a);
-    const key = g ? `g:${g}` : `s:${acctStatusKey(a)}`;
-    if (!buckets.has(key)) buckets.set(key, { label: g || statusLabel(acctStatusKey(a)), rows: [] });
-    buckets.get(key).rows.push(rowHtml(a));
-  }
-  const custom = [...buckets.keys()]
-    .filter((k) => k.startsWith("g:"))
-    .sort((x, y) => x.slice(2).localeCompare(y.slice(2), localeTag(), { sensitivity: "base" }));
-  const status = STATUS_ORDER.map((s) => `s:${s}`).filter((k) => buckets.has(k));
-  return [...custom, ...status].map((k) => {
-    const b = buckets.get(k);
-    const collapsed = collapsedSections.has(k);
+function visibleAccounts() {
+  const hm = healthMapOf();
+  const list = sortAccounts(
+    filterAccounts(state?.accounts || [], { search: ui.search, health: ui.health }, hm),
+    ui.sort, hm, localeTag(),
+  );
+  return { list, hm };
+}
+
+/** 分组视图：自定义分组优先，未分组按"额度健康度"分桶 */
+function groupedListHtml(accounts, rowHtml, healthMap) {
+  const buckets = bucketAccounts(accounts, { localeTag: localeTag(), healthLabel }, healthMap);
+  return buckets.map((b) => {
+    const collapsed = ui.collapsedSections.has(b.key);
     return `
-    <section class="grp-sec${collapsed ? " collapsed" : ""}" data-sec="${esc(k)}">
+    <section class="grp-sec${collapsed ? " collapsed" : ""}" data-sec="${esc(b.key)}">
       <button class="grp-head" click="actions.toggleSection(event)" aria-expanded="${collapsed ? "false" : "true"}">
         <span class="grp-chev">${ic("chevDown", 13)}</span>
         <span class="grp-title">${esc(b.label)}</span>
-        <span class="grp-num">${t("grp.count", { count: b.rows.length })}</span>
+        <span class="grp-num">${t("grp.count", { count: b.items.length })}</span>
       </button>
-      ${collapsed ? "" : `<div class="grp-body">${b.rows.join("")}</div>`}
+      ${collapsed ? "" : `<div class="grp-body">${b.items.map(rowHtml).join("")}</div>`}
     </section>`;
   }).join("");
+}
+
+function chipsHtml(sum) {
+  const levels = ["all", ...HEALTH_ORDER.filter((lv) => lv === ui.health || sum.counts[lv] > 0)];
+  return `<div class="chips" role="group" aria-label="${esc(t("list.filterLabel"))}">` +
+    levels.map((lv) => {
+      const on = ui.health === lv;
+      const n = lv === "all" ? (state?.accounts || []).length : sum.counts[lv];
+      const label = lv === "all" ? t("list.filterAll") : healthLabel(lv);
+      return `<button class="chip${lv === "all" ? "" : " " + lv}${on ? " on" : ""}" aria-pressed="${on}" click="actions.setHealth('${lv}')">${esc(label)}<span class="chip-n">${n}</span></button>`;
+    }).join("") + `</div>`;
+}
+
+function summaryHtml(sum) {
+  const avg = sum.avgRemainingPct == null ? "—" : Math.round(sum.avgRemainingPct) + "%";
+  return `<span class="lh-sum">${esc(t("list.summary", { n: (state?.accounts || []).length, avg }))}</span>`;
+}
+
+function bulkBarHtml() {
+  const n = selectedIds().length;
+  if (!n) return "";
+  return `<div class="bulk-bar">
+    <span class="bulk-n">${esc(t("list.selected", { n }))}</span>
+    <span class="lh-sp"></span>
+    <button class="btn-ghost has-ic" click="actions.askBulkGroup()">${ic("folder", 13)} ${t("list.bulkGroup")}</button>
+    <button class="btn-ghost danger has-ic" click="actions.askBulkDelete()">${ic("x", 13)} ${t("list.bulkDelete")}</button>
+    <button class="btn-ghost" click="actions.clearSelection()">${t("list.clearSel")}</button>
+  </div>`;
+}
+
+function listHeadHtml(s, sum, visible) {
+  const allOn = visible.length > 0 && visible.every((a) => ui.selected.has(a.id));
+  return `
+    <div class="list-head">
+      <div class="lh-row">
+        <div class="search-box">
+          <span class="search-ic">${ic("search", 14)}</span>
+          <input class="search-input" type="text" value="${esc(ui.search)}" placeholder="${esc(t("list.searchPh"))}"
+            input="actions.setSearch(event)" aria-label="${esc(t("list.searchPh"))}">
+          ${ui.search ? `<button class="search-clear" title="${esc(t("list.clearSearch"))}" click="actions.setSearch('')">${ic("x", 12)}</button>` : ""}
+        </div>
+        <div class="view-seg" role="group" aria-label="${esc(t("grp.viewLabel"))}">
+          <button class="vs-opt${s.grouped ? "" : " on"}" aria-pressed="${!s.grouped}" click="actions.setGrouped(false)">${t("grp.flat")}</button>
+          <button class="vs-opt${s.grouped ? " on" : ""}" aria-pressed="${!!s.grouped}" click="actions.setGrouped(true)">${t("grp.grouped")}</button>
+        </div>
+      </div>
+      <div class="lh-row">${chipsHtml(sum)}</div>
+      <div class="lh-row lh-tools">
+        ${summaryHtml(sum)}
+        <span class="lh-sp"></span>
+        <button class="sel-all" title="${esc(t("list.selectAllVisible"))}" click="actions.selectAllVisible()">
+          <span class="rchk sm${allOn ? " on" : ""}" aria-hidden="true">${ic("check", 11)}</span>${t("list.selectAll")}
+        </button>
+        <select class="mini-sel" change="actions.setSort(event)" aria-label="${esc(t("list.sortLabel"))}">
+          ${SORTS.map((v) => `<option value="${v}"${ui.sort === v ? " selected" : ""}>${esc(t(SORT_PREFIX + v))}</option>`).join("")}
+        </select>
+        <div class="view-seg" role="group" aria-label="${esc(t("list.densityLabel"))}">
+          <button class="vs-opt${ui.density === "compact" ? " on" : ""}" aria-pressed="${ui.density === "compact"}" click="actions.setDensity('compact')">${t("list.density.compact")}</button>
+          <button class="vs-opt${ui.density === "detail" ? " on" : ""}" aria-pressed="${ui.density === "detail"}" click="actions.setDensity('detail')">${t("list.density.detail")}</button>
+        </div>
+      </div>
+      ${bulkBarHtml()}
+    </div>`;
 }
 
 async function refresh() {
@@ -116,7 +242,7 @@ async function refresh() {
 }
 
 function uiLocked() {
-  return renaming !== null;
+  return renaming !== null || isTyping();
 }
 
 async function guard(fn) {
@@ -140,7 +266,7 @@ async function loadAcctQuota(id) {
     const data = await invoke("get_account_quota", { id });
     acctQuota[id] = { data, err: null, busy: false };
   } catch (e) {
-    acctQuota[id] = { data: null, err: stripErr(e), busy: false };
+    acctQuota[id] = { data: null, err: stripErr(e), code: errCode(e), busy: false };
   }
   if (!uiLocked()) render();
 }
@@ -245,9 +371,147 @@ const actions = {
   toggleSection(ev) {
     const key = ev?.target?.closest?.(".grp-sec")?.dataset?.sec;
     if (!key) return;
-    if (collapsedSections.has(key)) collapsedSections.delete(key);
-    else collapsedSections.add(key);
+    if (ui.collapsedSections.has(key)) ui.collapsedSections.delete(key);
+    else ui.collapsedSections.add(key);
     render();
+  },
+
+  setSearch(ev) {
+    const el = ev?.target;
+    ui.search = String(el?.value ?? "");
+    window.__searchPos = el && el.selectionStart != null ? el.selectionStart : ui.search.length;
+    render();
+  },
+
+  setHealth(lv) {
+    ui.health = HEALTH_ORDER.includes(lv) ? lv : "all";
+    render();
+  },
+
+  setSort(ev) {
+    const v = String(ev?.target?.value || "");
+    ui.sort = SORTS.includes(v) ? v : "quota";
+    savePrefs();
+    render();
+  },
+
+  setDensity(v) {
+    ui.density = v === "detail" ? "detail" : "compact";
+    savePrefs();
+    render();
+  },
+
+  toggleRow(ev) {
+    const id = ev?.target?.closest?.(".row")?.dataset?.id;
+    if (!id) return;
+    if (ui.expanded.has(id)) ui.expanded.delete(id);
+    else ui.expanded.add(id);
+    render();
+  },
+
+  toggleSelect(id) {
+    if (ui.selected.has(id)) ui.selected.delete(id);
+    else ui.selected.add(id);
+    render();
+  },
+
+  selectAllVisible() {
+    const { list } = visibleAccounts();
+    const allOn = list.length > 0 && list.every((a) => ui.selected.has(a.id));
+    for (const a of list) {
+      if (allOn) ui.selected.delete(a.id);
+      else ui.selected.add(a.id);
+    }
+    render();
+  },
+
+  clearSelection() {
+    ui.selected.clear();
+    render();
+  },
+
+  clearFilters() {
+    ui.search = "";
+    ui.health = "all";
+    render();
+  },
+
+  askBulkDelete() {
+    const ids = selectedIds();
+    if (!ids.length) return;
+    openConfirmModal({
+      kind: "danger",
+      icon: "x",
+      title: t("list.bulkDeleteTitle", { n: ids.length }),
+      desc: t("list.bulkDeleteDesc"),
+      yesLabel: t("common.delete"),
+      onYes: () => actions.doBulkDelete(ids),
+    });
+  },
+
+  async doBulkDelete(ids) {
+    await guard(async () => {
+      let ok = 0;
+      for (const id of ids) {
+        try { await invoke("delete_account", { id }); ok++; } catch { /* 单个失败不阻断 */ }
+      }
+      for (const id of ids) ui.selected.delete(id);
+      toast(t("list.toastBulkDeleted", { n: ok }), ok === ids.length ? "ok" : "warn");
+      await refresh(); render();
+    });
+  },
+
+  askBulkGroup() {
+    const ids = selectedIds();
+    if (!ids.length) return;
+    openGroupModal({
+      name: t("list.bulkGroupName", { n: ids.length }),
+      current: "",
+      groups: customGroups(state?.accounts || []),
+      onPick: (g) => actions.doBulkGroup(ids, g),
+      onCreate: (g) => actions.doBulkGroup(ids, g),
+    });
+  },
+
+  async doBulkGroup(ids, group) {
+    const next = String(group || "").trim();
+    await guard(async () => {
+      let ok = 0;
+      for (const id of ids) {
+        try { await invoke("set_account_group", { id, group: next || null }); ok++; } catch { /* 单个失败不阻断 */ }
+      }
+      if (next) toast(t("grp.toastBulkGrouped", { n: ok, group: next }), "ok");
+      else toast(t("grp.toastBulkUngrouped", { n: ok }));
+      await refresh(); render();
+    });
+  },
+
+  /** 逐个账号刷新额度（再点一下 = 停止）；健康度依赖它 */
+  async refreshAllQuota() {
+    if (quotaSweep.running) {
+      quotaSweep.cancel = true;
+      return;
+    }
+    const ids = (state?.accounts || []).map((a) => a.id);
+    if (!ids.length) return;
+    quotaSweep = { running: true, done: 0, total: ids.length, cancel: false };
+    render();
+    let cancelled = false;
+    try {
+      for (const id of ids) {
+        if (quotaSweep.cancel) { cancelled = true; break; }
+        await loadAcctQuota(id);
+        quotaSweep.done++;
+        if (!isTyping()) render();
+        await new Promise((r) => setTimeout(r, 200));
+      }
+    } finally {
+      const done = quotaSweep.done;
+      cancelled = cancelled || quotaSweep.cancel;
+      quotaSweep = { running: false, done: 0, total: 0, cancel: false };
+      toast(cancelled ? t("list.toastSweepCancelled", { n: done }) : t("list.toastSweepDone", { n: done }));
+      render();
+    }
   },
 
   setGroup(id) {
@@ -779,30 +1043,32 @@ function planGroupHtml(p) {
   </div>`;
 }
 
-function acctQuotaSlot(id) {
-  const strip = claimStripHtml(id);
+function quotaDetailHtml(id) {
   const q = acctQuota[id];
-  let inner = "";
-  if (q?.busy) {
-    inner = `<span class="aq-loading">${t("q.loading")}</span>`;
-  } else if (q?.err) {
+  if (q?.busy) return `<span class="aq-loading">${t("q.loading")}</span>`;
+  if (q?.err) {
     const msg = q.err.length > 46 ? q.err.slice(0, 46) + "…" : q.err;
-    inner = `<span class="aq-err">${esc(msg)}</span>`;
-  } else if (q?.data) {
-    const plans = q.data.plans || [];
-    if (plans.length >= 2) {
-      inner = plans.map(planGroupHtml).join("");
-    } else {
-      const items = q.data.items || [];
-      const wins = items.filter((it) => itemKind(it) === "prompt_count");
-      if (wins.length) {
-        inner = wins.map((it) => winRowHtml(it, " mini")).join("");
-      } else {
-        inner = slotRowsHtml(items);
-      }
-    }
+    return `<span class="aq-err">${esc(msg)}</span>`;
   }
-  if (!strip && !inner) return `<div class="row-quota-slot"></div>`;
+  if (!q?.data) return "";
+  const plans = q.data.plans || [];
+  if (plans.length >= 2) return plans.map(planGroupHtml).join("");
+  const items = q.data.items || [];
+  const wins = items.filter((it) => itemKind(it) === "prompt_count");
+  if (wins.length) return wins.map((it) => winRowHtml(it, " mini")).join("");
+  if (items.length) return slotRowsHtml(items);
+  // 没有明细项时用总览兜底，避免展开后一片空白
+  if (q.data.percent_used != null) {
+    return winRowHtml({ name: q.data.plan_tier || t("q.other"), percent_used: q.data.percent_used, window: "cycle" }, " mini");
+  }
+  return `<span class="aq-loading">${t("q.other")}</span>`;
+}
+
+/** 行内额度区：可领条永远显示；额度明细按展开状态决定 */
+function quotaSlotHtml(id, showDetail) {
+  const strip = claimStripHtml(id);
+  const inner = showDetail ? quotaDetailHtml(id) : "";
+  if (!strip && !inner) return "";
   return `<div class="row-quota-slot">${strip}${inner}</div>`;
 }
 
@@ -847,7 +1113,11 @@ function render() {
       ? unsaved ? t("m.status.unsaved") : t("m.status.safe")
       : t("m.status.loggedOut");
 
+  const { list: visible, hm: healthMap } = visibleAccounts();
+  const sum = summarize(s.accounts, healthMap);
+
   const rowHtml = (a) => {
+    const h = healthMap.get(a.id) || { level: "unknown", remainingPct: null };
     const isActive = a.is_active;
     if (renaming === a.id) {      return `
       <div class="row${isActive ? " active" : ""}" data-id="${a.id}">
@@ -872,26 +1142,31 @@ function render() {
         meta += `<span class="${exp.warn ? "warn-line" : ""}">${esc(t("q.validUntil", { date: exp.text }))}</span>`;
     }
     if (ident) meta += `${meta ? " · " : ""}${esc(ident)}`;
+    const checked = ui.selected.has(a.id);
+    const slim = ui.density === "compact" && !ui.expanded.has(a.id);
     return `
-    <div class="row${isActive ? " active" : ""}" data-id="${a.id}">
+    <div class="row${isActive ? " active" : ""}${checked ? " picked" : ""}${slim ? " slim" : ""}" data-id="${a.id}">
       <div class="row-top">
-        <span class="notch" style="background:${notchColor(a.id)}"></span>
-        <div class="row-main">
+        <span class="rchk" role="checkbox" aria-checked="${checked}" title="${esc(t("list.selectHint"))}" click="actions.toggleSelect('${a.id}')">${ic("check", 11)}</span>
+        ${healthDotHtml(h)}
+        ${slim ? "" : `<span class="notch" style="background:${notchColor(a.id)}"></span>`}
+        <div class="row-main"${slim ? ` click="actions.toggleRow(event)" title="${esc(t("list.expandTitle"))}"` : ""}>
           <div class="row-name">${esc(a.name)}${groupTagHtml(a)}${tierBadgeFor(a.id)}${isActive ? `<span class="tag-use">${t("btn.inUse")}</span>` : ""}${a.has_user_info === false ? `<span class="tag-relogin" title="${esc(t("btn.reloginTitle"))}">${t("btn.relogin")}</span>` : ""}</div>
           <div class="row-meta">${meta}</div>
         </div>
+        ${quotaChipHtml(a.id, h)}
         <div class="row-actions">
-          <button class="icon-btn" title="${t("btn.group")}" aria-label="${t("btn.group")}" click="actions.setGroup('${a.id}')">${ic("folder", 16)}</button>
-          <button class="icon-btn" title="${t("btn.quota")}" aria-label="${t("btn.quota")}" click="actions.acctQuota('${a.id}')">${ic("gauge", 16)}</button>
-          <button class="icon-btn" title="${t("btn.rename")}" aria-label="${t("btn.rename")}" click="actions.rename('${a.id}')">${ic("pen", 16)}</button>
-          <button class="icon-btn" title="${t("btn.export")}" aria-label="${t("btn.export")}" click="actions.exportOne('${a.id}')">${ic("export", 16)}</button>
-          <button class="icon-btn danger" title="${t("btn.delete")}" aria-label="${t("btn.delete")}" click="actions.delete('${a.id}')">${ic("x", 16)}</button>
+          <button class="icon-btn" title="${t("btn.group")}" aria-label="${t("btn.group")}" click="actions.setGroup('${a.id}')">${ic("folder", 15)}</button>
+          <button class="icon-btn" title="${t("btn.refreshQuota")}" aria-label="${t("btn.refreshQuota")}" click="actions.acctQuota('${a.id}')">${ic("refresh", 15)}</button>
+          <button class="icon-btn" title="${t("btn.rename")}" aria-label="${t("btn.rename")}" click="actions.rename('${a.id}')">${ic("pen", 15)}</button>
+          <button class="icon-btn" title="${t("btn.export")}" aria-label="${t("btn.export")}" click="actions.exportOne('${a.id}')">${ic("export", 15)}</button>
+          <button class="icon-btn danger" title="${t("btn.delete")}" aria-label="${t("btn.delete")}" click="actions.delete('${a.id}')">${ic("x", 15)}</button>
           <button class="btn-switch has-ic" click="actions.askSwitch('${a.id}')" ${isActive ? "disabled" : ""}>
             ${isActive ? t("btn.current") : ic("swap", 14) + " " + t("btn.switch")}
           </button>
         </div>
       </div>
-      ${acctQuotaSlot(a.id)}
+      ${quotaSlotHtml(a.id, !slim)}
     </div>`;
   };
 
@@ -901,9 +1176,15 @@ function render() {
          ${t("m.emptyTitle")}<br>
          ${t("m.emptyBody")}
        </div>`
-    : s.grouped
-      ? groupedListHtml(s.accounts, rowHtml)
-      : s.accounts.map(rowHtml).join("");
+    : visible.length === 0
+      ? `<div class="empty">
+           <div class="glyph">${ic("search", 34)}</div>
+           ${t("list.noMatch")}<br>
+           <button class="btn-ghost" style="margin-top:10px" click="actions.clearFilters()">${t("list.clearFilters")}</button>
+         </div>`
+      : s.grouped
+        ? groupedListHtml(visible, rowHtml, healthMap)
+        : visible.map(rowHtml).join("");
 
   const claimableCount = s.accounts.filter((a) => (claimable[a.id]?.plans || []).length > 0).length;
 
@@ -936,6 +1217,14 @@ function render() {
               : esc(t("btn.refreshClaim"))}
           </button>`
         : ""}
+      ${(s.accounts.length > 0)
+        ? `<button class="btn-ghost has-ic${quotaSweep.running ? " running" : ""}" click="actions.refreshAllQuota()"
+            title="${quotaSweep.running ? esc(t("list.sweepCancelHint")) : esc(t("list.sweepTitle"))}">
+            ${ic("refresh", 16)} ${quotaSweep.running
+              ? esc(t("list.sweepRunning", { done: quotaSweep.done, total: quotaSweep.total }))
+              : esc(t("list.sweep"))}
+          </button>`
+        : ""}
       <button class="tog-inline${s.auto_claim ? " on" : ""}${autoClaimRunning ? " running" : ""}"
         role="switch" aria-checked="${s.auto_claim}" aria-label="${t("btn.autoClaim")}"
         title="${autoPillTitle(s)}"
@@ -951,20 +1240,20 @@ function render() {
       <button class="btn-ghost tb-gear has-ic" click="actions.openSettings()" aria-label="${t("common.settings")}" title="${t("common.settings")}">${ic("sliders", 16)}</button>
     </section>
 
-    <div class="section-head">
-      <h2>${t("m.accounts")}</h2>
-      <div class="sh-right">
-        <div class="view-seg" role="group" aria-label="${t("grp.viewLabel")}">
-          <button class="vs-opt${s.grouped ? "" : " on"}" aria-pressed="${!s.grouped}" click="actions.setGrouped(false)">${t("grp.flat")}</button>
-          <button class="vs-opt${s.grouped ? " on" : ""}" aria-pressed="${!!s.grouped}" click="actions.setGrouped(true)">${t("grp.grouped")}</button>
-        </div>
-        <span class="count">${t("m.count", { count: s.accounts.length })}</span>
-      </div>
-    </div>
+    ${listHeadHtml(s, sum, visible)}
 
     <main class="list">${listHtml}</main>
   `;
   restoreScroll(scrollCap);
+  const pos = window.__searchPos;
+  window.__searchPos = null;
+  if (pos != null) {
+    const box = $app.querySelector(".search-input");
+    if (box) {
+      box.focus();
+      try { box.setSelectionRange(pos, pos); } catch { /* 忽略 */ }
+    }
+  }
 }
 
 window.actions = actions;
@@ -1055,7 +1344,7 @@ function enrollAccounts() {
 function pokeAccount(id) { if (id) quotaDue[id] = Date.now(); }
 
 async function sweepTick() {
-  if (ticking) return;
+  if (ticking || quotaSweep.running) return;
   enrollAccounts();
   const now = Date.now();
   const due = (state?.accounts || []).find(
@@ -1082,6 +1371,8 @@ async function sweepTick() {
     setTimeout(dismissSplash, 350);
     enrollAccounts();
     sweepTick();
+    // 启动时把额度拉全（健康度 / 筛选 / 排序都依赖它）
+    setTimeout(() => { if (!quotaSweep.running) actions.refreshAllQuota(); }, 900);
     setInterval(() => {
       invoke("get_state").then((s) => { state = s; if (s?.language) init(s.language); enrollAccounts(); if (!uiLocked()) render(); }).catch(() => {});
     }, 5000);

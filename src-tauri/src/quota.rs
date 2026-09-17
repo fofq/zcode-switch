@@ -366,7 +366,7 @@ fn http_get_json(url: &str, token: &str, retry_429: bool) -> Result<Value, Strin
                 let body = r.into_string().unwrap_or_default();
                 if let Ok(v) = serde_json::from_str::<Value>(&body) {
                     if v.get("code").and_then(|c| c.as_i64()) == Some(401) {
-                        return Err(crate::i18n::tr("err.token.biz401"));
+                        return Err(crate::i18n::coded("token_biz401", "err.token.biz401", &[]));
                     }
                 }
                 if code == 429 {
@@ -380,7 +380,7 @@ fn http_get_json(url: &str, token: &str, retry_429: bool) -> Result<Value, Strin
                     }
                 }
                 if code == 401 || code == 403 {
-                    return Err(crate::i18n::trf("err.token.http401", &[("code", &code.to_string())]));
+                    return Err(crate::i18n::coded("token_http401", "err.token.http401", &[("code", &code.to_string())]));
                 }
                 let msg = serde_json::from_str::<Value>(&body)
                     .ok()
@@ -408,7 +408,7 @@ fn query_with_token_via(token: &str, fetch: &FetchFn) -> Result<QuotaOverview, S
             }
             let code = limit_resp.get("code").and_then(|c| c.as_i64());
             best_err = Some(match code {
-                Some(401) => crate::i18n::tr("err.token.biz401"),
+                Some(401) => crate::i18n::coded("token_biz401", "err.token.biz401", &[]),
                 Some(c) => {
                     let msg = ["msg", "message", "error"]
                         .iter()
@@ -453,7 +453,7 @@ fn business_ok(v: &Value) -> bool {
 
 pub fn query_quota(tokens: &[String]) -> Result<QuotaOverview, String> {
     if tokens.is_empty() {
-        return Err(crate::i18n::tr("err.quota.no_token"));
+        return Err(crate::i18n::coded("quota_no_token", "err.quota.no_token", &[]));
     }
     let mut last_err: Option<String> = None;
     let mut first_business: Option<String> = None;
@@ -476,7 +476,7 @@ pub fn query_quota(tokens: &[String]) -> Result<QuotaOverview, String> {
         if let Ok(ov) = query_with_token(&tokens[0]) {
             return Ok(ov);
         }
-        return Err(crate::i18n::tr("err.token.expired"));
+        return Err(crate::i18n::coded("token_expired", "err.token.expired", &[]));
     }
     Err(first_business.or(last_err).unwrap_or_else(|| crate::i18n::tr("err.quota.fail")))
 }

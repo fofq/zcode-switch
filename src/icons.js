@@ -39,6 +39,7 @@ const ICONS = {
 
   folder: `<path d="M2.5 5v6.5A1.5 1.5 0 0 0 4 13h8a1.5 1.5 0 0 0 1.5-1.5V6.5A1.5 1.5 0 0 0 12 5H8L6.6 3.5H4A1.5 1.5 0 0 0 2.5 5z"/>`,
   chevDown: P("M4.5 6 8 9.5 11.5 6"),
+  search: `<circle cx="7" cy="7" r="4.3"/>` + P("M10.2 10.2 14 14"),
   xCircle: `<circle cx="8" cy="8" r="5.5"/>` + P("M6.2 6.2l3.6 3.6") + P("M9.8 6.2 6.2 9.8"),
 
   empty: P("M3 3h10") + P("M3 13h10") + `<path d="M8 6.2v3.6M6.2 8h3.6" stroke-dasharray="2 1.6"/>`,
