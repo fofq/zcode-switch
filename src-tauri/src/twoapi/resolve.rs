@@ -52,7 +52,7 @@ pub async fn resolve(st: &SharedState) -> Result<(String, String), String> {
         store::account_api_key(&Paths::detect(), &id_for_task)
     })
     .await
-    .map_err(|e| format!("内部任务失败: {e}"))?
+    .map_err(|e| format!("内部任务失败: {e}"))??
     .ok_or("该账号没有可用的 API Key，请先在账号详情里确认已同步配置")?;
     st.cache.lock().unwrap().insert(id, (Instant::now(), info.clone()));
     Ok((info.api_key, info.base_url))
