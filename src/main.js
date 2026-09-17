@@ -1504,13 +1504,13 @@ function expireInfo(s) {
   return { text: soon && hasTime ? s : s.slice(0, 10), soon, warn };
 }
 
-function planGroupHtml(p) {
+function planGroupHtml(p, omitTier = false) {
   const label = p.tier_code === "other" && !p.pid ? t("q.other") : (p.name || p.tier || "");
   const exp = expireInfo(p.expire);
   return `
   <div class="plan-grp">
     <div class="pg-head">
-      ${p.tier ? tierChipHtml(p.tier, p.tier_code) : ""}
+      ${p.tier && !omitTier ? tierChipHtml(p.tier, p.tier_code) : ""}
       <span class="pg-name" title="${esc(label)}">${esc(label)}</span>
       ${exp ? `<span class="pg-exp${exp.warn ? " warn-line" : ""}" title="${esc(t("q.validUntil", { date: exp.text }))}">${esc(t("q.validUntilShort", { date: exp.text }))}</span>` : ""}
     </div>
@@ -1538,7 +1538,11 @@ function quotaDetailHtml(id) {
   }
   if (!q?.data) return "";
   const plans = q.data.plans || [];
-  if (plans.length >= 2) return plans.map(planGroupHtml).join("");
+  if (plans.length >= 2) {
+    // 行内徽章已展示套餐等级；所有 plan 同级时明细区不再重复渲染等级标签
+    const kinds = new Set(plans.map((p) => tierKind(p.tier, p.tier_code)));
+    return plans.map((p) => planGroupHtml(p, kinds.size === 1)).join("");
+  }
   const items = q.data.items || [];
   const wins = items.filter((it) => itemKind(it) === "prompt_count");
   if (wins.length) return wins.map((it) => winRowHtml(it, " mini")).join("");
@@ -1652,9 +1656,10 @@ function render() {
         ${healthDotHtml(h)}
         ${slim ? "" : `<span class="notch" style="background:${notchColor(a.id)}"></span>`}
         <div class="row-main"${ui.density === "compact" ? ` click="actions.toggleRow(event)" title="${esc(slim ? t("list.expandTitle") : t("list.collapseTitle"))}"` : ""}>
-          <div class="row-name">${ui.density === "compact" ? `<span class="row-chev${slim ? "" : " open"}">${ic("chevDown", 12)}</span>` : ""}${tierBadgeFor(a.id)}<span class="rn-text" title="${esc(a.name)}">${esc(nameText(a))}</span>${groupTagHtml(a)}${isActive ? `<span class="tag-use">${t("btn.inUse")}</span>` : ""}${a.has_user_info === false ? `<span class="tag-relogin" title="${esc(t("btn.reloginTitle"))}">${t("btn.relogin")}</span>` : ""}${expSoon}</div>
+          <div class="row-name">${ui.density === "compact" ? `<span class="row-chev${slim ? "" : " open"}">${ic("chevDown", 12)}</span>` : ""}${tierBadgeFor(a.id)}<span class="rn-text" title="${esc(a.name)}">${esc(nameText(a))}</span>${groupTagHtml(a)}${isActive ? `<span class="tag-use">${t("btn.inUse")}</span>` : ""}${a.has_user_info === false ? `<span class="tag-relogin" title="${esc(t("btn.reloginTitle"))}">${t("btn.relogin")}</span>` : ""}</div>
           <div class="row-meta">${meta}</div>
         </div>
+        ${expSoon}
         ${showChip ? quotaChipHtml(a.id, h) : ""}
         <div class="row-actions">
           <button class="icon-btn" title="${t("btn.group")}" aria-label="${t("btn.group")}" click="actions.setGroup('${a.id}')">${ic("folder", 15)}</button>
@@ -1663,7 +1668,7 @@ function render() {
           <button class="icon-btn" title="${t("btn.export")}" aria-label="${t("btn.export")}" click="actions.exportOne('${a.id}')">${ic("export", 15)}</button>
           <button class="icon-btn danger" title="${t("btn.delete")}" aria-label="${t("btn.delete")}" click="actions.delete('${a.id}')">${ic("x", 15)}</button>
           <button class="btn-switch has-ic" click="actions.askSwitch('${a.id}')" ${isActive ? "disabled" : ""}>
-            ${isActive ? t("btn.current") : ic("swap", 14) + " " + t("btn.switch")}
+            ${isActive ? ic("check", 14) + " " + t("btn.current") : ic("swap", 14) + " " + t("btn.switch")}
           </button>
         </div>
       </div>

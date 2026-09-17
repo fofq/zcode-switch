@@ -1387,7 +1387,8 @@ input:focus-visible,
 .row.picked { border-color: var(--amber-deep); background: rgba(232, 163, 61, .05); }
 .row.slim { padding: 7px 10px 7px 12px; margin-bottom: 5px; }
 .row.slim .row-top { gap: 8px; }
-.row.slim .row-name { font-size: 15.5px; }
+.row.slim .row-name { font-size: 15.5px; overflow: hidden; }
+.row.slim .row-top > .meta-chip { flex: none; margin-right: 2px; }
 .row.slim .row-meta { display: none; }
 .row.slim .icon-btn { width: 26px; height: 26px; }
 .row.slim .btn-switch { height: 26px; padding: 0 10px; font-size: 13.5px; }
