@@ -498,21 +498,20 @@ function twoApiFormHtml() {
       </div>
 
       <div class="st-sec">${t("two.secConfig")}</div>
-      <div class="st-row">
-        <div class="st-lab">${t("two.port")}</div>
-        <div class="st-ctl"><input class="two-port" type="number" min="1024" max="65535" value="${port}"></div>
-      </div>
-      <div class="st-row">
-        <div class="st-lab">${t("two.models")}</div>
-        <div class="st-ctl wide"><input class="two-models" type="text" value="${esc(st.two_api_models || "")}" placeholder="glm-5.3-flash, glm-5.3"></div>
-      </div>
-      <div class="st-row">
-        <div class="st-lab">${t("two.account")}</div>
-        <div class="st-ctl"><select class="two-account" aria-label="${esc(t("two.account"))}" change="actions.twoSetAccount(event)">${acctOpts}</select></div>
-      </div>
-      <div class="st-row">
-        <div class="st-lab"></div>
-        <div class="st-ctl"><button class="btn-ghost" click="actions.twoSaveConfig()">${t("common.save")}</button></div>
+      <div class="two-cfg-grid">
+        <label class="two-cfg"><span>${t("two.port")}</span>
+          <input class="two-input two-port" type="number" min="1024" max="65535" value="${port}">
+        </label>
+        <label class="two-cfg"><span>${t("two.account")}</span>
+          <select class="two-input two-account" change="actions.twoSetAccount(event)">${acctOpts}</select>
+        </label>
+        <label class="two-cfg wide"><span>${t("two.models")}</span>
+          <input class="two-input two-models" type="text" value="${esc(st.two_api_models || "")}" placeholder="glm-5.3-flash, glm-5.3">
+        </label>
+        <div class="two-cfg-actions">
+          <button class="btn-ghost has-ic" click="actions.twoTest()">${ic("bolt", 14)} ${t("two.test")}</button>
+          <button class="btn-ghost" click="actions.twoSaveConfig()">${t("common.save")}</button>
+        </div>
       </div>
 
       <div class="st-sec">${t("two.secToken")}</div>
@@ -699,13 +698,15 @@ async function guard(fn) {
 async function loadAcctQuota(id) {
   const cur = acctQuota[id] || {};
   if (cur.busy) return;
-  acctQuota[id] = { busy: true };
+  // 保留旧数据只标记 busy：健康度/分组在刷新期间不变，避免条目闪回“待查询额度”
+  acctQuota[id] = { ...cur, busy: true };
   if (!uiLocked()) render();
   try {
     const data = await invoke("get_account_quota", { id });
-    acctQuota[id] = { data, err: null, busy: false };
+    acctQuota[id] = { data, err: null, code: null, busy: false };
   } catch (e) {
-    acctQuota[id] = { data: null, err: stripErr(e), code: errCode(e), busy: false };
+    // 失败时也保留旧数据展示，错误信息进明细区；没旧数据才回落到错误态
+    acctQuota[id] = { data: cur.data || null, err: stripErr(e), code: errCode(e), busy: false };
   }
   if (!uiLocked()) render();
 }
@@ -1305,6 +1306,17 @@ const actions = {
 
   openTwoApi() { openTwoApiModal(); },
 
+  /** 一键复制所有账号的 API Key（名称 + key 逐行） */
+  async copyAllKeys() {
+    try {
+      const rows = await invoke("all_account_api_keys");
+      const lines = (rows || []).filter((r) => r.hasKey).map((r) => `${r.name}  ${r.apiKey}`);
+      if (!lines.length) { toast(t("list.apiKeyNone"), "warn"); return; }
+      const ok = await copyText(lines.join("\n"));
+      toast(ok ? t("list.apiKeysCopied", { n: lines.length }) : t("list.copyFail"), ok ? "ok" : "err");
+    } catch (e) { toast(stripErr(e), "err"); }
+  },
+
   async twoToggle() {
     try {
       await invoke("set_two_api", {
@@ -1369,6 +1381,17 @@ const actions = {
   async twoCopySnippet(name) {
     const ok = await copyText(twoSnippet(name, state || {}));
     toast(ok ? t("two.copied") : t("list.copyFail"), ok ? "ok" : "err");
+  },
+
+  async twoTest() {
+    try {
+      const r = await invoke("two_api_test");
+      twoLastStatus = await invoke("two_api_status").catch(() => null);
+      const old = twoApiModalEl?.querySelector(".two-status");
+      if (old) old.outerHTML = twoStatusHtml();
+      if (r?.ok) toast(t("two.testOk", { ms: r.latencyMs, status: r.status }));
+      else toast(t("two.testFail", { err: r?.error || "unknown" }), "err");
+    } catch (e) { toast(stripErr(e), "err"); }
   },
 
   async twoRegenToken() {
@@ -2044,16 +2067,16 @@ function render() {
 
     <section class="toolbar">
       <div class="tb-group">
-        <button class="icon-btn tb-btn tb-primary${unsaved ? " attention" : ""}" click="actions.capture()" ${!s.live_logged_in || active ? "disabled" : ""}
+        <button class="icon-btn tb-btn tb-capture${unsaved ? " attention" : ""}" click="actions.capture()" ${!s.live_logged_in || active ? "disabled" : ""}
           aria-label="${t("btn.saveLogin")}" title="${active ? esc(t("m.saveLoginDisabledTitle", { name: active.name })) : t("btn.saveLogin")}">
           ${ic("capture", 17)}
         </button>
-        <button class="icon-btn tb-btn" click="actions.addAccount()" aria-label="${t("btn.addAccount")}" title="${t("btn.addAccountTitle")}">${ic("userPlus", 17)}</button>
+        <button class="icon-btn tb-btn tb-add" click="actions.addAccount()" aria-label="${t("btn.addAccount")}" title="${t("btn.addAccountTitle")}">${ic("userPlus", 17)}</button>
       </div>
       <span class="tb-sep"></span>
       <div class="tb-group">
         ${(claimableCount > 0 || claimAllState.running)
-          ? `<button class="icon-btn tb-btn${claimAllState.running ? " running" : ""}" click="actions.claimAll()" ${claimAllRunning || refreshClaim.running || autoClaimRunning ? "disabled" : ""}
+          ? `<button class="icon-btn tb-btn tb-gift${claimAllState.running ? " running" : ""}" click="actions.claimAll()" ${claimAllRunning || refreshClaim.running || autoClaimRunning ? "disabled" : ""}
               aria-label="${t("btn.claimAll")}" title="${claimAllState.running
                 ? esc(t("btn.claimAllRunning", { done: claimAllState.done, total: claimAllState.total }))
                 : esc(t("btn.claimAllTitle"))}${claimableCount > 1 ? ` (${claimableCount})` : ""}">
@@ -2062,18 +2085,18 @@ function render() {
                 : claimableCount > 1 ? `<span class="tb-badge">${claimableCount}</span>` : ""}
             </button>`
           : ""}
-        <button class="icon-btn tb-btn${s.auto_claim ? " on" : ""}${autoClaimRunning ? " running" : ""}"
+        <button class="icon-btn tb-btn tb-autoclaim${s.auto_claim ? " on" : ""}${autoClaimRunning ? " running" : ""}"
           role="switch" aria-checked="${s.auto_claim}" aria-label="${t("btn.autoClaim")}"
           title="${autoPillTitle(s)}" click="actions.toggleAutoClaim()">
           ${ic("giftRepeat", 17)}
         </button>
-        <button class="icon-btn tb-btn${s.auto_switch ? " on" : ""}${autoSwitchRunning ? " running" : ""}"
+        <button class="icon-btn tb-btn tb-autoswitch${s.auto_switch ? " on" : ""}${autoSwitchRunning ? " running" : ""}"
           role="switch" aria-checked="${s.auto_switch}" aria-label="${t("as.label")}"
           title="${autoSwitchTitle(s)}" click="actions.toggleAutoSwitch()">
           ${ic("bolt", 17)}
         </button>
         ${(s.accounts.length > 0)
-          ? `<button class="icon-btn tb-btn${quotaSweep.running ? " running" : ""}" click="actions.refreshAll()"
+          ? `<button class="icon-btn tb-btn tb-refresh${quotaSweep.running ? " running" : ""}" click="actions.refreshAll()"
               aria-label="${t("btn.refreshAll")}" title="${esc(refreshAllTitle())}">
               ${ic("refresh", 17)}${refreshAllBadge()}
             </button>`
@@ -2082,11 +2105,15 @@ function render() {
       <span class="tb-sep"></span>
       <div class="tb-group">
         ${s.zcode_running
-          ? `<button class="icon-btn tb-btn danger" click="actions.askKill()" aria-label="${t("btn.killZcode")}" title="${t("btn.killZcode")}">${ic("power", 17)}</button>`
-          : `<button class="icon-btn tb-btn" click="actions.launch()" ${s.zcode_path_ok ? "" : "disabled"} aria-label="${t("btn.launchZcode")}" title="${t("btn.launchZcode")}">${ic("play", 16)}</button>`}
-        <button class="icon-btn tb-btn${s.two_api_on ? " on" : ""}" click="actions.openTwoApi()"
+          ? `<button class="icon-btn tb-btn danger tb-kill" click="actions.askKill()" aria-label="${t("btn.killZcode")}" title="${t("btn.killZcode")}">${ic("power", 17)}</button>`
+          : `<button class="icon-btn tb-btn tb-launch" click="actions.launch()" ${s.zcode_path_ok ? "" : "disabled"} aria-label="${t("btn.launchZcode")}" title="${t("btn.launchZcode")}">${ic("play", 16)}</button>`}
+        <button class="icon-btn tb-btn tb-twoapi${s.two_api_on ? " on" : ""}" click="actions.openTwoApi()"
           aria-label="${t("two.title")}" title="${t("two.title")}">${ic("plug", 17)}</button>
-        <button class="icon-btn tb-btn" click="actions.openSettings()" aria-label="${t("common.settings")}" title="${t("common.settings")}">${ic("sliders", 17)}</button>
+        ${(s.accounts.length > 0)
+          ? `<button class="icon-btn tb-btn tb-copyall" click="actions.copyAllKeys()"
+              aria-label="${t("btn.copyAllKeys")}" title="${t("btn.copyAllKeys")}">${ic("copy", 17)}</button>`
+          : ""}
+        <button class="icon-btn tb-btn tb-settings" click="actions.openSettings()" aria-label="${t("common.settings")}" title="${t("common.settings")}">${ic("sliders", 17)}</button>
       </div>
     </section>
 
@@ -2219,6 +2246,8 @@ async function autoSwitchTick(manual = false) {
   const cands = s.accounts
     .filter((a) => a.id !== active.id)
     .map((a) => ({ a, h: hm.get(a.id) }))
+    // 鉴权失效/查询失败的账号不可作为切换目标（auth 可能带旧数据，需显式排除）
+    .filter((x) => x.h && x.h.level !== "auth" && x.h.level !== "fail")
     .filter((x) => x.h?.remainingPct != null && x.h.remainingPct > thr);
   // 关注模型时，优先在「确实有该模型额度」的账号里挑
   const withModel = cands.filter((x) => x.h.modelMatched);

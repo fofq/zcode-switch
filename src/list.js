@@ -62,17 +62,19 @@ export function modelRemainingPct(q, model) {
  * 返回 { level, remainingPct, modelMatched }
  */
 export function healthOf(acct, quota, isAuthErr, model) {
-  if (quota?.err) {
-    return { level: isAuthErr && isAuthErr(quota) ? "auth" : "fail", remainingPct: null, modelMatched: false };
-  }
   const mp = modelRemainingPct(quota, model);
   const pct = mp != null ? mp : quotaRemainingPct(quota);
+  // 鉴权失效永远优先（token 过期等，旧数据不可信）
+  if (quota?.err && isAuthErr && isAuthErr(quota)) {
+    return { level: "auth", remainingPct: pct, modelMatched: mp != null };
+  }
   if (pct != null) {
     if (pct <= 0) return { level: "dead", remainingPct: 0, modelMatched: mp != null };
     if (pct <= LOW_THRESHOLD) return { level: "low", remainingPct: pct, modelMatched: mp != null };
     return { level: "ok", remainingPct: pct, modelMatched: mp != null };
   }
-  // 没有额度数据时的回退信号
+  // 没有任何额度数据时才用错误/回退信号（避免刷新失败把账号闪进失败分组）
+  if (quota?.err) return { level: "fail", remainingPct: null, modelMatched: false };
   if (acct?.has_user_info === false) return { level: "auth", remainingPct: null, modelMatched: false };
   return { level: "unknown", remainingPct: null, modelMatched: false };
 }

@@ -263,6 +263,16 @@ fn two_api_status() -> twoapi::Status {
 }
 
 #[tauri::command]
+async fn two_api_test() -> twoapi::TestResult {
+    twoapi::test_service().await
+}
+
+#[tauri::command]
+async fn all_account_api_keys() -> Result<Vec<store::AccountKeyLine>, String> {
+    store::all_account_api_keys(&Paths::detect())
+}
+
+#[tauri::command]
 async fn claim_preview(id: String) -> Result<Vec<claim::ClaimPlan>, String> {
     let paths = Paths::detect();
     let mid = store::ensure_virtual_device_mid(&paths, &id)?;
@@ -1234,6 +1244,8 @@ pub fn run() {
             set_two_api,
             regen_two_api_token,
             two_api_status,
+            two_api_test,
+            all_account_api_keys,
             claim_preview,
             claim_refresh,
             claim_start,

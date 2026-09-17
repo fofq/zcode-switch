@@ -155,6 +155,59 @@ pub struct Status {
     pub last_request_at: i64,
 }
 
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TestResult {
+    pub ok: bool,
+    pub latency_ms: u64,
+    pub status: u16,
+    pub error: Option<String>,
+}
+
+/// 连通性测试：实际请求本机 /v1/models（带令牌），返回延迟与 HTTP 状态。
+pub async fn test_service() -> TestResult {
+    let (port, token) = {
+        let mgr = MANAGER.lock().unwrap();
+        match mgr.as_ref() {
+            Some(m) => (m.cfg.port, m.state.token.lock().unwrap().clone()),
+            None => (0, String::new()),
+        }
+    };
+    if port == 0 {
+        return TestResult { ok: false, latency_ms: 0, status: 0, error: Some("服务未运行".into()) };
+    }
+    tauri::async_runtime::spawn_blocking(move || {
+        let started = std::time::Instant::now();
+        let url = format!("http://127.0.0.1:{port}/v1/models");
+        let mut req = upstream_agent().get(&url);
+        if !token.is_empty() {
+            req = req.set("Authorization", &format!("Bearer {token}"));
+        }
+        match req.call() {
+            Ok(resp) => TestResult {
+                ok: true,
+                latency_ms: started.elapsed().as_millis() as u64,
+                status: resp.status(),
+                error: None,
+            },
+            Err(ureq::Error::Status(code, _)) => TestResult {
+                ok: true,
+                latency_ms: started.elapsed().as_millis() as u64,
+                status: code,
+                error: None,
+            },
+            Err(e) => TestResult {
+                ok: false,
+                latency_ms: started.elapsed().as_millis() as u64,
+                status: 0,
+                error: Some(format!("{e}")),
+            },
+        }
+    })
+    .await
+    .unwrap_or(TestResult { ok: false, latency_ms: 0, status: 0, error: Some("内部任务失败".into()) })
+}
+
 pub fn status() -> Status {
     let mgr = MANAGER.lock().unwrap();
     let (running, port) = mgr

@@ -425,6 +425,25 @@ input:focus-visible,
   margin-bottom: 12px;
 }
 .two-status .two-state { font-weight: 600; color: var(--ink); }
+.two-cfg-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px 12px; margin-bottom: 6px; }
+.two-cfg { display: flex; flex-direction: column; gap: 5px; font-size: 12px; color: var(--ink-mute); min-width: 0; }
+.two-cfg.wide { grid-column: 1 / -1; }
+.two-input {
+  height: 30px;
+  padding: 0 9px;
+  font-size: 13px;
+  font-family: var(--mono);
+  color: var(--ink);
+  background: var(--panel-2);
+  border: 1px solid var(--hairline);
+  border-radius: 6px;
+  min-width: 0;
+  width: 100%;
+  box-sizing: border-box;
+}
+.two-input:focus { outline: none; border-color: var(--amber-deep); }
+select.two-input { cursor: pointer; }
+.two-cfg-actions { grid-column: 1 / -1; display: flex; justify-content: flex-end; gap: 8px; }
 .two-token { display: flex; align-items: center; gap: 6px; }
 .two-token-val {
   flex: 1;
@@ -559,23 +578,53 @@ input:focus-visible,
   border: 1px solid var(--hairline-soft);
   border-radius: 10px;
 }
-.tb-group { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
-.tb-sep { flex: none; width: 1px; height: 20px; background: var(--hairline); }
-.toolbar .tb-btn { position: relative; width: 32px; height: 32px; }
-.toolbar .tb-btn.tb-primary {
-  background: var(--amber);
-  border-color: var(--amber);
-  color: var(--amber-ink);
+.tb-group { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+.tb-sep { flex: none; width: 1px; height: 20px; background: var(--hairline); margin: 0 3px; }
+.toolbar .tb-btn { position: relative; width: 34px; height: 34px; }
+/* 保存登录：琥珀色（主操作，柔和底色 + 琥珀图标） */
+.toolbar .tb-btn.tb-capture {
+  background: rgba(232, 163, 61, .14);
+  border-color: var(--amber-deep);
+  color: var(--amber);
 }
-.toolbar .tb-btn.tb-primary:hover:not(:disabled) { background: #f0b055; }
-.toolbar .tb-btn.tb-primary.attention {
+.toolbar .tb-btn.tb-capture:hover:not(:disabled) { background: rgba(232, 163, 61, .24); color: #f0b055; }
+.toolbar .tb-btn.tb-capture.attention {
   box-shadow: 0 0 0 1px var(--bg-2), 0 0 14px rgba(232, 163, 61, .35);
 }
-.toolbar .tb-btn.on {
+/* 各按钮独立配色：图标即语义色，悬停补边框 */
+.toolbar .tb-btn.tb-add { color: var(--mint); }
+.toolbar .tb-btn.tb-add:hover:not(:disabled) { border-color: rgba(98, 195, 112, .45); background: rgba(98, 195, 112, .08); }
+.toolbar .tb-btn.tb-gift { color: #e08aa0; }
+.toolbar .tb-btn.tb-gift:hover:not(:disabled) { border-color: rgba(224, 138, 160, .45); background: rgba(224, 138, 160, .08); }
+.toolbar .tb-btn.tb-refresh { color: #6aa9e0; }
+.toolbar .tb-btn.tb-refresh:hover:not(:disabled) { border-color: rgba(106, 169, 224, .45); background: rgba(106, 169, 224, .08); }
+.toolbar .tb-btn.tb-launch { color: var(--mint); }
+.toolbar .tb-btn.tb-launch:hover:not(:disabled) { border-color: rgba(98, 195, 112, .45); background: rgba(98, 195, 112, .08); }
+.toolbar .tb-btn.tb-kill { color: var(--red); }
+.toolbar .tb-btn.tb-twoapi { color: #5bc8d8; }
+.toolbar .tb-btn.tb-twoapi:hover:not(:disabled) { border-color: rgba(91, 200, 216, .45); background: rgba(91, 200, 216, .08); }
+.toolbar .tb-btn.tb-copyall { color: #9d8ae0; }
+.toolbar .tb-btn.tb-copyall:hover:not(:disabled) { border-color: rgba(157, 138, 224, .45); background: rgba(157, 138, 224, .08); }
+.toolbar .tb-btn.tb-settings { color: var(--ink-mute); }
+.toolbar .tb-btn.tb-settings:hover:not(:disabled) { color: var(--ink); }
+/* 开关类按钮：开启后边缘高亮（每类一个色相） */
+.toolbar .tb-btn.tb-autoclaim.on {
+  color: #b48ae0;
+  border-color: rgba(180, 138, 224, .55);
+  background: rgba(180, 138, 224, .1);
+  box-shadow: 0 0 12px rgba(180, 138, 224, .35);
+}
+.toolbar .tb-btn.tb-autoswitch.on {
   color: var(--amber);
   border-color: var(--amber-deep);
   background: rgba(232, 163, 61, .1);
   box-shadow: 0 0 12px rgba(232, 163, 61, .3);
+}
+.toolbar .tb-btn.tb-twoapi.on {
+  color: #5bc8d8;
+  border-color: rgba(91, 200, 216, .55);
+  background: rgba(91, 200, 216, .1);
+  box-shadow: 0 0 12px rgba(91, 200, 216, .35);
 }
 .toolbar .tb-btn.running { animation: tog-pulse 1.6s ease-in-out infinite; }
 .toolbar .tb-btn.danger:hover:not(:disabled) {

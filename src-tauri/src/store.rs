@@ -1144,8 +1144,8 @@ fn decrypt_opt(v: &str, home: &std::path::Path) -> Option<String> {
     }
 }
 
-pub fn account_api_key(paths: &Paths, id: &str) -> Result<Option<ApiKeyInfo>, String> {
-    let acc = load_account(paths, id)?;
+/// 纯本地解析：账号 config 快照里的 coding-plan key，回退 start-plan JWT。不发网络请求。
+fn local_api_key(acc: &Account, home: &std::path::Path) -> Option<ApiKeyInfo> {
     if let Some(cfg) = acc.config.as_ref() {
         if let Some(providers) = cfg.get("provider").and_then(|p| p.as_object()) {
             // 打分（越小越优先）：enabled 优先；coding-plan 家族优先；apiKey 非空优先
@@ -1173,7 +1173,7 @@ pub fn account_api_key(paths: &Paths, id: &str) -> Result<Option<ApiKeyInfo>, St
                     .get("options")
                     .and_then(|o| o.get("apiKey"))
                     .and_then(|k| k.as_str())
-                    .and_then(|k| decrypt_opt(k, &paths.home))
+                    .and_then(|k| decrypt_opt(k, home))
                     .unwrap_or_default();
                 if key.trim().len() <= 20 {
                     continue;
@@ -1190,13 +1190,30 @@ pub fn account_api_key(paths: &Paths, id: &str) -> Result<Option<ApiKeyInfo>, St
                     .get("name")
                     .and_then(|n| n.as_str())
                     .unwrap_or(pid.as_str());
-                return Ok(Some(ApiKeyInfo {
+                return Some(ApiKeyInfo {
                     label: label.to_string(),
                     api_key: key.trim().to_string(),
                     base_url: base.to_string(),
-                }));
+                });
             }
         }
+    }
+    if let Some(jwt) = cred_plain(&acc.credentials, "zcodejwttoken", home) {
+        if jwt.trim().len() > 20 {
+            return Some(ApiKeyInfo {
+                label: "Start Plan".into(),
+                api_key: jwt.trim().to_string(),
+                base_url: oauth::START_PLAN_ANTHROPIC_BASE.into(),
+            });
+        }
+    }
+    None
+}
+
+pub fn account_api_key(paths: &Paths, id: &str) -> Result<Option<ApiKeyInfo>, String> {
+    let acc = load_account(paths, id)?;
+    if let Some(info) = local_api_key(&acc, &paths.home) {
+        return Ok(Some(info));
     }
     // 配置快照里没有现成 key：像登录/热切换那样现场解析（上游会自动创建 zcode-api-key）
     let provider = cred_plain(&acc.credentials, "oauth:active_provider", &paths.home)
@@ -1221,17 +1238,31 @@ pub fn account_api_key(paths: &Paths, id: &str) -> Result<Option<ApiKeyInfo>, St
             }));
         }
     }
-    // 回退：start-plan JWT + 固定端点
-    if let Some(jwt) = cred_plain(&acc.credentials, "zcodejwttoken", &paths.home) {
-        if jwt.trim().len() > 20 {
-            return Ok(Some(ApiKeyInfo {
-                label: "Start Plan".into(),
-                api_key: jwt.trim().to_string(),
-                base_url: oauth::START_PLAN_ANTHROPIC_BASE.into(),
-            }));
-        }
-    }
     Ok(None)
+}
+
+#[derive(serde::Serialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct AccountKeyLine {
+    pub name: String,
+    pub api_key: String,
+    pub has_key: bool,
+}
+
+/// 一键复制所有 API Key 用：只做本地解析，不逐个发网络请求。
+pub fn all_account_api_keys(paths: &Paths) -> Result<Vec<AccountKeyLine>, String> {
+    let accounts = list_accounts(paths)?;
+    Ok(accounts
+        .iter()
+        .map(|a| {
+            let info = local_api_key(a, &paths.home);
+            AccountKeyLine {
+                name: a.name.clone(),
+                api_key: info.map(|i| i.api_key).unwrap_or_default(),
+                has_key: info.is_some(),
+            }
+        })
+        .collect())
 }
 
 fn ensure_virtual_device_mid_locked(paths: &Paths, id: &str) -> Result<String, String> {

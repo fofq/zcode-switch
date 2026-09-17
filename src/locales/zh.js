@@ -192,6 +192,7 @@ export const zh = {
   "list.unnamed": "未命名账号",
   "list.apiKeyCopied": "API Key 已复制",
   "list.apiKeyNone": "该账号没有可用的 API Key",
+  "list.apiKeysCopied": "已复制 {n} 个账号的 API Key",
   "list.copyFail": "复制失败",
 
   "two.title": "2API 本地服务",
@@ -214,6 +215,9 @@ export const zh = {
   "two.tokenRegen": "重新生成",
   "two.tokenRegenDone": "已生成新令牌",
   "two.copied": "已复制",
+  "two.test": "测试连接",
+  "two.testOk": "连通正常 · {ms}ms · HTTP {status}",
+  "two.testFail": "连接失败：{err}",
   "two.secEndpoints": "接入端点",
   "two.epAnthropic": "Anthropic 兼容 · Claude Code 等",
   "two.epOpenai": "OpenAI 兼容 · codex / opencode / pi",
@@ -247,6 +251,7 @@ export const zh = {
   "list.toastSweepCancelled": "已停止，本次刷新了 {n} 个账号",
   "btn.refreshQuota": "刷新额度",
   "btn.copyKey": "复制 API Key",
+  "btn.copyAllKeys": "复制所有账号的 API Key",
 
   "q.loading": "查询中…",
   "q.unknown": "未知",

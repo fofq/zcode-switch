@@ -192,6 +192,7 @@ export const en = {
   "list.unnamed": "Unnamed account",
   "list.apiKeyCopied": "API key copied",
   "list.apiKeyNone": "No usable API key for this account",
+  "list.apiKeysCopied": "Copied API keys of {n} accounts",
   "list.copyFail": "Copy failed",
 
   "two.title": "2API local service",
@@ -214,6 +215,9 @@ export const en = {
   "two.tokenRegen": "Regenerate",
   "two.tokenRegenDone": "New token generated",
   "two.copied": "Copied",
+  "two.test": "Test connection",
+  "two.testOk": "Connected · {ms}ms · HTTP {status}",
+  "two.testFail": "Connection failed: {err}",
   "two.secEndpoints": "Endpoints",
   "two.epAnthropic": "Anthropic compatible · Claude Code etc.",
   "two.epOpenai": "OpenAI compatible · codex / opencode / pi",
@@ -247,6 +251,7 @@ export const en = {
   "list.toastSweepCancelled": "Stopped — refreshed {n} accounts this run",
   "btn.refreshQuota": "Refresh quota",
   "btn.copyKey": "Copy API key",
+  "btn.copyAllKeys": "Copy API keys of all accounts",
 
   "q.loading": "Querying…",
   "q.unknown": "unknown",
