@@ -116,6 +116,8 @@ pub struct Settings {
     pub auto_switch: Option<bool>,
     #[serde(default)]
     pub auto_switch_threshold: Option<u32>,
+    #[serde(default)]
+    pub auto_switch_model: Option<String>,
 }
 
 impl Settings {
@@ -127,6 +129,13 @@ impl Settings {
     pub fn oauth_browser(&self) -> bool { self.oauth_browser.unwrap_or(true) }
     pub fn auto_switch(&self) -> bool { self.auto_switch.unwrap_or(false) }
     pub fn auto_switch_threshold(&self) -> u32 { self.auto_switch_threshold.unwrap_or(10).clamp(1, 90) }
+    pub fn auto_switch_model(&self) -> Option<String> {
+        self.auto_switch_model
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|s| s.chars().take(40).collect())
+    }
     pub fn auth_proxy(&self) -> Option<&str> {
         if self.auth_proxy_on.unwrap_or(false) {
             self.auth_proxy_url.as_deref().map(str::trim).filter(|s| !s.is_empty())
@@ -169,6 +178,7 @@ pub struct AppState {
     pub oauth_browser: bool,
     pub auto_switch: bool,
     pub auto_switch_threshold: u32,
+    pub auto_switch_model: Option<String>,
     pub auth_proxy_on: bool,
     pub auth_proxy_url: Option<String>,
     pub language: String,
@@ -687,7 +697,10 @@ fn align_family_domain(paths: &Paths, target: &Account) {
 }
 
 fn rematerialize_wiped_builtins(paths: &Paths, target: &Account) {
-    if target.config.is_none() { return; }
+    // 不要求目标账号有 config 快照：即使没有快照（切换后沿用现有 config），
+    // 只要现有 config 里同家族的 builtin 条目已被客户端抹掉（apiKey 为空）或被标为
+    // oauth_provider_inactive，就应该用目标账号的凭据把 apiKey 补回来——
+    // 这是“切完号模型调不通、要在客户端手动刷新”的常见原因。
     let Some(provider) = cred_plain(&target.credentials, "oauth:active_provider", &paths.home)
         .filter(|p| p == "bigmodel" || p == "zai") else { return; };
     let Some(jwt) = cred_plain(&target.credentials, "zcodejwttoken", &paths.home)
@@ -803,6 +816,12 @@ pub fn switch_to(paths: &Paths, id: &str, force: bool, restart: bool, hot: bool)
         let creds = inject_relay_pass_hash(&target.credentials, current_relay_pass(paths).as_ref());
         hot_swap_verified(paths, &target, &creds)?;
         backfill_relay_pass_hash(paths, &target.id, &creds);
+        // 热切换也必须让运行中的客户端认到新账号的 provider 家族与 apiKey：
+        // setting.json 的 providerFamilyDomain 带 UpdatedAt 时间戳，客户端靠它感知变更；
+        // config.json 里同家族的 builtin 条目可能已被客户端抹掉/禁用。
+        // 否则跨家族（zai ↔ bigmodel）热切后模型调用会持续失败，需用户手动刷新/等待。
+        align_family_domain(paths, &target);
+        rematerialize_wiped_builtins(paths, &target);
         reset_live_plan_cache(paths);
         let mid = ensure_virtual_device_mid_locked(paths, &target.id)?;
         write_live_device_mid(paths, &mid)?;
@@ -1480,6 +1499,7 @@ pub fn get_state(paths: &Paths) -> Result<AppState, String> {
         oauth_browser: settings.oauth_browser(),
         auto_switch: settings.auto_switch(),
         auto_switch_threshold: settings.auto_switch_threshold(),
+        auto_switch_model: settings.auto_switch_model(),
         auth_proxy_on: settings.auth_proxy_on.unwrap_or(false),
         auth_proxy_url: settings.auth_proxy_url.clone(),
         language: crate::i18n::current().as_str().to_string(),

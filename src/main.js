@@ -107,6 +107,8 @@ let autoSwitchNote = "";
 
 function autoSwitchTitle(s) {
   const bits = [t("as.label"), t("as.threshold", { pct: s?.auto_switch_threshold ?? 10 })];
+  const m = String(s?.auto_switch_model || "").trim();
+  if (m) bits.push(t("as.model", { model: m }));
   if (autoSwitchRunning) bits.push(t("as.switching"));
   else if (autoSwitchNote) bits.push(autoSwitchNote);
   if (s?.zcode_running && !s?.hot_switch) bits.push(t("as.needHot"));
@@ -150,12 +152,18 @@ function healthLabel(level) {
   return t(HEALTH_PREFIX + level);
 }
 function healthMapOf() {
+  const model = state?.auto_switch_model || "";
   const map = new Map();
-  for (const a of state?.accounts || []) map.set(a.id, healthOf(a, acctQuota[a.id], isAuthErr));
+  for (const a of state?.accounts || []) map.set(a.id, healthOf(a, acctQuota[a.id], isAuthErr, model));
   return map;
+}
+function focusModel() {
+  return String(state?.auto_switch_model || "").trim();
 }
 function pctLabel(h) {
   if (h.remainingPct == null) return t("list.pctUnknown");
+  const m = focusModel();
+  if (m && h.modelMatched) return t("list.modelPct", { model: m, pct: Math.round(h.remainingPct) });
   return t("list.pctLeft", { pct: Math.round(h.remainingPct) });
 }
 function healthDotHtml(h) {
@@ -229,7 +237,9 @@ function chipsHtml(sum) {
 
 function summaryHtml(sum) {
   const avg = sum.avgRemainingPct == null ? "—" : Math.round(sum.avgRemainingPct) + "%";
-  return `<span class="lh-sum">${esc(t("list.summary", { n: (state?.accounts || []).length, avg }))}</span>`;
+  const m = focusModel();
+  const base = t("list.summary", { n: (state?.accounts || []).length, avg });
+  return `<span class="lh-sum">${esc(m ? base + " · " + t("list.focusModel", { model: m }) : base)}</span>`;
 }
 
 function bulkBarHtml() {
@@ -1455,10 +1465,13 @@ async function autoSwitchTick() {
   const thr = Number(s.auto_switch_threshold ?? 10);
   if (!cur || cur.remainingPct == null) return;
   if (cur.remainingPct > thr) return;
-  const best = s.accounts
+  const cands = s.accounts
     .filter((a) => a.id !== active.id)
     .map((a) => ({ a, h: hm.get(a.id) }))
-    .filter((x) => x.h?.remainingPct != null && x.h.remainingPct > thr)
+    .filter((x) => x.h?.remainingPct != null && x.h.remainingPct > thr);
+  // 关注模型时，优先在「确实有该模型额度」的账号里挑
+  const withModel = cands.filter((x) => x.h.modelMatched);
+  const best = (withModel.length ? withModel : cands)
     .sort((x, y) => y.h.remainingPct - x.h.remainingPct)[0];
   if (!best) return;
   // ZCode 运行中且未开热切换：不自动强杀客户端，只在提示里说明

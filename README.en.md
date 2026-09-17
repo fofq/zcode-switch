@@ -8,12 +8,12 @@ A Tauri 2 desktop tool for one-click switching between multiple ZCode accounts, 
 
 ## Features
 
-- **Save / switch accounts**: one-click login switching; the current login is auto-preserved before any switch — accounts are never lost
+- **Save / switch accounts**: one-click login switching; the current login is auto-preserved before any switch — accounts are never lost; the device identity follows the account and the remote-control relay key survives switches; hot switch also realigns the provider family and builtin apiKey, so cross-site switches (z.ai ↔ BigModel) need no manual refresh in the client
 - **Add accounts**: OAuth login for new accounts (BigModel / z.ai entries), either in your **system default browser** or in an **in-app window** (email / password or QR), never touching the current login
 - **Quota display**: inline plan quota and reset time per account row, multi-plan grouping; one-click refresh for every account's quota (claim eligibility is refreshed with it at most once every 10 minutes)
 - **Account grouping & search**: tag accounts with custom groups; the list supports flat / grouped views (grouped by **quota health** by default: available / low / exhausted / re-login needed / query failed / unknown), search, filters, sorting and compact / detailed density, plus bulk group / bulk delete and a one-click "hide account info" mode for screenshots
 - **Claim promotions**: one-click claim for eligible promotions; "Auto claim" toggle (off by default) checks and claims periodically — manual actions take priority
-- **Auto-switch on low quota**: switches to the account with the most quota when the current one drops below the threshold (10% by default, configurable); one-click toggle in the toolbar, pairs with "hot switch" while ZCode is running
+- **Auto-switch on low quota**: switches to the account with the most quota when the current one drops below the threshold (10% by default, configurable); an optional **focus model** (e.g. GLM-5.2) makes both the health check and the switch decision look only at that model's quota; one-click toggle in the toolbar, pairs with "hot switch" while ZCode is running
 - **Encrypted import / export**: `.zsb` bundle, PBKDF2(100k) + AES-256-GCM password encryption
 - **Bilingual UI (中文 / English)**: one-click switch in Settings — main window, tray, error messages and CLI output all covered; first run follows your OS language
 - **Tray / autostart / CLI automation**

@@ -31,22 +31,50 @@ export function quotaRemainingPct(q) {
 }
 
 /**
- * 账号健康度：以额度为主，额度查不到时回退到快照信号。
- * 返回 { level, remainingPct }（remainingPct 为 null 表示算不出）
+ * 关注模型（可选）：只统计名称命中该模型的额度项（不区分大小写，子串匹配）。
+ * 命中 → 返回该模型的剩余百分比；未命中 → null（调用方回退到总额度）。
  */
-export function healthOf(acct, quota, isAuthErr) {
+export function modelRemainingPct(q, model) {
+  const key = String(model || "").trim().toLowerCase();
+  if (!key) return null;
+  const d = q?.data;
+  if (!d) return null;
+  const pcts = [];
+  const consider = (it) => {
+    if (!it || typeof it.name !== "string") return;
+    if (!it.name.toLowerCase().includes(key)) return;
+    const p = Number(it.percent_used);
+    if (isFinite(p)) { pcts.push(p); return; }
+    const total = Number(it.total);
+    const used = Number(it.used);
+    if (isFinite(total) && total > 0 && isFinite(used)) pcts.push((used / total) * 100);
+  };
+  for (const it of d.items || []) consider(it);
+  for (const p of d.plans || []) for (const it of p.items || []) consider(it);
+  if (!pcts.length) return null;
+  const bestUsed = Math.min(...pcts);
+  return Math.max(0, Math.min(100, 100 - bestUsed));
+}
+
+/**
+ * 账号健康度：以额度为主，额度查不到时回退到快照信号。
+ * 传了 model 时优先用该模型的额度，modelMatched 表示是否命中。
+ * 返回 { level, remainingPct, modelMatched }
+ */
+export function healthOf(acct, quota, isAuthErr, model) {
   if (quota?.err) {
-    return { level: isAuthErr && isAuthErr(quota) ? "auth" : "fail", remainingPct: null };
+    return { level: isAuthErr && isAuthErr(quota) ? "auth" : "fail", remainingPct: null, modelMatched: false };
   }
-  const pct = quotaRemainingPct(quota);
+  const mp = modelRemainingPct(quota, model);
+  const pct = mp != null ? mp : quotaRemainingPct(quota);
   if (pct != null) {
-    if (pct <= 0) return { level: "dead", remainingPct: 0 };
-    if (pct <= LOW_THRESHOLD) return { level: "low", remainingPct: pct };
-    return { level: "ok", remainingPct: pct };
+    if (pct <= 0) return { level: "dead", remainingPct: 0, modelMatched: mp != null };
+    if (pct <= LOW_THRESHOLD) return { level: "low", remainingPct: pct, modelMatched: mp != null };
+    return { level: "ok", remainingPct: pct, modelMatched: mp != null };
   }
   // 没有额度数据时的回退信号
-  if (acct?.has_user_info === false) return { level: "auth", remainingPct: null };
-  return { level: "unknown", remainingPct: null };
+  if (acct?.has_user_info === false) return { level: "auth", remainingPct: null, modelMatched: false };
+  return { level: "unknown", remainingPct: null, modelMatched: false };
 }
 
 /** 搜索匹配：名称 / 用户名 / 邮箱 / 分组 / 提供方 */

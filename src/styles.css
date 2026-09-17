@@ -1421,3 +1421,15 @@ input:focus-visible,
   padding: 5px 8px;
 }
 .auto-switch-thr:focus { outline: none; border-color: var(--amber-deep); }
+.focus-model {
+  flex: none;
+  width: 132px;
+  font-family: var(--mono);
+  font-size: 13px;
+  color: var(--ink);
+  background: var(--panel);
+  border: 1px solid var(--hairline);
+  border-radius: 6px;
+  padding: 5px 8px;
+}
+.focus-model:focus { outline: none; border-color: var(--amber-deep); }

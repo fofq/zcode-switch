@@ -869,6 +869,7 @@ async fn set_behavior(
     oauth_browser: Option<bool>,
     auto_switch: Option<bool>,
     auto_switch_threshold: Option<u32>,
+    auto_switch_model: Option<String>,
 ) -> Result<(), String> {
     let _guard = store_guard();
     let paths = Paths::detect();
@@ -896,6 +897,10 @@ async fn set_behavior(
     }
     if let Some(v) = auto_switch_threshold {
         s.auto_switch_threshold = Some(v.clamp(1, 90));
+    }
+    if let Some(v) = auto_switch_model {
+        let t = v.trim();
+        s.auto_switch_model = if t.is_empty() { None } else { Some(t.chars().take(40).collect()) };
     }
     let r = save_settings(&paths, &s);
     rebuild_tray(&app);

@@ -87,6 +87,15 @@ const actions = {
     });
   },
 
+  async saveFocusModel(ev) {
+    const v = String(ev?.target?.value || "").trim();
+    await guard(async () => {
+      await invoke("set_behavior", { autoSwitchModel: v });
+      await refresh(); render();
+      toast(v ? t("s.focusModelSaved", { model: v }) : t("s.focusModelCleared"));
+    });
+  },
+
   async toggleBehavior(key) {
     await guard(async () => {
       await invoke("set_behavior", {
@@ -220,6 +229,12 @@ function render() {
         <div class="thr-line">
           <input class="auto-switch-thr" type="number" min="1" max="90" step="1" value="${s.auto_switch_threshold ?? 10}" change="actions.saveThreshold(event)">
           <span class="thr-pct">%</span>
+        </div>
+      </div>
+      <div class="tog-row">
+        <div class="tog-info"><div class="tog-label">${t("s.focusModel")}</div><div class="tog-desc">${t("s.focusModelDesc")}</div></div>
+        <div class="thr-line">
+          <input class="focus-model" type="text" maxlength="40" placeholder="${t("s.focusModelPh")}" value="${esc(s.auto_switch_model || "")}" change="actions.saveFocusModel(event)">
         </div>
       </div>
       <label style="margin-top:14px">${t("s.authLabel")}</label>
