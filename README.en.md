@@ -13,6 +13,7 @@ A Tauri 2 desktop tool for one-click switching between multiple ZCode accounts, 
 - **Quota display**: inline plan quota and reset time per account row, multi-plan grouping; one-click refresh for every account's quota (claim eligibility is refreshed with it at most once every 10 minutes)
 - **Account grouping & search**: tag accounts with custom groups; the list supports flat / grouped views (grouped by **quota health** by default: available / low / exhausted / re-login needed / query failed / unknown), search, filters, sorting and compact / detailed density, plus bulk group / bulk delete and a one-click "hide account info" mode for screenshots
 - **Claim promotions**: one-click claim for eligible promotions; "Auto claim" toggle (off by default) checks and claims periodically — manual actions take priority
+- **Auto-switch on low quota**: switches to the account with the most quota when the current one drops below the threshold (10% by default, configurable); one-click toggle in the toolbar, pairs with "hot switch" while ZCode is running
 - **Encrypted import / export**: `.zsb` bundle, PBKDF2(100k) + AES-256-GCM password encryption
 - **Bilingual UI (中文 / English)**: one-click switch in Settings — main window, tray, error messages and CLI output all covered; first run follows your OS language
 - **Tray / autostart / CLI automation**

@@ -68,6 +68,25 @@ const actions = {
     });
   },
 
+  async saveThreshold(ev) {
+    const raw = Number(ev?.target?.value);
+    if (!isFinite(raw)) { render(); return; }
+    const v = Math.max(1, Math.min(90, Math.round(raw)));
+    await guard(async () => {
+      await invoke("set_behavior", { autoSwitchThreshold: v });
+      await refresh(); render();
+      toast(t("s.savedToast"));
+    });
+  },
+
+  async toggleAutoSwitch() {
+    await guard(async () => {
+      await invoke("set_behavior", { autoSwitch: !state.auto_switch });
+      await refresh(); render();
+      toast(t("s.savedToast"));
+    });
+  },
+
   async toggleBehavior(key) {
     await guard(async () => {
       await invoke("set_behavior", {
@@ -195,6 +214,14 @@ function render() {
       ${toggle(s.close_to_tray, "actions.toggleBehavior('tray')", t("s.closeTray"), t("s.closeTrayDesc"))}
       ${toggle(s.hot_switch, "actions.toggleBehavior('hot')", t("s.hotSwitch"), t("s.hotSwitchDesc"))}
       ${toggle(s.grouped, "actions.toggleGrouped()", t("s.grouped"), t("s.groupedDesc"))}
+      ${toggle(s.auto_switch, "actions.toggleAutoSwitch()", t("s.autoSwitch"), t("s.autoSwitchDesc"))}
+      <div class="tog-row">
+        <div class="tog-info"><div class="tog-label">${t("s.autoSwitchThr")}</div><div class="tog-desc">${t("s.autoSwitchThrDesc")}</div></div>
+        <div class="thr-line">
+          <input class="auto-switch-thr" type="number" min="1" max="90" step="1" value="${s.auto_switch_threshold ?? 10}" change="actions.saveThreshold(event)">
+          <span class="thr-pct">%</span>
+        </div>
+      </div>
       <label style="margin-top:14px">${t("s.authLabel")}</label>
       ${toggle(s.oauth_browser, "actions.toggleOauthBrowser()", t("s.oauthBrowser"), t("s.oauthBrowserDesc"))}
       ${toggle(s.auth_proxy_on, "actions.toggleAuthProxy()", t("s.proxyToggle"), t("s.proxyToggleDesc"))}

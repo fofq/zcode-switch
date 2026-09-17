@@ -98,6 +98,21 @@ function refreshAllBadge() {
   return n > 0 ? `<span class="tb-badge">${n}</span>` : "";
 }
 
+// 低额度自动切换
+const AUTO_SWITCH_CHECK_MS = 60 * 1000;
+const AUTO_SWITCH_COOLDOWN_MS = 5 * 60 * 1000;
+let autoSwitchRunning = false;
+let lastAutoSwitchAt = 0;
+let autoSwitchNote = "";
+
+function autoSwitchTitle(s) {
+  const bits = [t("as.label"), t("as.threshold", { pct: s?.auto_switch_threshold ?? 10 })];
+  if (autoSwitchRunning) bits.push(t("as.switching"));
+  else if (autoSwitchNote) bits.push(autoSwitchNote);
+  if (s?.zcode_running && !s?.hot_switch) bits.push(t("as.needHot"));
+  return esc(bits.join(" · "));
+}
+
 function savePrefs() {
   try {
     localStorage.setItem(UI_PREFS_KEY, JSON.stringify({ sort: ui.sort, density: ui.density, hideInfo: ui.hideInfo }));
@@ -555,6 +570,7 @@ const actions = {
       if (cancelled) toast(t("list.toastSweepCancelled", { n: done }));
       else toast(elig ? t("list.toastRefreshAllBoth", { n: done }) : t("list.toastSweepDone", { n: done }));
       render();
+      if (state?.auto_switch) autoSwitchTick();
     }
   },
 
@@ -818,6 +834,21 @@ const actions = {
       setTimeout(stopRefreshTickerIfIdle, 1100);
     }
     toast(t("m.refreshClaimDone", { n: ids.length, k: okCount }), "ok");
+  },
+
+  async toggleAutoSwitch() {
+    const next = !state?.auto_switch;
+    await guard(async () => {
+      await invoke("set_behavior", { autoSwitch: next });
+      await refresh(); render();
+      if (next) {
+        toast(t("as.on"), "ok", t("as.onDetail", { pct: state?.auto_switch_threshold ?? 10 }));
+        setTimeout(autoSwitchTick, 1200);
+      } else {
+        autoSwitchNote = "";
+        toast(t("as.off"));
+      }
+    });
   },
 
   async toggleAutoClaim() {
@@ -1091,6 +1122,17 @@ function planGroupHtml(p) {
   </div>`;
 }
 
+/** 明细区是否已经有内容（有的话行内就不再重复显示额度小条） */
+function hasQuotaDetail(id) {
+  const q = acctQuota[id];
+  if (q?.busy || q?.err) return true;
+  const d = q?.data;
+  if (!d) return false;
+  if ((d.plans || []).length >= 2) return true;
+  if ((d.items || []).length) return true;
+  return d.percent_used != null;
+}
+
 function quotaDetailHtml(id) {
   const q = acctQuota[id];
   if (q?.busy) return `<span class="aq-loading">${t("q.loading")}</span>`;
@@ -1196,6 +1238,8 @@ function render() {
     if (ident) meta += `${meta ? " · " : ""}${ui.hideInfo ? `<span class="masked">${esc(t("list.hidden"))}</span>` : esc(ident)}`;
     const checked = ui.selected.has(a.id);
     const slim = ui.density === "compact" && !ui.expanded.has(a.id);
+    // 详细（或已展开）且明细区有内容时，行内不再重复展示额度小条
+    const showChip = slim || !hasQuotaDetail(a.id);
     return `
     <div class="row${isActive ? " active" : ""}${checked ? " picked" : ""}${slim ? " slim" : ""}" data-id="${a.id}">
       <div class="row-top">
@@ -1206,7 +1250,7 @@ function render() {
           <div class="row-name">${ui.density === "compact" ? `<span class="row-chev${slim ? "" : " open"}">${ic("chevDown", 12)}</span>` : ""}${esc(nameText(a))}${groupTagHtml(a)}${tierBadgeFor(a.id)}${isActive ? `<span class="tag-use">${t("btn.inUse")}</span>` : ""}${a.has_user_info === false ? `<span class="tag-relogin" title="${esc(t("btn.reloginTitle"))}">${t("btn.relogin")}</span>` : ""}</div>
           <div class="row-meta">${meta}</div>
         </div>
-        ${quotaChipHtml(a.id, h)}
+        ${showChip ? quotaChipHtml(a.id, h) : ""}
         <div class="row-actions">
           <button class="icon-btn" title="${t("btn.group")}" aria-label="${t("btn.group")}" click="actions.setGroup('${a.id}')">${ic("folder", 15)}</button>
           <button class="icon-btn" title="${t("btn.refreshQuota")}" aria-label="${t("btn.refreshQuota")}" click="actions.acctQuota('${a.id}')">${ic("refresh", 15)}</button>
@@ -1272,6 +1316,11 @@ function render() {
           role="switch" aria-checked="${s.auto_claim}" aria-label="${t("btn.autoClaim")}"
           title="${autoPillTitle(s)}" click="actions.toggleAutoClaim()">
           ${ic("giftRepeat", 17)}
+        </button>
+        <button class="icon-btn tb-btn${s.auto_switch ? " on" : ""}${autoSwitchRunning ? " running" : ""}"
+          role="switch" aria-checked="${s.auto_switch}" aria-label="${t("as.label")}"
+          title="${autoSwitchTitle(s)}" click="actions.toggleAutoSwitch()">
+          ${ic("bolt", 17)}
         </button>
         ${(s.accounts.length > 0)
           ? `<button class="icon-btn tb-btn${quotaSweep.running ? " running" : ""}" click="actions.refreshAll()"
@@ -1391,6 +1440,55 @@ function enrollAccounts() {
 }
 function pokeAccount(id) { if (id) quotaDue[id] = Date.now(); }
 
+/** 低额度自动切换：当前账号剩余额度低于阈值时，切到剩余最多的账号 */
+async function autoSwitchTick() {
+  autoSwitchNote = "";
+  const s = state;
+  if (!s?.auto_switch || autoSwitchRunning || busy) return;
+  if (!(s.accounts || []).length) return;
+  if (quotaSweep.running || refreshClaim.running || claimAllRunning || autoClaimRunning || claimActive) return;
+  if (Date.now() - lastAutoSwitchAt < AUTO_SWITCH_COOLDOWN_MS) return;
+  const active = s.accounts.find((a) => a.is_active);
+  if (!active) return;
+  const hm = healthMapOf();
+  const cur = hm.get(active.id);
+  const thr = Number(s.auto_switch_threshold ?? 10);
+  if (!cur || cur.remainingPct == null) return;
+  if (cur.remainingPct > thr) return;
+  const best = s.accounts
+    .filter((a) => a.id !== active.id)
+    .map((a) => ({ a, h: hm.get(a.id) }))
+    .filter((x) => x.h?.remainingPct != null && x.h.remainingPct > thr)
+    .sort((x, y) => y.h.remainingPct - x.h.remainingPct)[0];
+  if (!best) return;
+  // ZCode 运行中且未开热切换：不自动强杀客户端，只在提示里说明
+  if (s.zcode_running && !s.hot_switch) {
+    autoSwitchNote = t("as.needHot");
+    if (!isTyping()) render();
+    return;
+  }
+  autoSwitchRunning = true;
+  if (!isTyping()) render();
+  try {
+    const r = await invoke("switch_to", { id: best.a.id, force: false, restart: s.launch_after_switch });
+    lastAutoSwitchAt = Date.now();
+    ui.expanded.delete(best.a.id);
+    const bits = [];
+    if (r?.hot) bits.push(t("m.bitHot"));
+    if (r?.launched) bits.push(t("m.bitLaunched"));
+    if (r?.preserved_as) bits.push(t("m.bitPreserved", { name: r.preserved_as }));
+    toast(t("as.toast", { from: active.name, to: r?.name || best.a.name, pct: Math.round(cur.remainingPct) }), "ok", bits.join(t("common.listSep")));
+    await refresh();
+    pokeAccount(best.a.id);
+  } catch (e) {
+    lastAutoSwitchAt = Date.now();
+    toast(t("as.fail", { err: stripErr(e) }), "warn");
+  } finally {
+    autoSwitchRunning = false;
+    if (!uiLocked()) render();
+  }
+}
+
 async function sweepTick() {
   if (ticking || quotaSweep.running) return;
   enrollAccounts();
@@ -1425,6 +1523,7 @@ async function sweepTick() {
       invoke("get_state").then((s) => { state = s; if (s?.language) init(s.language); enrollAccounts(); if (!uiLocked()) render(); }).catch(() => {});
     }, 5000);
     setInterval(sweepTick, TICK_MS);
+    setInterval(autoSwitchTick, AUTO_SWITCH_CHECK_MS);
     setTimeout(autoClaimTick, AUTO_CLAIM_FIRST_DELAY_MS);
     setInterval(autoClaimTick, AUTO_CLAIM_INTERVAL_MS);
   } catch (e) {

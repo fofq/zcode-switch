@@ -112,6 +112,10 @@ pub struct Settings {
     pub grouped: Option<bool>,
     #[serde(default)]
     pub oauth_browser: Option<bool>,
+    #[serde(default)]
+    pub auto_switch: Option<bool>,
+    #[serde(default)]
+    pub auto_switch_threshold: Option<u32>,
 }
 
 impl Settings {
@@ -121,6 +125,8 @@ impl Settings {
     pub fn auto_claim(&self) -> bool { self.auto_claim.unwrap_or(false) }
     pub fn grouped(&self) -> bool { self.grouped.unwrap_or(true) }
     pub fn oauth_browser(&self) -> bool { self.oauth_browser.unwrap_or(true) }
+    pub fn auto_switch(&self) -> bool { self.auto_switch.unwrap_or(false) }
+    pub fn auto_switch_threshold(&self) -> u32 { self.auto_switch_threshold.unwrap_or(10).clamp(1, 90) }
     pub fn auth_proxy(&self) -> Option<&str> {
         if self.auth_proxy_on.unwrap_or(false) {
             self.auth_proxy_url.as_deref().map(str::trim).filter(|s| !s.is_empty())
@@ -161,6 +167,8 @@ pub struct AppState {
     pub auto_claim: bool,
     pub grouped: bool,
     pub oauth_browser: bool,
+    pub auto_switch: bool,
+    pub auto_switch_threshold: u32,
     pub auth_proxy_on: bool,
     pub auth_proxy_url: Option<String>,
     pub language: String,
@@ -1405,26 +1413,51 @@ pub fn get_state(paths: &Paths) -> Result<AppState, String> {
     let live = read_live(paths)?;
     let live_hash = live.as_ref().map(canonical_hash);
     let live_logged_in = live.as_ref().map(is_logged_in).unwrap_or(false);
-    let active_account_id = live_hash
-        .as_ref()
-        .and_then(|h| accounts.iter().find(|a| &a.hash == h).map(|a| a.id.clone()));
     let live_identity = live
         .as_ref()
         .filter(|_| live_logged_in)
         .map(|v| zcrypto::account_identity(v, &paths.home));
+    // 每个账号的登录身份（同时用于 is_active 判定，避免重复解密）
+    let identities: Vec<zcrypto::Identity> = accounts
+        .iter()
+        .map(|a| zcrypto::account_identity(&a.credentials, &paths.home))
+        .collect();
+    // 判定「当前账号」：先按凭据 hash 精确匹配；但 ZCode 使用中会刷新 token / 回写设备信息，
+    // hash 会漂移，此时退回登录身份（user_id / email / username）匹配，
+    // 否则切换成功后过一会儿 UI 就会丢失"当前账号"。
+    let active_idx = if live_logged_in {
+        live_hash
+            .as_ref()
+            .and_then(|h| accounts.iter().position(|a| &a.hash == h))
+            .or_else(|| {
+                let li = live_identity.as_ref()?;
+                if !identity_has_signal(li) {
+                    return None;
+                }
+                accounts
+                    .iter()
+                    .zip(identities.iter())
+                    .position(|(_, ai)| identity_has_signal(ai) && identity_matches(li, ai))
+            })
+    } else {
+        None
+    };
+    let active_account_id = active_idx.map(|i| accounts[i].id.clone());
     let (zcode_path, zcode_path_ok) = effective_zcode_path(paths);
     let settings = load_settings(paths);
     let summaries = accounts
         .iter()
-        .map(|a| AccountSummary {
+        .zip(identities.iter())
+        .enumerate()
+        .map(|(i, (a, idt))| AccountSummary {
             id: a.id.clone(),
             name: a.name.clone(),
             created_at: a.created_at.clone(),
             updated_at: a.updated_at.clone(),
-            is_active: live_hash.as_deref() == Some(a.hash.as_str()),
+            is_active: active_idx == Some(i),
             has_config: a.config.is_some(),
             has_user_info: crate::claim::telemetry_user_id(&paths.home, &a.credentials).is_some(),
-            identity: zcrypto::account_identity(&a.credentials, &paths.home),
+            identity: idt.clone(),
             group: a.group.clone(),
         })
         .collect();
@@ -1445,6 +1478,8 @@ pub fn get_state(paths: &Paths) -> Result<AppState, String> {
         auto_claim: settings.auto_claim(),
         grouped: settings.grouped(),
         oauth_browser: settings.oauth_browser(),
+        auto_switch: settings.auto_switch(),
+        auto_switch_threshold: settings.auto_switch_threshold(),
         auth_proxy_on: settings.auth_proxy_on.unwrap_or(false),
         auth_proxy_url: settings.auth_proxy_url.clone(),
         language: crate::i18n::current().as_str().to_string(),

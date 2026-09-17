@@ -1405,3 +1405,19 @@ input:focus-visible,
 .pv-mode:hover { color: var(--ink); border-color: #3a3e47; }
 .pv-mode.on { color: var(--amber); border-color: var(--amber-deep); background: rgba(232, 163, 61, .1); }
 .pv-mode .ic { flex: none; }
+
+.thr-line { display: flex; align-items: center; gap: 4px; flex: none; }
+.thr-pct { font-family: var(--mono); font-size: 13px; color: var(--ink-mute); }
+.auto-switch-thr {
+  flex: none;
+  width: 62px;
+  text-align: right;
+  font-family: var(--mono);
+  font-size: 13.5px;
+  color: var(--ink);
+  background: var(--panel);
+  border: 1px solid var(--hairline);
+  border-radius: 6px;
+  padding: 5px 8px;
+}
+.auto-switch-thr:focus { outline: none; border-color: var(--amber-deep); }
