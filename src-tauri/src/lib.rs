@@ -420,7 +420,14 @@ async fn oauth_begin(app: AppHandle, provider: String, browser: Option<bool>) ->
         flowlog::log(
             &flow,
             "init-ok",
-            &format!("server_flow={srv_flow} expires_in={expires_in}s interval={}ms", init.poll_interval_ms),
+            &format!(
+                "server_flow={srv_flow} expires_in={expires_in}s interval={}ms auth_params={}",
+                init.poll_interval_ms,
+                init.authorize_url
+                    .parse::<tauri::Url>()
+                    .map(|u| u.query_pairs().map(|(k, _)| k.to_string()).collect::<Vec<_>>().join(","))
+                    .unwrap_or_default(),
+            ),
         );
     }
     let url = init.authorize_url.clone();
@@ -461,10 +468,14 @@ async fn oauth_begin(app: AppHandle, provider: String, browser: Option<bool>) ->
     let app2 = app.clone();
     let (provider2, state2, flow2, mid2) = (provider.clone(), init.state.clone(), flow.clone(), mid.clone());
     let flow_close = flow.clone();
+    let target_url = url
+        .parse::<tauri::Url>()
+        .map_err(|e| i18n::trf("err.oauth.bad_authorize_url", &[("e", &e.to_string())]))?;
     let mut builder = tauri::WebviewWindowBuilder::new(
         &app,
         "login",
-        tauri::WebviewUrl::External(url.parse::<tauri::Url>().map_err(|e| i18n::trf("err.oauth.bad_authorize_url", &[("e", &e.to_string())]))?),
+        // 先加载本地占位页（带转圈与提示），避免窗口长时间黑屏；随后再用 JS 跳转到授权页
+        tauri::WebviewUrl::App("login.html".into()),
     )
     .title(i18n::tr("title.login"))
     .theme(Some(tauri::Theme::Dark))
@@ -476,7 +487,7 @@ async fn oauth_begin(app: AppHandle, provider: String, browser: Option<bool>) ->
     if let Some(u) = proxy_url {
         builder = builder.proxy_url(u);
     }
-    builder
+    let login_win = builder
     .on_navigation(move |url| {
         if url.scheme() != "zcode" {
             return true;
@@ -498,6 +509,20 @@ async fn oauth_begin(app: AppHandle, provider: String, browser: Option<bool>) ->
         flowlog::log(&flow, "window-fail", &m);
         m
     })?;
+    // 本地占位页绘制后再跳到真正的授权页（不跳的话窗口就一直停在占位页）
+    {
+        let w = login_win.clone();
+        let js = format!(
+            "setTimeout(function () {{ location.replace({}) }}, 120)",
+            serde_json::to_string(&url).unwrap_or_else(|_| "\"about:blank\"".into()),
+        );
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(220));
+            if let Err(e) = w.eval(&js) {
+                eprintln!("login placeholder redirect failed: {e}");
+            }
+        });
+    }
     if let Some(w) = app.get_webview_window("login") {
         w.on_window_event(move |e| {
             if let tauri::WindowEvent::CloseRequested { .. } = e {

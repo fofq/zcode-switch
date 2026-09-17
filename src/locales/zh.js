@@ -108,6 +108,7 @@ export const zh = {
   "btn.saveLogin": "保存登录",
   "btn.claimAll": "全部领取",
   "btn.claimAllTitle": "逐账号完成安全验证并领取（每账号限领一次）",
+  "btn.claimAllRunning": "领取中 {done}/{total}",
   "btn.autoClaim": "自动领取",
   "btn.autoClaimTitle": "开启后每 10 分钟自动检测可领套餐并领取（每号先激活一次活动资格；验证码静默通过，需人工验证时提醒）",
   "btn.claim": "领取",

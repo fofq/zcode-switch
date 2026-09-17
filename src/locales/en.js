@@ -108,6 +108,7 @@ export const en = {
   "btn.saveLogin": "Save login",
   "btn.claimAll": "Claim all",
   "btn.claimAllTitle": "Complete verification and claim for each account (one claim per account)",
+  "btn.claimAllRunning": "Claiming {done}/{total}",
   "btn.autoClaim": "Auto claim",
   "btn.autoClaimTitle": "When on, checks claimable plans every 10 min and claims automatically (activates eligibility once per account first; captcha solved silently, alerts if manual verification needed)",
   "btn.claim": "Claim",

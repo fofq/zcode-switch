@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <title>登录 ZCode 账号</title>
+    <style>
+      html, body {
+        margin: 0; height: 100%; background: #0a0a0c; color: #e9e7e1;
+        font-family: "Segoe UI", "Microsoft YaHei UI", "PingFang SC", sans-serif;
+        user-select: none;
+      }
+      #wrap {
+        height: 100%;
+        display: flex; flex-direction: column;
+        align-items: center; justify-content: center;
+        gap: 12px; padding: 0 24px; text-align: center;
+      }
+      .spin {
+        width: 26px; height: 26px; border-radius: 50%;
+        border: 2px solid #2c2f37; border-top-color: #e8a33d;
+        animation: sp .9s linear infinite;
+      }
+      @keyframes sp { to { transform: rotate(360deg); } }
+      @media (prefers-reduced-motion: reduce) { .spin { animation: none; } }
+      .t { font-size: 14px; color: #e9e7e1; }
+      .d { font-size: 12px; color: #838794; line-height: 1.7; }
+      .en { opacity: .75; }
+    </style>
+  </head>
+  <body>
+    <div id="wrap">
+      <div class="spin"></div>
+      <div class="t">正在打开登录页… <span class="en">Opening sign-in page…</span></div>
+      <div class="d">首次打开需要加载官方页面，若长时间无响应，请到「设置」里配置登录代理</div>
+      <div class="d en">First open loads the official page from network. If it hangs, configure the sign-in proxy in Settings</div>
+    </div>
+  </body>
+</html>

@@ -13,6 +13,7 @@ let appVer = "";
 let acctQuota = {};
 let claimable = {};
 let claimAllRunning = false;
+let claimAllState = { running: false, done: 0, total: 0 };
 const REFRESH_CLAIM_COOLDOWN_MS = 60_000;
 let refreshClaim = { running: false, done: 0, total: 0, cooldownUntil: 0 };
 let refreshTicker = null;
@@ -888,22 +889,36 @@ const actions = {
       });
       return;
     }
-    if (key === "proxy") {
-      await actions.stToggleProxy();
-      return;
-    }
+    if (key === "proxy") { await actions.stToggleProxy(); return; }
+    // 两个自动化开关共用工具栏那套逻辑（含立即开跑 / 轮次提示）
+    if (key === "autoClaim") { await actions.toggleAutoClaim(); return; }
+    if (key === "autoSwitch") { await actions.toggleAutoSwitch(); return; }
     const map = {
-      launch: ["launchAfterSwitch", !!s?.launch_after_switch],
-      tray: ["closeToTray", !!s?.close_to_tray],
-      hot: ["hotSwitch", !!s?.hot_switch],
-      grouped: ["grouped", s?.grouped !== false],
-      oauthBrowser: ["oauthBrowser", s?.oauth_browser !== false],
-      autoClaim: ["autoClaim", !!s?.auto_claim],
-      autoSwitch: ["autoSwitch", !!s?.auto_switch],
+      launch: ["launchAfterSwitch", "launch_after_switch"],
+      tray: ["closeToTray", "close_to_tray"],
+      hot: ["hotSwitch", "hot_switch"],
+      grouped: ["grouped", "grouped"],
+      oauthBrowser: ["oauthBrowser", "oauth_browser"],
     };
     const hit = map[key];
     if (!hit) return;
-    await actions.applySetting({ [hit[0]]: !hit[1] });
+    const [param, field] = hit;
+    const prev = !!s?.[field];
+    const next = !prev;
+    if (s) s[field] = next;
+    render();
+    syncSettingsModal();
+    try {
+      await invoke("set_behavior", { [param]: next });
+      await refresh();
+      render();
+      syncSettingsModal();
+    } catch (e) {
+      if (s) s[field] = prev;
+      render();
+      syncSettingsModal();
+      toast(stripErr(e), "err");
+    }
   },
 
   async stToggleProxy() {
@@ -1082,9 +1097,13 @@ const actions = {
     if (claimActive || claimAllRunning || refreshClaim.running) return;
     claimAllRunning = true;
     claimActive = true;
+    claimAllState = { running: true, done: 0, total: ids.length };
+    render();
     try {
       for (let i = 0; i < ids.length; i++) {
         const id = ids[i];
+        claimAllState.done = i;
+        if (!isTyping()) render();
         const plan = claimable[id].plans[0];
         const name = state.accounts.find((a) => a.id === id)?.name || id;
         try {
@@ -1103,6 +1122,8 @@ const actions = {
     } finally {
       claimAllRunning = false;
       claimActive = false;
+      claimAllState = { running: false, done: 0, total: 0 };
+      render();
     }
   },
 
@@ -1162,10 +1183,17 @@ const actions = {
   },
 
   async toggleAutoSwitch() {
-    const next = !state?.auto_switch;
-    await guard(async () => {
+    const prev = !!state?.auto_switch;
+    const next = !prev;
+    // 点击即翻转（乐观更新），再写后端；失败回滚
+    if (state) state.auto_switch = next;
+    render();
+    syncSettingsModal();
+    try {
       await invoke("set_behavior", { autoSwitch: next });
-      await refresh(); render();
+      await refresh();
+      render();
+      syncSettingsModal();
       if (next) {
         toast(t("as.on"), "ok", t("as.onDetail", { pct: state?.auto_switch_threshold ?? 10 }));
         setTimeout(autoSwitchTick, 1200);
@@ -1173,29 +1201,46 @@ const actions = {
         autoSwitchNote = "";
         toast(t("as.off"));
       }
-    });
+    } catch (e) {
+      if (state) state.auto_switch = prev;
+      render();
+      syncSettingsModal();
+      toast(stripErr(e), "err");
+    }
   },
 
   async toggleAutoClaim() {
     if (autoToggleBusy) return;
-    const next = !state.auto_claim;
+    const prev = !!state?.auto_claim;
+    const next = !prev;
     if (next && (autoClaimRunning || claimActive || claimAllRunning || refreshClaim.running)) {
       toast(t("m.claimBusy"), "warn");
       return;
     }
     autoToggleBusy = true;
+    // 点击即翻转（乐观更新），再写后端；失败回滚
+    if (state) state.auto_claim = next;
+    render();
+    syncSettingsModal();
     try {
       await invoke("set_behavior", { autoClaim: next });
       await refresh();
       render();
+      syncSettingsModal();
       if (state.auto_claim) {
         toast(t("m.autoClaimOn"), "ok", t("m.autoClaimOnDetail"));
         if (Date.now() - (lastAutoRound?.at ?? 0) > REFRESH_CLAIM_COOLDOWN_MS) autoClaimTick();
       } else {
         lastAutoRound = null;
       }
-    } catch (e) { toast(stripErr(e), "err"); }
-    finally { autoToggleBusy = false; }
+    } catch (e) {
+      if (state) state.auto_claim = prev;
+      render();
+      syncSettingsModal();
+      toast(stripErr(e), "err");
+    } finally {
+      autoToggleBusy = false;
+    }
   },
 };
 
@@ -1630,10 +1675,14 @@ function render() {
       </div>
       <span class="tb-sep"></span>
       <div class="tb-group">
-        ${claimableCount > 0
-          ? `<button class="icon-btn tb-btn" click="actions.claimAll()" ${claimAllRunning || refreshClaim.running || autoClaimRunning ? "disabled" : ""}
-              aria-label="${t("btn.claimAll")}" title="${t("btn.claimAllTitle")}${claimableCount > 1 ? ` (${claimableCount})` : ""}">
-              ${ic("gift", 17)}${claimableCount > 1 ? `<span class="tb-badge">${claimableCount}</span>` : ""}
+        ${(claimableCount > 0 || claimAllState.running)
+          ? `<button class="icon-btn tb-btn${claimAllState.running ? " running" : ""}" click="actions.claimAll()" ${claimAllRunning || refreshClaim.running || autoClaimRunning ? "disabled" : ""}
+              aria-label="${t("btn.claimAll")}" title="${claimAllState.running
+                ? esc(t("btn.claimAllRunning", { done: claimAllState.done, total: claimAllState.total }))
+                : esc(t("btn.claimAllTitle"))}${claimableCount > 1 ? ` (${claimableCount})` : ""}">
+              ${ic("gift", 17)}${claimAllState.running
+                ? `<span class="tb-badge">${claimAllState.done}/${claimAllState.total}</span>`
+                : claimableCount > 1 ? `<span class="tb-badge">${claimableCount}</span>` : ""}
             </button>`
           : ""}
         <button class="icon-btn tb-btn${s.auto_claim ? " on" : ""}${autoClaimRunning ? " running" : ""}"

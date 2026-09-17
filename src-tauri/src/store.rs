@@ -391,25 +391,37 @@ pub fn open_url(url: &str) -> Result<(), String> {
         return Ok(());
     }
     #[cfg(windows)]
-    let cmd = {
-        let mut c = no_window("cmd");
-        c.args(["/c", "start", "", url]);
-        c
-    };
+    {
+        // 不经过 cmd：URL 里的 `&` 会被 cmd 当成命令分隔符、`%XX%` 会被当环境变量展开，
+        // 结果是浏览器拿到被截断/污染的链接（OAuth 授权页就会报缺 response_type 等参数）。
+        // 直接用 rundll32 把 URL 作为 argv 交给 shell，不经任何命令行解析。
+        let mut direct = no_window("rundll32");
+        direct.args(["url.dll,FileProtocolHandler", url]);
+        if detached(direct).spawn().is_ok() {
+            return Ok(());
+        }
+        // 兜底：rundll32 不可用时再退回 cmd（加引号，降低被拆分的可能）
+        let mut fallback = no_window("cmd");
+        fallback.args(["/c", "start", "", &format!("\"{url}\"")]);
+        detached(fallback)
+            .spawn()
+            .map_err(|e| trf("err.open.link", &[("e", &e.to_string())]))?;
+        return Ok(());
+    }
     #[cfg(target_os = "macos")]
-    let cmd = {
+    {
         let mut c = no_window("open");
         c.arg(url);
-        c
-    };
+        let _ = detached(c).spawn();
+        return Ok(());
+    }
     #[cfg(all(not(windows), not(target_os = "macos")))]
-    let cmd = {
+    {
         let mut c = no_window("xdg-open");
         c.arg(url);
-        c
-    };
-    let _ = detached(cmd).spawn();
-    Ok(())
+        let _ = detached(c).spawn();
+        Ok(())
+    }
 }
 
 pub fn load_settings(paths: &Paths) -> Settings {

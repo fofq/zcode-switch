@@ -48,6 +48,10 @@ CLI password (export / import): prefer the `ZSW_PASSWORD` environment variable (
 
 ## FAQ
 
+### The sign-in window stays black / empty for a long time?
+
+The sign-in page loads the official page from the network (z.ai can be slow on some networks and needs an overseas exit). The window now shows an "Opening sign-in page…" placeholder instead of a plain black screen. If it hangs, configure the sign-in proxy in **Settings → AUTH**, or switch to signing in via your **system default browser**.
+
 ### macOS asks for Microphone / Accessibility / Screen Recording permission?
 
 Deny all of them — nothing breaks.
