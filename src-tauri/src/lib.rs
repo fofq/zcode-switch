@@ -1,6 +1,7 @@
 pub mod cipher;
 pub mod cli;
 pub mod i18n;
+pub mod twoapi;
 mod claim;
 mod flowlog;
 mod oauth;
@@ -210,6 +211,55 @@ async fn get_live_quota() -> Result<quota::QuotaOverview, String> {
 #[tauri::command]
 async fn get_account_quota(id: String) -> Result<quota::QuotaOverview, String> {
     store::account_quota(&Paths::detect(), &id)
+}
+
+#[tauri::command]
+async fn account_api_key(id: String) -> Result<Option<store::ApiKeyInfo>, String> {
+    store::account_api_key(&Paths::detect(), &id)
+}
+
+#[tauri::command]
+async fn set_two_api(
+    app: AppHandle,
+    on: bool,
+    port: u16,
+    account: Option<String>,
+    models: Option<String>,
+) -> Result<(), String> {
+    let paths = Paths::detect();
+    {
+        let _guard = store_guard();
+        let mut s = load_settings(&paths);
+        s.two_api_on = Some(on);
+        s.two_api_port = Some(port.clamp(1024, 65535));
+        s.two_api_account = account.filter(|x| !x.trim().is_empty());
+        s.two_api_models = models;
+        save_settings(&paths, &s)?;
+    }
+    twoapi::sync(&paths).await?;
+    rebuild_tray(&app);
+    let _ = app.emit("state-changed", ());
+    Ok(())
+}
+
+#[tauri::command]
+async fn regen_two_api_token(app: AppHandle) -> Result<String, String> {
+    let paths = Paths::detect();
+    let token = format!("sk-zsw-{}", uuid::Uuid::new_v4().simple());
+    {
+        let _guard = store_guard();
+        let mut s = load_settings(&paths);
+        s.two_api_token = Some(token.clone());
+        save_settings(&paths, &s)?;
+    }
+    twoapi::update_token(&token);
+    let _ = app.emit("state-changed", ());
+    Ok(token)
+}
+
+#[tauri::command]
+fn two_api_status() -> twoapi::Status {
+    twoapi::status()
 }
 
 #[tauri::command]
@@ -1180,6 +1230,10 @@ pub fn run() {
             switch_to,
             get_live_quota,
             get_account_quota,
+            account_api_key,
+            set_two_api,
+            regen_two_api_token,
+            two_api_status,
             claim_preview,
             claim_refresh,
             claim_start,
@@ -1224,6 +1278,15 @@ pub fn run() {
             i18n::init_from_settings(&store::load_settings(&Paths::detect()));
             if let Ok(data_dir) = app.path().app_local_data_dir() {
                 flowlog::init(&data_dir);
+            }
+            // 设置里开了 2API 就随 app 启动本地服务
+            if store::load_settings(&Paths::detect()).two_api_on() {
+                let paths = Paths::detect();
+                tauri::async_runtime::spawn(async move {
+                    if let Err(e) = twoapi::sync(&paths).await {
+                        eprintln!("2API 启动失败: {e}");
+                    }
+                });
             }
             let _tray = TrayIconBuilder::with_id(TRAY_ID)
                 .icon(app.default_window_icon().expect("no window icon").clone())

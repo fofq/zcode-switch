@@ -1,5 +1,6 @@
 
 use crate::i18n::{tr, trf};
+use crate::oauth;
 use crate::quota;
 use crate::zcrypto;
 use chrono::Local;
@@ -118,6 +119,16 @@ pub struct Settings {
     pub auto_switch_threshold: Option<u32>,
     #[serde(default)]
     pub auto_switch_model: Option<String>,
+    #[serde(default)]
+    pub two_api_on: Option<bool>,
+    #[serde(default)]
+    pub two_api_port: Option<u16>,
+    #[serde(default)]
+    pub two_api_account: Option<String>,
+    #[serde(default)]
+    pub two_api_token: Option<String>,
+    #[serde(default)]
+    pub two_api_models: Option<String>,
 }
 
 impl Settings {
@@ -142,6 +153,21 @@ impl Settings {
         } else {
             None
         }
+    }
+    pub fn two_api_on(&self) -> bool { self.two_api_on.unwrap_or(false) }
+    pub fn two_api_port(&self) -> u16 { self.two_api_port.unwrap_or(8117) }
+    pub fn two_api_account(&self) -> Option<String> {
+        self.two_api_account
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(String::from)
+    }
+    pub fn two_api_token(&self) -> String { self.two_api_token.clone().unwrap_or_default() }
+    pub fn two_api_models(&self) -> String {
+        self.two_api_models
+            .clone()
+            .unwrap_or_else(|| "glm-5.3-flash, glm-5.3, glm-4.6".into())
     }
 }
 
@@ -182,6 +208,11 @@ pub struct AppState {
     pub auth_proxy_on: bool,
     pub auth_proxy_url: Option<String>,
     pub language: String,
+    pub two_api_on: bool,
+    pub two_api_port: u16,
+    pub two_api_account: Option<String>,
+    pub two_api_token: String,
+    pub two_api_models: String,
 }
 
 #[derive(Serialize, Clone, Debug)]
@@ -1078,6 +1109,108 @@ pub fn account_quota(paths: &Paths, id: &str) -> Result<quota::QuotaOverview, St
     quota::quota_for_snapshot(&paths.home, &acc.credentials, acc.config.as_ref())
 }
 
+/// 2API 跟随模式用：返回当前激活账号 id（与 get_state 的 is_active 判定一致）
+pub fn active_account_id(paths: &Paths) -> Option<String> {
+    let accounts = list_accounts(paths).ok()?;
+    let live = read_live(paths).ok().flatten()?;
+    if !is_logged_in(&live) { return None; }
+    let live_hash = canonical_hash(&live);
+    if let Some(a) = accounts.iter().find(|a| a.hash == live_hash) {
+        return Some(a.id.clone());
+    }
+    let li = zcrypto::account_identity(&live, &paths.home);
+    if !identity_has_signal(&li) { return None; }
+    accounts.iter().find(|a| {
+        let ai = zcrypto::account_identity(&a.credentials, &paths.home);
+        identity_has_signal(&ai) && identity_matches(&li, &ai)
+    }).map(|a| a.id.clone())
+}
+
+#[derive(serde::Serialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct ApiKeyInfo {
+    pub label: String,
+    pub api_key: String,
+    pub base_url: String,
+}
+
+/// 供"复制 API Key"和 2API 使用：从账号快照里解析可用的 (apiKey, baseURL)。
+/// 优先 enabled 的 coding-plan 条目，其次其它 anthropic 条目，最后回退 start-plan JWT。
+fn decrypt_opt(v: &str, home: &std::path::Path) -> Option<String> {
+    if zcrypto::is_encrypted(v) {
+        zcrypto::decrypt_with_secret(v, &zcrypto::default_secret(home)).ok()
+    } else {
+        Some(v.to_string())
+    }
+}
+
+pub fn account_api_key(paths: &Paths, id: &str) -> Result<Option<ApiKeyInfo>, String> {
+    let acc = load_account(paths, id)?;
+    if let Some(cfg) = acc.config.as_ref() {
+        if let Some(providers) = cfg.get("provider").and_then(|p| p.as_object()) {
+            // 打分（越小越优先）：enabled 优先；coding-plan 家族优先；apiKey 非空优先
+            let mut scored: Vec<(u32, &String, &Value)> = providers
+                .iter()
+                .map(|(pid, p)| {
+                    let enabled = p.get("enabled").and_then(|e| e.as_bool()).unwrap_or(false);
+                    let is_plan = !pid.contains("coding-plan");
+                    let key = p
+                        .get("options")
+                        .and_then(|o| o.get("apiKey"))
+                        .and_then(|k| k.as_str())
+                        .unwrap_or("");
+                    let has_key = key.len() > 20;
+                    (
+                        u32::from(!enabled) * 4 + u32::from(is_plan) * 2 + u32::from(!has_key),
+                        pid,
+                        p,
+                    )
+                })
+                .collect();
+            scored.sort_by_key(|(s, _, _)| *s);
+            for (_, pid, p) in scored {
+                let key = p
+                    .get("options")
+                    .and_then(|o| o.get("apiKey"))
+                    .and_then(|k| k.as_str())
+                    .and_then(|k| decrypt_opt(k, &paths.home))
+                    .unwrap_or_default();
+                if key.trim().len() <= 20 {
+                    continue;
+                }
+                let base = p
+                    .get("options")
+                    .and_then(|o| o.get("baseURL"))
+                    .and_then(|b| b.as_str())
+                    .unwrap_or("");
+                if base.is_empty() {
+                    continue;
+                }
+                let label = p
+                    .get("name")
+                    .and_then(|n| n.as_str())
+                    .unwrap_or(pid.as_str());
+                return Ok(Some(ApiKeyInfo {
+                    label: label.to_string(),
+                    api_key: key.trim().to_string(),
+                    base_url: base.to_string(),
+                }));
+            }
+        }
+    }
+    // 回退：start-plan JWT + 固定端点
+    if let Some(jwt) = cred_plain(&acc.credentials, "zcodejwttoken", &paths.home) {
+        if jwt.trim().len() > 20 {
+            return Ok(Some(ApiKeyInfo {
+                label: "Start Plan".into(),
+                api_key: jwt.trim().to_string(),
+                base_url: oauth::START_PLAN_ANTHROPIC_BASE.into(),
+            }));
+        }
+    }
+    Ok(None)
+}
+
 fn ensure_virtual_device_mid_locked(paths: &Paths, id: &str) -> Result<String, String> {
     {
         let acc = load_account(paths, id)?;
@@ -1515,5 +1648,10 @@ pub fn get_state(paths: &Paths) -> Result<AppState, String> {
         auth_proxy_on: settings.auth_proxy_on.unwrap_or(false),
         auth_proxy_url: settings.auth_proxy_url.clone(),
         language: crate::i18n::current().as_str().to_string(),
+        two_api_on: settings.two_api_on(),
+        two_api_port: settings.two_api_port(),
+        two_api_account: settings.two_api_account(),
+        two_api_token: settings.two_api_token(),
+        two_api_models: settings.two_api_models(),
     })
 }

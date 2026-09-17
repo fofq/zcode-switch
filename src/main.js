@@ -80,6 +80,47 @@ const ui = {
   expanded: new Set(),
   collapsedSections: new Set(),
 };
+
+// 剪贴板：优先 navigator.clipboard，失败回退 execCommand（webview 环境兜底）
+async function copyText(text) {
+  try {
+    await navigator.clipboard.writeText(text);
+    return true;
+  } catch {
+    try {
+      const ta = document.createElement("textarea");
+      ta.value = text;
+      ta.style.cssText = "position:fixed;top:0;left:0;opacity:0;pointer-events:none";
+      document.body.appendChild(ta);
+      ta.select();
+      const ok = document.execCommand("copy");
+      ta.remove();
+      return ok;
+    } catch { return false; }
+  }
+}
+
+// 紧凑行展开后，鼠标离开且无交互超过该时长自动收起（悬停期间暂停计时）
+const EXPAND_AUTO_COLLAPSE_MS = 8000;
+const expandAt = new Map();function expandTouch(id) {
+  if (ui.expanded.has(id)) expandAt.set(id, Date.now());
+}
+function autoCollapseTick() {
+  if (!ui.expanded.size) return;
+  const now = Date.now();
+  let changed = false;
+  for (const id of [...ui.expanded]) {
+    const el = $app.querySelector(`.row[data-id="${CSS.escape(id)}"]`);
+    if (el && el.matches(":hover")) { expandAt.set(id, now); continue; }
+    if (now - (expandAt.get(id) || 0) >= EXPAND_AUTO_COLLAPSE_MS) {
+      ui.expanded.delete(id);
+      expandAt.delete(id);
+      changed = true;
+    }
+  }
+  if (changed) render();
+}
+
 let quotaSweep = { running: false, phase: "quota", eligibility: false, done: 0, total: 0, cancel: false };
 // 领取资格刷新很重，节流到至少 10 分钟一次，避免触发风控
 const ELIGIBILITY_MIN_GAP_MS = 10 * 60 * 1000;
@@ -352,6 +393,183 @@ async function openSettingsModal() {
   mask.querySelector(".st-close").addEventListener("click", closeSettingsModal);
 }
 
+// ---------- 2API 服务弹窗（工具栏插头按钮打开） ----------
+
+let twoApiModalEl = null;
+let twoStatusTimer = null;
+let twoShowToken = false;
+let twoLastStatus = null;
+
+function twoStatusHtml() {
+  const on = !!state?.two_api_on;
+  const st = twoLastStatus || {};
+  const run = !!st.running;
+  const port = st.port || state?.two_api_port || 8117;
+  const last = st.last_request_at
+    ? new Date(st.last_request_at * 1000).toLocaleTimeString(localeTag(), { hour12: false })
+    : "—";
+  return `<div class="two-status"><span class="status-dot ${run ? "run" : "off"}"></span>
+    <span class="two-state">${run ? esc(t("two.statusOn")) : esc(t("two.statusOff"))}</span>
+    <span class="two-meta">127.0.0.1:${port}</span>
+    <span class="two-meta">${esc(t("two.requests", { n: st.requests || 0 }))}</span>
+    <span class="two-meta">${esc(t("two.errors", { n: st.errors || 0 }))}</span>
+    <span class="two-meta">${esc(t("two.lastAt", { time: last }))}</span>
+  </div>`;
+}
+
+function twoSnippet(name, st) {
+  const base = `http://127.0.0.1:${st.two_api_port || 8117}`;
+  const token = st.two_api_token || "<your-token>";
+  const model = String(st.two_api_models || "").split(",")[0].trim() || "glm-5.3-flash";
+  switch (name) {
+    case "claude":
+      return [
+        `export ANTHROPIC_BASE_URL=${base}`,
+        `export ANTHROPIC_AUTH_TOKEN=${token}`,
+        `claude`,
+      ].join("\n");
+    case "codex":
+      return [
+        `export ZSW_API_KEY=${token}`,
+        ``,
+        `# ~/.codex/config.toml`,
+        `model = "${model}"`,
+        `model_provider = "zsw"`,
+        ``,
+        `[model_providers.zsw]`,
+        `name = "zsw"`,
+        `base_url = "${base}/v1"`,
+        `wire_api = "chat"`,
+        `env_key = "ZSW_API_KEY"`,
+      ].join("\n");
+    case "opencode":
+      return JSON.stringify({
+        provider: {
+          zsw: {
+            npm: "@ai-sdk/openai-compatible",
+            options: { baseURL: `${base}/v1`, apiKey: token },
+            models: { [model]: {} },
+          },
+        },
+      }, null, 2);
+    case "pi":
+      return [
+        `# pi 自定义 OpenAI 兼容模型`,
+        `baseUrl = ${base}/v1`,
+        `apiKey = ${token}`,
+        `model = ${model}`,
+      ].join("\n");
+    default:
+      return "";
+  }
+}
+
+function twoApiFormHtml() {
+  const st = state || {};
+  const on = !!st.two_api_on;
+  const port = st.two_api_port || 8117;
+  const token = st.two_api_token || "";
+  const tokenShown = !token ? t("two.tokenEmpty") : twoShowToken ? token : token.slice(0, 10) + "••••••••";
+  const acctOpts = [
+    `<option value=""${!st.two_api_account ? " selected" : ""}>${esc(t("two.accountFollow"))}</option>`,
+    ...(st.accounts || []).map((a) => `<option value="${esc(a.id)}"${st.two_api_account === a.id ? " selected" : ""}>${esc(a.name)}</option>`),
+  ].join("");
+  const epRow = (path, note) => `
+    <div class="two-ep"><code>${base}${path}</code><span class="two-ep-note">${esc(note)}</span>
+      <button class="icon-btn" title="${esc(t("two.copied"))}" click="actions.twoCopyEndpoint('${path}')">${ic("copy", 13)}</button>
+    </div>`;
+  const snippetBtn = (key, label) => `
+    <details class="two-sn"><summary>${esc(label)}</summary>
+      <pre>${esc(twoSnippet(key, st))}</pre>
+      <button class="btn-ghost has-ic" click="actions.twoCopySnippet('${key}')">${ic("copy", 13)} ${esc(t("two.copySnippet"))}</button>
+    </details>`;
+  return `
+  <div class="st-panel" role="dialog" aria-modal="true" aria-label="${esc(t("two.title"))}">
+    <div class="st-head">
+      <span class="st-title">${ic("plug", 16)} ${t("two.title")}</span>
+      <button class="icon-btn st-close" title="${esc(t("common.close"))}" aria-label="${esc(t("common.close"))}">${ic("x", 15)}</button>
+    </div>
+    <div class="st-body">
+      ${twoStatusHtml()}
+      <div class="tog-row">
+        <div class="tog-info"><div class="tog-label">${t("two.on")}</div><div class="tog-desc">${t("two.onDesc")}</div></div>
+        <button class="toggle${on ? " on" : ""}" role="switch" aria-checked="${on}" aria-label="${esc(t("two.on"))}" click="actions.twoToggle()"><span class="knob"></span></button>
+      </div>
+
+      <div class="st-sec">${t("two.secConfig")}</div>
+      <div class="st-row">
+        <div class="st-lab">${t("two.port")}</div>
+        <div class="st-ctl"><input class="two-port" type="number" min="1024" max="65535" value="${port}"></div>
+      </div>
+      <div class="st-row">
+        <div class="st-lab">${t("two.models")}</div>
+        <div class="st-ctl wide"><input class="two-models" type="text" value="${esc(st.two_api_models || "")}" placeholder="glm-5.3-flash, glm-5.3"></div>
+      </div>
+      <div class="st-row">
+        <div class="st-lab">${t("two.account")}</div>
+        <div class="st-ctl"><select class="two-account" aria-label="${esc(t("two.account"))}" change="actions.twoSetAccount(event)">${acctOpts}</select></div>
+      </div>
+      <div class="st-row">
+        <div class="st-lab"></div>
+        <div class="st-ctl"><button class="btn-ghost" click="actions.twoSaveConfig()">${t("common.save")}</button></div>
+      </div>
+
+      <div class="st-sec">${t("two.secToken")}</div>
+      <div class="two-token">
+        <code class="two-token-val">${esc(tokenShown)}</code>
+        <button class="icon-btn" title="${t("two.showToken")}" click="actions.twoToggleTokenShow()">${ic(twoShowToken ? "eyeOff" : "eye", 14)}</button>
+        <button class="icon-btn" title="${t("two.tokenCopy")}" click="actions.twoCopyToken()">${ic("copy", 14)}</button>
+        <button class="btn-ghost" click="actions.twoRegenToken()">${t("two.tokenRegen")}</button>
+      </div>
+
+      <div class="st-sec">${t("two.secEndpoints")}</div>
+      ${epRow("/v1/messages", t("two.epAnthropic"))}
+      ${epRow("/v1/chat/completions", t("two.epOpenai"))}
+
+      <div class="st-sec">${t("two.secSnippets")}</div>
+      ${snippetBtn("claude", t("two.snippetClaude"))}
+      ${snippetBtn("codex", t("two.snippetCodex"))}
+      ${snippetBtn("opencode", t("two.snippetOpencode"))}
+      ${snippetBtn("pi", t("two.snippetPi"))}
+      <div class="st-hint">${t("two.hint")}</div>
+    </div>
+  </div>`;
+}
+
+function syncTwoApiModal() {
+  if (!twoApiModalEl) return;
+  twoApiModalEl.innerHTML = twoApiFormHtml();
+}
+
+function closeTwoApiModal() {
+  document.querySelector(".two-mask")?.remove();
+  twoApiModalEl = null;
+  if (twoStatusTimer) {
+    clearInterval(twoStatusTimer);
+    twoStatusTimer = null;
+  }
+}
+
+async function openTwoApiModal() {
+  closeTwoApiModal();
+  twoLastStatus = await invoke("two_api_status").catch(() => null);
+  const mask = document.createElement("div");
+  mask.className = "st-mask two-mask pv-mask";
+  mask.innerHTML = twoApiFormHtml();
+  document.body.appendChild(mask);
+  twoApiModalEl = mask;
+  const onKey = (e) => { if (e.key === "Escape") closeTwoApiModal(); };
+  document.addEventListener("keydown", onKey);
+  mask.addEventListener("click", (e) => { if (e.target === mask) { closeTwoApiModal(); document.removeEventListener("keydown", onKey); } });
+  mask.querySelector(".st-close").addEventListener("click", closeTwoApiModal);
+  twoStatusTimer = setInterval(async () => {
+    if (!twoApiModalEl) return;
+    twoLastStatus = await invoke("two_api_status").catch(() => null);
+    const old = twoApiModalEl.querySelector(".two-status");
+    if (old) old.outerHTML = twoStatusHtml();
+  }, 2000);
+}
+
 function customGroups(accounts) {
   const set = new Set();
   for (const a of accounts) {
@@ -618,6 +836,7 @@ const actions = {
   setDensity(v) {
     ui.density = v === "detail" ? "detail" : "compact";
     ui.expanded.clear();
+    expandAt.clear();
     savePrefs();
     render();
   },
@@ -631,8 +850,13 @@ const actions = {
   toggleRow(ev) {
     const id = ev?.target?.closest?.(".row")?.dataset?.id;
     if (!id) return;
-    if (ui.expanded.has(id)) ui.expanded.delete(id);
-    else ui.expanded.add(id);
+    if (ui.expanded.has(id)) {
+      ui.expanded.delete(id);
+      expandAt.delete(id);
+    } else {
+      ui.expanded.add(id);
+      expandAt.set(id, Date.now());
+    }
     render();
   },
 
@@ -746,7 +970,7 @@ const actions = {
       if (cancelled) toast(t("list.toastSweepCancelled", { n: done }));
       else toast(elig ? t("list.toastRefreshAllBoth", { n: done }) : t("list.toastSweepDone", { n: done }));
       render();
-      if (state?.auto_switch) autoSwitchTick();
+      if (state?.auto_switch) autoSwitchTick(true);
     }
   },
 
@@ -1062,7 +1286,98 @@ const actions = {
     const dueAt = quotaDue[id];
     loadAcctQuota(id).then(() => {
       if (quotaDue[id] === dueAt) scheduleNext(id);
+      // 手动刷新的是当前账号且额度已低于阈值 → 立即尝试切换
+      if (state?.auto_switch && state?.accounts?.some((a) => a.id === id && a.is_active)) {
+        autoSwitchTick(true);
+      }
     });
+  },
+
+  async copyApiKey(id) {
+    try {
+      const r = await invoke("account_api_key", { id });
+      if (!r?.api_key) { toast(t("list.apiKeyNone"), "warn"); return; }
+      if (await copyText(r.api_key)) toast(t("list.apiKeyCopied"));
+      else toast(t("list.copyFail"), "err");
+    } catch (e) { toast(stripErr(e), "err"); }
+  },
+
+  openTwoApi() { openTwoApiModal(); },
+
+  async twoToggle() {
+    try {
+      await invoke("set_two_api", {
+        on: !state?.two_api_on,
+        port: state?.two_api_port || 8117,
+        account: state?.two_api_account || null,
+        models: state?.two_api_models || null,
+      });
+      await refresh();
+      syncTwoApiModal();
+      render();
+    } catch (e) { toast(stripErr(e), "err"); }
+  },
+
+  async twoSaveConfig() {
+    try {
+      const raw = Number(document.querySelector(".two-port")?.value);
+      const models = document.querySelector(".two-models")?.value || "";
+      await invoke("set_two_api", {
+        on: !!state?.two_api_on,
+        port: Number.isFinite(raw) && raw > 0 ? raw : 8117,
+        account: state?.two_api_account || null,
+        models: models || null,
+      });
+      await refresh();
+      syncTwoApiModal();
+      toast(t("two.saved"));
+    } catch (e) { toast(stripErr(e), "err"); }
+  },
+
+  async twoSetAccount(ev) {
+    const v = ev?.target?.value || "";
+    try {
+      await invoke("set_two_api", {
+        on: !!state?.two_api_on,
+        port: state?.two_api_port || 8117,
+        account: v || null,
+        models: state?.two_api_models || null,
+      });
+      await refresh();
+      syncTwoApiModal();
+    } catch (e) { toast(stripErr(e), "err"); }
+  },
+
+  twoToggleTokenShow() {
+    twoShowToken = !twoShowToken;
+    syncTwoApiModal();
+  },
+
+  async twoCopyToken() {
+    const token = state?.two_api_token || "";
+    if (!token) { toast(t("two.tokenEmpty"), "warn"); return; }
+    const ok = await copyText(token);
+    toast(ok ? t("two.copied") : t("list.copyFail"), ok ? "ok" : "err");
+  },
+
+  async twoCopyEndpoint(path) {
+    const ok = await copyText(`http://127.0.0.1:${state?.two_api_port || 8117}${path}`);
+    toast(ok ? t("two.copied") : t("list.copyFail"), ok ? "ok" : "err");
+  },
+
+  async twoCopySnippet(name) {
+    const ok = await copyText(twoSnippet(name, state || {}));
+    toast(ok ? t("two.copied") : t("list.copyFail"), ok ? "ok" : "err");
+  },
+
+  async twoRegenToken() {
+    try {
+      await invoke("regen_two_api_token");
+      await refresh();
+      twoShowToken = true;
+      syncTwoApiModal();
+      toast(t("two.tokenRegenDone"));
+    } catch (e) { toast(stripErr(e), "err"); }
   },
 
   async addAccount() {
@@ -1682,6 +1997,7 @@ function render() {
         <div class="row-actions">
           <span class="row-tools">
             <button class="icon-btn" title="${t("btn.group")}" aria-label="${t("btn.group")}" click="actions.setGroup('${a.id}')">${ic("folder", 15)}</button>
+            <button class="icon-btn" title="${t("btn.copyKey")}" aria-label="${t("btn.copyKey")}" click="actions.copyApiKey('${a.id}')">${ic("copy", 15)}</button>
             <button class="icon-btn" title="${t("btn.refreshQuota")}" aria-label="${t("btn.refreshQuota")}" click="actions.acctQuota('${a.id}')">${ic("refresh", 15)}</button>
             <button class="icon-btn" title="${t("btn.rename")}" aria-label="${t("btn.rename")}" click="actions.rename('${a.id}')">${ic("pen", 15)}</button>
             <button class="icon-btn" title="${t("btn.export")}" aria-label="${t("btn.export")}" click="actions.exportOne('${a.id}')">${ic("export", 15)}</button>
@@ -1767,6 +2083,8 @@ function render() {
         ${s.zcode_running
           ? `<button class="icon-btn tb-btn danger" click="actions.askKill()" aria-label="${t("btn.killZcode")}" title="${t("btn.killZcode")}">${ic("power", 17)}</button>`
           : `<button class="icon-btn tb-btn" click="actions.launch()" ${s.zcode_path_ok ? "" : "disabled"} aria-label="${t("btn.launchZcode")}" title="${t("btn.launchZcode")}">${ic("play", 16)}</button>`}
+        <button class="icon-btn tb-btn${s.two_api_on ? " on" : ""}" click="actions.openTwoApi()"
+          aria-label="${t("two.title")}" title="${t("two.title")}">${ic("plug", 17)}</button>
         <button class="icon-btn tb-btn" click="actions.openSettings()" aria-label="${t("common.settings")}" title="${t("common.settings")}">${ic("sliders", 17)}</button>
       </div>
     </section>
@@ -1860,6 +2178,8 @@ listen("state-changed", () => {
 });
 
 const SWEEP_PERIOD = 5 * 60 * 1000;
+// 阶梯式刷新：当前使用中的账号用短周期，加速自动切换的响应；其余账号维持长周期
+const SWEEP_PERIOD_ACTIVE = 45 * 1000;
 const SWEEP_JITTER = 0.2;
 const TICK_MS = 8000;
 let quotaDue = {};
@@ -1867,7 +2187,10 @@ let ticking = false;
 
 function scheduleNext(id, base = Date.now()) {
   const jitter = 1 + (Math.random() * 2 - 1) * SWEEP_JITTER;
-  quotaDue[id] = base + Math.round(SWEEP_PERIOD * jitter);
+  const period = state?.accounts?.some((a) => a.id === id && a.is_active)
+    ? SWEEP_PERIOD_ACTIVE
+    : SWEEP_PERIOD;
+  quotaDue[id] = base + Math.round(period * jitter);
 }
 function enrollAccounts() {
   const live = new Set((state?.accounts || []).map((a) => a.id));
@@ -1877,13 +2200,14 @@ function enrollAccounts() {
 function pokeAccount(id) { if (id) quotaDue[id] = Date.now(); }
 
 /** 低额度自动切换：当前账号剩余额度低于阈值时，切到剩余最多的账号 */
-async function autoSwitchTick() {
+async function autoSwitchTick(manual = false) {
   autoSwitchNote = "";
   const s = state;
   if (!s?.auto_switch || autoSwitchRunning || busy) return;
   if (!(s.accounts || []).length) return;
   if (quotaSweep.running || refreshClaim.running || claimAllRunning || autoClaimRunning || claimActive) return;
-  if (Date.now() - lastAutoSwitchAt < AUTO_SWITCH_COOLDOWN_MS) return;
+  // 手动刷新是显式触发，跳过冷却；定时巡检仍受冷却约束，避免来回切换
+  if (!manual && Date.now() - lastAutoSwitchAt < AUTO_SWITCH_COOLDOWN_MS) return;
   const active = s.accounts.find((a) => a.is_active);
   if (!active) return;
   const hm = healthMapOf();
@@ -1897,8 +2221,11 @@ async function autoSwitchTick() {
     .filter((x) => x.h?.remainingPct != null && x.h.remainingPct > thr);
   // 关注模型时，优先在「确实有该模型额度」的账号里挑
   const withModel = cands.filter((x) => x.h.modelMatched);
+  // 候选排序：额度高者优先；礼物/套餐临期的账号再插队，尽快把赠送额度用掉
+  const giftSoon = (a) => (acctQuota[a.id]?.data?.plans || []).some((p) => expireInfo(p.expire)?.warn);
   const best = (withModel.length ? withModel : cands)
-    .sort((x, y) => y.h.remainingPct - x.h.remainingPct)[0];
+    .map((x) => ({ ...x, gift: giftSoon(x.a) ? 1 : 0 }))
+    .sort((x, y) => (y.gift - x.gift) || (y.h.remainingPct - x.h.remainingPct))[0];
   if (!best) return;
   // ZCode 运行中且未开热切换：不自动强杀客户端，只在提示里说明
   if (s.zcode_running && !s.hot_switch) {
@@ -1963,6 +2290,12 @@ async function sweepTick() {
     }, 5000);
     setInterval(sweepTick, TICK_MS);
     setInterval(autoSwitchTick, AUTO_SWITCH_CHECK_MS);
+    setInterval(autoCollapseTick, 1000);
+    // 行内任何点击都算“有操作”，刷新自动收起倒计时
+    $app.addEventListener("click", (e) => {
+      const row = e.target?.closest?.(".row");
+      if (row?.dataset?.id) expandTouch(row.dataset.id);
+    });
     setTimeout(autoClaimTick, AUTO_CLAIM_FIRST_DELAY_MS);
     setInterval(autoClaimTick, AUTO_CLAIM_INTERVAL_MS);
   } catch (e) {

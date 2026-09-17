@@ -64,6 +64,10 @@ const ICONS = {
   xCircle: `<circle cx="8" cy="8" r="5.5"/>` + P("M6.2 6.2l3.6 3.6") + P("M9.8 6.2 6.2 9.8"),
 
   empty: P("M3 3h10") + P("M3 13h10") + `<path d="M8 6.2v3.6M6.2 8h3.6" stroke-dasharray="2 1.6"/>`,
+
+  copy: `<rect x="5.6" y="5.6" width="8" height="8" rx="1.2"/>` + `<path d="M10.4 3.4V3A1.4 1.4 0 0 0 9 1.6H3.4A1.4 1.4 0 0 0 2 3v5.6A1.4 1.4 0 0 0 3.4 10h.4"/>`,
+
+  plug: P("M6 2v3.2") + P("M10 2v3.2") + `<path d="M4.2 5.2h7.6v2.4A3.8 3.8 0 0 1 8 11.4a3.8 3.8 0 0 1-3.8-3.8z"/>` + P("M8 11.4v2.6"),
 };
 
 export function ic(name, size = 16, cls = "") {

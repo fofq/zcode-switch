@@ -27,6 +27,10 @@ base64 = "0.22"
 pbkdf2 = { version = "0.12", default-features = false, features = ["hmac"] }
 ureq = { version = "2", features = ["json"] }
 sys-locale = "0.3"
+# 2API 本地服务：axum 监听 + tokio 流式管道
+axum = { version = "0.7", default-features = false, features = ["http1", "json", "tokio"] }
+tokio = { version = "1", features = ["rt", "net", "sync", "time", "macros"] }
+tokio-stream = "0.1"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.52", features = [
