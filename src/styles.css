@@ -1759,30 +1759,27 @@ select.two-input { cursor: pointer; }
 /* 行内礼物徽标（正交维度：有礼物额度，不再占用健康分组） */
 .gift-badge { display: inline-flex; flex: none; color: #e08aa0; vertical-align: -2px; }
 
-/* 头部额度汇总：chip + 详情弹层 */
-.list-head { position: relative; }
+/* 头部额度统计：定宽 chip + 设置同款模态面板 */
 .qh-chip {
-  display: inline-flex; align-items: center; gap: 6px;
-  padding: 3px 10px; border-radius: 999px; font-size: 12px;
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 92px; padding: 3px 10px; border-radius: 999px; font-size: 12px;
   color: var(--amber); border: 1px solid rgba(232, 163, 61, .35);
   background: rgba(232, 163, 61, .07); cursor: pointer; white-space: nowrap;
 }
 .qh-chip:hover, .qh-chip.on { background: rgba(232, 163, 61, .16); }
-.qh-pop {
-  position: absolute; top: calc(100% - 4px); right: 12px; z-index: 30;
-  width: 600px; max-width: min(92vw, 720px); max-height: 64vh; overflow: auto;
-  scrollbar-width: none;
+.qh-panel {
+  width: min(680px, calc(100vw - 48px));
+  max-height: 76vh; display: flex; flex-direction: column;
+  background: var(--panel); border: 1px solid var(--hairline);
+  border-radius: 12px; padding: 16px 18px 14px;
+  box-shadow: 0 18px 60px rgba(0, 0, 0, .5);
 }
-.qh-pop::-webkit-scrollbar { width: 0; height: 0; }
-  padding: 12px 14px; border-radius: 12px;
-  background: var(--panel, #17191f); border: 1px solid rgba(255,255,255,.09);
-  box-shadow: 0 16px 40px rgba(0,0,0,.5);
-}
-.qh-head { display: flex; align-items: center; justify-content: space-between; font-size: 11px; color: #8a90a0; margin-bottom: 10px; }
+.qh-title { font-size: 15px; font-weight: 700; color: var(--ink); }
+.qh-sub { font-size: 11px; color: #8a90a0; margin-top: 3px; }
+.qh-head { display: flex; align-items: flex-start; justify-content: space-between; margin-bottom: 10px; }
 .qh-close { flex: none; }
 .qh-tag { margin-left: 6px; font-size: 10px; padding: 1px 5px; border-radius: 999px; border: 1px solid rgba(232,163,61,.4); }
 .qh-empty { font-size: 12px; color: #8a90a0; padding: 6px 0; }
-/* 统计面板：模型分节 + 账号明细表 */
 .qhd-tabs { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 10px; }
 .qhd-tab {
   padding: 3px 11px; border-radius: 999px; font-size: 12px; cursor: pointer;
@@ -1791,6 +1788,8 @@ select.two-input { cursor: pointer; }
 .qhd-tab.on { color: #dfe3ec; border-color: rgba(255, 255, 255, .25); background: rgba(255, 255, 255, .06); }
 .qhd-tab.focus { color: var(--amber); border-color: rgba(232, 163, 61, .4); }
 .qhd-tab.focus.on { background: rgba(232, 163, 61, .12); }
+.qhd-body { overflow: auto; margin-top: 8px; padding-right: 4px; scrollbar-width: none; }
+.qhd-body::-webkit-scrollbar { width: 0; height: 0; }
 .qhd-sec-head { display: flex; align-items: baseline; justify-content: space-between; margin-bottom: 5px; }
 .qhd-model { font-size: 13px; color: #dfe3ec; }
 .qhd-sum { font-size: 12px; color: #aab0bf; font-variant-numeric: tabular-nums; }
@@ -1806,28 +1805,4 @@ select.two-input { cursor: pointer; }
 .qhd-bar { height: 6px; border-radius: 3px; background: #2b2e37; overflow: hidden; }
 .qhd-bar > i { display: block; height: 100%; background: #e0a24a; border-radius: 3px; }
 .qhd-pct { text-align: right; font-variant-numeric: tabular-nums; color: #8a90a0; }
-
-/* qh chip 数字对：琥珀色=关注模型，灰=全部模型；tabular-nums 稳定宽度 */
-.qh-chip { font-variant-numeric: tabular-nums; }
-.qh-pair { font-variant-numeric: tabular-nums; color: #aab0bf; }
-.qh-pair.focus { color: var(--amber); }
-.qh-dot { color: #5a5f6d; margin: 0 2px; }
-
-/* 按模型堆叠额度条：一段一色=一个套餐来源，悬浮提示 + 图例 */
-.mstack { display: grid; grid-template-columns: 112px 1fr auto; gap: 4px 10px; align-items: center; margin-bottom: 8px; }
-.mstack:last-of-type { margin-bottom: 0; }
-.ms-model { font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: #c9cede; }
-.ms-main { min-width: 0; }
-.ms-bar { display: flex; height: 14px; border-radius: 7px; overflow: hidden; background: #2b2e37; position: relative; }
-.ms-seg { height: 100%; min-width: 3px; }
-.ms-seg + .ms-seg { border-left: 1px solid #14161b; }
-.ms-seg.empty { background: #343845; }
-.ms-pct {
-  position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
-  font-size: 10px; color: rgba(255, 255, 255, .72); pointer-events: none; text-shadow: 0 1px 2px rgba(0, 0, 0, .5);
-}
-.ms-legend { display: flex; flex-wrap: wrap; gap: 2px 12px; margin-top: 3px; }
-.ms-leg { display: inline-flex; align-items: center; gap: 5px; font-size: 11px; color: #8a90a0; }
-.ms-leg > i { flex: none; width: 8px; height: 8px; border-radius: 2px; }
-.ms-sum { font-size: 12px; color: #8a90a0; font-variant-numeric: tabular-nums; white-space: nowrap; }
 .qh-pop .ms-bar { height: 10px; border-radius: 5px; }

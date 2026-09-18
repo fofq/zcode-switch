@@ -706,12 +706,8 @@ function quotaTotals() {
 
 function quotaHeadChipHtml(tot) {
   if (!tot || !tot.accounts) return "";
-  // 不用文字标注“关注”：第一对数字用琥珀色即关注模型，灰色为全部模型；tabular-nums 稳定宽度
-  const focus = tot.focus
-    ? `<span class="qh-pair focus" title="${esc(t("list.qhFocus"))}">${esc(fmtTokens(tot.focus.remaining))}/${esc(fmtTokens(tot.focus.total))}</span>`
-    : "";
-  const all = `<span class="qh-pair" title="${esc(t("list.qhAll"))}">${esc(fmtTokens(tot.all.remaining))}/${esc(fmtTokens(tot.all.total))}</span>`;
-  return `<button class="qh-chip${ui.qhOpen ? " on" : ""}" data-qh-chip title="${esc(t("list.qhTitle"))}" click="actions.toggleQhDetail()">${focus}${focus && all ? `<span class="qh-dot">·</span>` : ""}${all}</button>`;
+  // 定宽纯按钮：具体数字全部进统计面板，避免 chip 宽度随数值抖动
+  return `<button class="qh-chip${ui.qhOpen ? " on" : ""}" data-qh-chip title="${esc(t("list.qhTitle"))}" click="actions.toggleQhDetail()">${esc(t("list.qhBtn"))}</button>`;
 }
 
 function quotaHeadPopHtml(tot) {
@@ -745,12 +741,16 @@ function quotaHeadPopHtml(tot) {
   } else {
     body = `<div class="qh-empty">${esc(t("list.qhEmpty"))}</div>`;
   }
-  return `<div class="qh-pop" data-qh-pop>
-    <div class="qh-head">${esc(t("list.qhPopTitle", { n: tot.accounts }))}
-      <button class="icon-btn sm qh-close" click="actions.toggleQhDetail()" aria-label="close">${ic("x", 12)}</button>
+  return `<div class="qh-panel" data-qh-pop>
+    <div class="qh-head">
+      <div>
+        <div class="qh-title">${esc(t("list.qhBtn"))}</div>
+        <div class="qh-sub">${esc(t("list.qhPopTitle", { n: tot.accounts }))}</div>
+      </div>
+      <button class="icon-btn sm qh-close" click="actions.toggleQhDetail()" aria-label="close">${ic("x", 14)}</button>
     </div>
     <div class="qhd-tabs">${tabs}</div>
-    ${body}
+    <div class="qhd-body" data-qh-scroll>${body}</div>
   </div>`;
 }
 
@@ -799,7 +799,6 @@ function listHeadHtml(s, sum, visible) {
           <button class="vs-opt${ui.density === "detail" ? " on" : ""}" aria-pressed="${ui.density === "detail"}" click="actions.setDensity('detail')">${t("list.density.detail")}</button>
         </div>
       </div>
-      ${quotaHeadPopHtml(qt)}
       ${bulkBarHtml()}
     </div>`;
 }
@@ -942,13 +941,13 @@ const actions = {
   },
 
   toggleQhDetail() {
-    ui.qhOpen = !ui.qhOpen;
+    if (ui.qhOpen || quotaModalEl) closeQuotaModal(); else openQuotaModal();
     render();
   },
 
   setQhTab(name) {
     ui.qhTab = name;
-    render();
+    refreshQuotaModal();
   },
 
   async setGrouped(on) {
@@ -2195,6 +2194,46 @@ function giftBtnHtml(claimableCount) {
     </button>`;
 }
 
+// ---------- 额度统计模态（设置弹窗同款交互：body 挂载 / Esc / 点外关闭） ----------
+
+let quotaModalEl = null;
+let qhOnKey = null;
+
+function closeQuotaModal() {
+  if (quotaModalEl) { quotaModalEl.remove(); quotaModalEl = null; }
+  if (qhOnKey) { document.removeEventListener("keydown", qhOnKey); qhOnKey = null; }
+  ui.qhOpen = false;
+}
+
+function openQuotaModal() {
+  closeQuotaModal();
+  ui.qhOpen = true;
+  const mask = document.createElement("div");
+  mask.className = "st-mask pv-mask";
+  mask.innerHTML = `<div class="qh-panel" data-qh-pop>${quotaPanelHtml(quotaTotals())}</div>`;
+  document.body.appendChild(mask);
+  quotaModalEl = mask;
+  const close = () => { closeQuotaModal(); render(); };
+  qhOnKey = (e) => { if (e.key === "Escape") close(); };
+  document.addEventListener("keydown", qhOnKey);
+  mask.addEventListener("click", (e) => { if (e.target === mask) close(); });
+}
+
+/** 面板打开期间的局部刷新：重建面板内容但保持滚动位置（Tab 切换 / 额度数据更新共用） */
+function refreshQuotaModal() {
+  const pop = document.querySelector("[data-qh-pop]");
+  if (!pop) return;
+  const sc = pop.querySelector("[data-qh-scroll]");
+  const st = sc ? sc.scrollTop : 0;
+  const tpl = document.createElement("template");
+  tpl.innerHTML = `<div class="qh-panel" data-qh-pop>${quotaPanelHtml(quotaTotals())}</div>`.trim();
+  const node = tpl.content.firstElementChild;
+  if (!node) return;
+  const nsc = node.querySelector("[data-qh-scroll]");
+  if (nsc) nsc.scrollTop = st;
+  pop.replaceWith(node);
+}
+
 /** 进度/用量类就地补丁：批量刷新计数、礼物按钮徽标、行内 2API 用量 */
 function patchProgressDom() {
   const replace = (sel, html) => {
@@ -2246,14 +2285,7 @@ function patchQuotaDom() {
   replace(".chips", chipsHtml(sum));
   const qt = quotaTotals();
   replace("[data-qh-chip]", quotaHeadChipHtml(qt));
-  const pop = $app.querySelector("[data-qh-pop]");
-  if (pop) {
-    const st = pop.scrollTop;
-    const tpl = document.createElement("template");
-    tpl.innerHTML = quotaHeadPopHtml(qt).trim();
-    const node = tpl.content.firstElementChild;
-    if (node) { node.scrollTop = st; pop.replaceWith(node); } else pop.remove();
-  }
+  if (ui.qhOpen || quotaModalEl) refreshQuotaModal();
   for (const a of visible) {
     const row = $app.querySelector(`.row[data-id="${CSS.escape(a.id)}"]`);
     if (!row) continue;
