@@ -978,6 +978,7 @@ fn normalize_quota_limit(limit_resp: &Value, sub_resp: Option<&Value>) -> QuotaO
             tier_code: plan_tier.as_deref().map(tier_code_from_display),
             name: product_name,
             expire: plan_expire.clone(),
+            gift: None,
             total,
             used,
             remaining,
