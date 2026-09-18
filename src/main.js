@@ -2347,8 +2347,10 @@ async function autoSwitchTick(manual = false) {
     // 鉴权失效/查询失败的账号不可作为切换目标（auth 可能带旧数据，需显式排除）
     .filter((x) => x.h && x.h.level !== "auth" && x.h.level !== "fail")
     .filter((x) => x.h?.remainingPct != null && x.h.remainingPct > thr);
-  // 关注模型时，优先在「确实有该模型额度」的账号里挑
-  const withModel = cands.filter((x) => x.h.modelMatched);
+  // 关注模型时，优先在「确实还有关注模型额度」的账号里挑。
+  // 流转账号的 modelMatched 来自其它模型（如 GLM-5.3），必须排除——
+  // 否则 Flash 耗尽但 5.3 满额的账号会抢在真有关注模型额度的账号前面。
+  const withModel = cands.filter((x) => x.h.modelMatched && !x.h.fallback);
   // 候选排序：额度高者优先；礼物/套餐临期的账号再插队，尽快把赠送额度用掉
   const giftSoon = (a) => (acctQuota[a.id]?.data?.plans || []).some((p) => expireInfo(p.expire)?.warn);
   const best = (withModel.length ? withModel : cands)
