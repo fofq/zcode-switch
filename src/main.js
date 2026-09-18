@@ -19,6 +19,10 @@ let refreshClaim = { running: false, done: 0, total: 0, cooldownUntil: 0 };
 let refreshTicker = null;
 
 const AUTO_CLAIM_INTERVAL_MS = 10 * 60 * 1000;
+// 干净收尾（本轮无可领礼物）后的重查间隔：礼物品只在新号入库/活动发放时出现，
+// 无需高频轮询；新号入库会主动清冷却触发领取
+const AUTO_CLAIM_RECHECK_MS = 30 * 60 * 1000;
+const AUTO_CLAIM_TICK_MS = 60 * 1000;
 const AUTO_CLAIM_FIRST_DELAY_MS = 2 * 60 * 1000;
 const AUTO_CLAIM_WAIT_MS = 45_000;
 const AUTO_CLAIM_PER_ACCOUNT_CAP = 5;
@@ -805,6 +809,10 @@ const actions = {
       enrollAccounts();
       // 新账号入库：稍等 ZCode 落盘凭据后立刻拉额度（立即拉可能与写盘竞争）
       setTimeout(() => loadAcctQuota(r.id), 1500);
+      // 新号上游还没有任何套餐（Start Plan 余额行跟着首次领取事件一起发放），
+      // 清冷却尽快进入自动领取，领完才有额度可查
+      autoClaimCooldown[r.id] = 0;
+      setTimeout(() => autoClaimTick(), 4000);
     });
   },
 
@@ -1511,6 +1519,7 @@ const actions = {
       toast(t("m.claimVerify", { name: plan.name || plan.plan_id }), "ok", t("m.claimVerifyDetail"));
       const r = await waitForClaimResult(id);
       if (!r) toast(t("m.claimTimeout"), "warn");
+      else pokeAccount(id);
     } catch (e) {
       toast(stripErr(e), "err");
     } finally {
@@ -1545,7 +1554,7 @@ const actions = {
         if (!r) {
           toast(t("m.claimAcctTimeout", { name }), "warn");
           await invoke("claim_cancel").catch(() => {});
-        }
+        } else pokeAccount(id);
         if (i < ids.length - 1) await new Promise((res) => setTimeout(res, 1200));
       }
     } finally {
@@ -1715,6 +1724,7 @@ async function autoClaimTick() {
       if (!state?.auto_claim || autoAbortRequested) break;
       if (!(state.accounts || []).some((a) => a.id === id)) continue;
       let gotAny = false;
+      let failed = false;
       claimable[id] = { ...(claimable[id] || {}), busy: true };
       try {
         const r = await invoke("claim_refresh", { id });
@@ -1739,25 +1749,36 @@ async function autoClaimTick() {
         } catch (e) {
           await invoke("claim_cancel").catch(() => {});
           autoClaimCooldown[id] = Date.now() + AUTO_CLAIM_INTERVAL_MS;
+          failed = true;
           break;
         }
         const r = await waitForClaimResult(id, AUTO_CLAIM_WAIT_MS);
         if (!r) {
           await invoke("claim_cancel").catch(() => {});
           autoClaimCooldown[id] = Date.now() + AUTO_CLAIM_INTERVAL_MS;
+          failed = true;
           break;
         }
         if (r.ok === false) {
           autoClaimCooldown[id] = autoClaimCooldownFor(r);
+          failed = true;
           break;
         }
         gotAny = true; roundClaimed++;
+        // 领取成功：上游需要几分钟发放套餐余额，主动触发额度刷新能最早看到数据
+        pokeAccount(id);
         await awaitClaimPreviewFresh(id);
         if (!uiLocked()) render();
         progressed = true;
         await new Promise((res) => setTimeout(res, 1200));
       }
       if (!gotAny && (claimable[id]?.plans || []).length) roundSkipped++;
+      // 统一收尾冷却：有失败走失败时已设的冷却；领完/无可领 → 30 分钟后再查。
+      // 不设冷却的话每轮都会把所有无 pending 的账号重复刷一遍领奖接口
+      if (!failed) {
+        const remaining = (claimable[id]?.plans || []).length;
+        autoClaimCooldown[id] = Date.now() + (remaining === 0 ? AUTO_CLAIM_RECHECK_MS : AUTO_CLAIM_INTERVAL_MS);
+      }
       await new Promise((res) => setTimeout(res, AUTO_CLAIM_ACCT_GAP_MS));
     }
   } finally {
@@ -2527,7 +2548,9 @@ async function sweepTick() {
       if (row?.dataset?.id) expandTouch(row.dataset.id);
     });
     setTimeout(autoClaimTick, AUTO_CLAIM_FIRST_DELAY_MS);
-    setInterval(autoClaimTick, AUTO_CLAIM_INTERVAL_MS);
+    // 周期兜底：新号入库/活动发放后最迟 1 分钟进入领取；
+    // 全部账号都在冷却中时空转（零请求）
+    setInterval(autoClaimTick, AUTO_CLAIM_TICK_MS);
   } catch (e) {
     $app.innerHTML = `<div class="loading" style="color:var(--red)">${t("common.loadFail", { e: esc(stripErr(e)) })}</div>`;
     invoke("reveal_main").catch(() => {});
