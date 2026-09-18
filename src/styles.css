@@ -270,10 +270,11 @@ input:focus-visible,
   flex: 1;
   min-height: 0;
   overflow-y: auto;
+  /* 隐藏内部滚动条：滚动条占位会使卡片右缘与上方面板错位 */
+  scrollbar-width: none;
   padding: 8px 18px 12px;
-  scrollbar-width: thin;
-  scrollbar-color: #34373f transparent;
 }
+.list::-webkit-scrollbar { display: none; }
 
 .empty {
   border: 1px dashed var(--hairline);

@@ -727,9 +727,10 @@ async function guard(fn) {
 
 async function loadAcctQuota(id) {
   const cur = acctQuota[id] || {};
-  if (cur.busy) return;
+  // busy 超时保护：一次请求异常卡住后，超过 20s 允许重新拉取，避免手动刷新永远静默失效
+  if (cur.busy && Date.now() - (cur.busyAt || 0) < 20000) return;
   // 保留旧数据只标记 busy：健康度/分组在刷新期间不变，避免条目闪回“待查询额度”
-  acctQuota[id] = { ...cur, busy: true };
+  acctQuota[id] = { ...cur, busy: true, busyAt: Date.now() };
   if (!uiLocked()) render();
   try {
     const data = await invoke("get_account_quota", { id });
@@ -802,6 +803,8 @@ const actions = {
       toast(t("m.toastSaved", { name: r.name }), "ok", t("m.toastSavedDetail"));
       await refresh(); render();
       enrollAccounts();
+      // 新账号入库后立即拉额度，不等巡检节奏
+      loadAcctQuota(r.id);
     });
   },
 
@@ -1021,6 +1024,38 @@ const actions = {
     } else {
       actions.doSwitch(id, false);
     }
+  },
+
+  /** 行内快捷「常规切换」：无视热切换设置，强制关闭再打开 ZCode 完成切换 */
+  askColdSwitch(id) {
+    const a = state.accounts.find((x) => x.id === id);
+    if (!a) return;
+    openConfirmModal({
+      kind: "warn",
+      icon: "power",
+      title: t("m.coldSwitchTitle", { name: a.name }),
+      desc: t("m.coldSwitchDesc"),
+      yesLabel: t("m.switchYes"),
+      onYes: () => actions.doColdSwitch(id),
+    });
+  },
+
+  async doColdSwitch(id) {
+    await guard(async () => {
+      const r = await invoke("switch_to", { id, force: false, restart: state.launch_after_switch, hot: false });
+      if (r.already_active) {
+        toast(t("m.toastAlready", { name: r.name }), "ok");
+        return;
+      }
+      const bits = [];
+      if (r.killed) bits.push(t("m.bitKilled"));
+      if (r.launched) bits.push(t("m.bitLaunched"));
+      if (r.config_stale) bits.push(t("m.bitConfigStale"));
+      toast(t("m.toastSwitched", { name: r.name }), r.config_stale ? "warn" : "ok", bits.join(t("common.listSep")));
+      ui.expanded.delete(id);
+      await refresh();
+      if (!uiLocked()) render();
+    });
   },
 
   async doSwitch(id, force) {
@@ -1980,19 +2015,69 @@ function restoreScroll(cap) {
 
 let lastRenderSig = "";
 function renderSignature() {
+  // 额度数据用轻量摘要（busy/错误/refreshed_at），避免每次渲染全量序列化大对象
+  const qsig = Object.keys(acctQuota).map((k) => {
+    const q = acctQuota[k];
+    if (!q) return `${k}:0`;
+    const mark = q.busy ? "b" : q.err ? "e" : (q.data?.refreshed_at ?? "x");
+    return `${k}:${mark}`;
+  }).join("|");
+  const csig = Object.keys(claimable).map((k) => `${k}:${claimable[k]?.busy ? "b" : ""}${claimable[k]?.plans?.length ?? 0}`).join("|");
   return JSON.stringify([
-    state, acctQuota, claimable, autoSwitchNote, quotaSweep, refreshClaim,
+    state, qsig, csig, autoSwitchNote, quotaSweep, refreshClaim,
     claimAllState, twoLastStatus, [...twoUsageMap.entries()],
     [...ui.expanded], [...ui.selected], [...ui.collapsedSections],
     ui.search, ui.health, ui.sort, ui.density, ui.hideInfo, renaming,
     appVer, autoSwitchRunning, autoClaimRunning, claimActive, busy,
   ]);
 }
+// 滚动期间延迟重渲染：列表在滚动时被全量重建会造成掉帧
+let scrollDeferUntil = 0;
+let scrollRenderQueued = false;
+let scrollDeferTimer = null;
+let lastBulkRender = 0;
+let bulkRenderQueued = false;
+let bulkRenderTimer = null;
+function scheduleBulkRender() {
+  if (bulkRenderTimer) return;
+  bulkRenderTimer = setTimeout(() => {
+    bulkRenderTimer = null;
+    if (bulkRenderQueued) {
+      bulkRenderQueued = false;
+      render();
+    }
+  }, 520);
+}
+function scheduleDeferredRender() {
+  if (scrollDeferTimer) return;
+  scrollDeferTimer = setTimeout(() => {
+    scrollDeferTimer = null;
+    if (scrollRenderQueued) {
+      scrollRenderQueued = false;
+      render();
+    }
+  }, 420);
+}
 function render(force = false) {
   // 轮询驱动的重渲染：状态指纹未变则跳过全量重建（避免高度抖动/滚动条漂移）
   if (!force) {
+    if (Date.now() < scrollDeferUntil) {
+      scrollRenderQueued = true;
+      scheduleDeferredRender();
+      return;
+    }
     const sig = renderSignature();
     if (sig === lastRenderSig) return;
+    // 批量操作（全量刷新/领取）期间合并重渲染，最多 500ms 一次，避免连续重建掉帧
+    if (quotaSweep?.running || refreshClaim?.running || claimAllRunning || autoClaimRunning) {
+      const now = Date.now();
+      if (now - lastBulkRender < 500) {
+        bulkRenderQueued = true;
+        scheduleBulkRender();
+        return;
+      }
+      lastBulkRender = now;
+    }
     lastRenderSig = sig;
   }
   const scrollCap = captureScroll();
@@ -2085,6 +2170,7 @@ function render(force = false) {
             <button class="icon-btn" title="${t("btn.refreshQuota")}" aria-label="${t("btn.refreshQuota")}" click="actions.acctQuota('${a.id}')">${ic("refresh", 15)}</button>
             <button class="icon-btn" title="${t("btn.rename")}" aria-label="${t("btn.rename")}" click="actions.rename('${a.id}')">${ic("pen", 15)}</button>
             <button class="icon-btn" title="${t("btn.export")}" aria-label="${t("btn.export")}" click="actions.exportOne('${a.id}')">${ic("export", 15)}</button>
+            <button class="icon-btn${isActive ? " on" : ""}" title="${t("btn.coldSwitch")}" aria-label="${t("btn.coldSwitch")}" click="actions.askColdSwitch('${a.id}')" ${isActive ? "disabled" : ""}>${ic("power", 15)}</button>
             <button class="icon-btn danger" title="${t("btn.delete")}" aria-label="${t("btn.delete")}" click="actions.delete('${a.id}')">${ic("x", 15)}</button>
           </span>
           <button class="btn-switch has-ic" click="actions.askSwitch('${a.id}')" ${isActive ? "disabled" : ""}>
@@ -2202,6 +2288,11 @@ window.onRenameKey = (e, id) => {
   if (e.key === "Escape") actions.cancelRename();
 };
 installDelegation();
+// 任意滚动（含 .list 内部滚动容器，scroll 事件不冒泡所以用捕获）期间推迟重渲染
+document.addEventListener("scroll", () => {
+  scrollDeferUntil = Date.now() + 400;
+  scheduleDeferredRender();
+}, { capture: true, passive: true });
 
 listen("tray-action", (ev) => {
   const p = ev.payload || {};

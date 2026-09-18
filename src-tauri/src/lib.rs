@@ -194,10 +194,11 @@ async fn update_account_from_live(app: AppHandle, id: String) -> Result<Account,
 }
 
 #[tauri::command]
-async fn switch_to(app: AppHandle, id: String, force: bool, restart: bool) -> Result<SwitchResult, String> {
+async fn switch_to(app: AppHandle, id: String, force: bool, restart: bool, hot: Option<bool>) -> Result<SwitchResult, String> {
     let _guard = store_guard();
     let paths = Paths::detect();
-    let hot = load_settings(&paths).hot_switch();
+    // hot 缺省跟随设置；显式传入时覆盖（行内"常规切换"按钮用：强制关闭再打开）
+    let hot = hot.unwrap_or_else(|| load_settings(&paths).hot_switch());
     let r = store::switch_to(&paths, &id, force, restart, hot);
     rebuild_tray(&app);
     r

@@ -259,6 +259,9 @@ export const zh = {
   "list.toastSweepCancelled": "已停止，本次刷新了 {n} 个账号",
   "btn.refreshQuota": "刷新额度",
   "btn.copyKey": "复制 API Key",
+  "btn.coldSwitch": "常规切换（关闭并重新打开 ZCode）",
+  "m.coldSwitchTitle": "常规切换「{name}」？",
+  "m.coldSwitchDesc": "将关闭并重新打开 ZCode 完成切换（不使用热切换）；当前会话会中断，恢复请在 ZCode 中重试继续",
   "btn.copyAllKeys": "复制所有账号的 API Key",
 
   "q.loading": "查询中…",

@@ -49,6 +49,8 @@ export const en = {
   "m.switchDesc": "ZCode is running: it will be closed automatically and {restart} (change in Settings)",
   "m.switchRestartYes": "restarted after the switch",
   "m.switchRestartNo": "not restarted",
+  "m.coldSwitchTitle": "Cold switch to \"{name}\"?",
+  "m.coldSwitchDesc": "ZCode will be closed and reopened to finish the switch (no hot swap); the current session breaks, retry in ZCode to continue",
   "m.switchYes": "Force switch",
   "m.toastAlready": "\"{name}\" is already the current login",
   "m.bitHot": "Hot swap · restart ZCode to see the new account",
@@ -259,6 +261,7 @@ export const en = {
   "list.toastSweepCancelled": "Stopped — refreshed {n} accounts this run",
   "btn.refreshQuota": "Refresh quota",
   "btn.copyKey": "Copy API key",
+  "btn.coldSwitch": "Cold switch (close and reopen ZCode)",
   "btn.copyAllKeys": "Copy API keys of all accounts",
 
   "q.loading": "Querying…",

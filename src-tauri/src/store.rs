@@ -1114,7 +1114,28 @@ pub fn live_quota(paths: &Paths) -> Result<quota::QuotaOverview, String> {
 
 pub fn account_quota(paths: &Paths, id: &str) -> Result<quota::QuotaOverview, String> {
     let acc = load_account(paths, id)?;
-    quota::quota_for_snapshot(&paths.home, &acc.credentials, acc.config.as_ref())
+    let (creds, config) = effective_snapshot(paths, &acc);
+    quota::quota_for_snapshot(&paths.home, &creds, config.as_ref())
+}
+
+/// 账号若是当前激活账号（live 与其身份一致），优先用 live 凭据/配置——
+/// zcode 运行期间会轮换 JWT，账号快照里存的旧 JWT 会过期导致额度/2API 查询失败。
+fn effective_snapshot(paths: &Paths, acc: &Account) -> (Value, Option<Value>) {
+    if let Ok(Some(live)) = read_live(paths) {
+        if is_logged_in(&live) {
+            let same = canonical_hash(&live) == acc.hash || {
+                let li = zcrypto::account_identity(&live, &paths.home);
+                identity_has_signal(&li) && {
+                    let ai = zcrypto::account_identity(&acc.credentials, &paths.home);
+                    identity_has_signal(&ai) && identity_matches(&li, &ai)
+                }
+            };
+            if same {
+                return (live, read_live_config(paths));
+            }
+        }
+    }
+    (acc.credentials.clone(), acc.config.clone())
 }
 
 /// 2API 跟随模式用：返回当前激活账号 id（与 get_state 的 is_active 判定一致）
@@ -1234,15 +1255,18 @@ fn local_api_key(acc: &Account, home: &std::path::Path) -> Option<ApiKeyInfo> {
 
 pub fn account_api_key(paths: &Paths, id: &str) -> Result<Option<ApiKeyInfo>, String> {
     let acc = load_account(paths, id)?;
-    if let Some(info) = local_api_key(&acc, &paths.home) {
+    // 激活账号优先用 live 凭据（zcode 轮换 JWT 后快照里的会过期）
+    let (creds, config) = effective_snapshot(paths, &acc);
+    let acc_eff = Account { credentials: creds, config, ..acc };
+    if let Some(info) = local_api_key(&acc_eff, &paths.home) {
         return Ok(Some(info));
     }
     // 配置快照里没有现成 key：像登录/热切换那样现场解析（上游会自动创建 zcode-api-key）
-    let provider = cred_plain(&acc.credentials, "oauth:active_provider", &paths.home)
+    let provider = cred_plain(&acc_eff.credentials, "oauth:active_provider", &paths.home)
         .filter(|p| p == "bigmodel" || p == "zai");
     if let Some(provider) = provider {
         let access = cred_plain(
-            &acc.credentials,
+            &acc_eff.credentials,
             &format!("oauth:{provider}:access_token"),
             &paths.home,
         ).unwrap_or_default();
