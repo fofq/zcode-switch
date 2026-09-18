@@ -80,6 +80,7 @@ const ui = {
   density: savedPrefs.density === "detail" ? "detail" : "compact",
   hideInfo: savedPrefs.hideInfo === true,
   qhOpen: false,
+  qhTab: "",
   modelCustom: false,
   selected: new Set(),
   expanded: new Set(),
@@ -715,8 +716,16 @@ function quotaHeadChipHtml(tot) {
 
 function quotaHeadPopHtml(tot) {
   if (!ui.qhOpen || !tot) return "";
-  const section = (x) => {
-    const isFocus = tot.focus && x === tot.focus;
+  // Tab 切换模型：账号多时不用滚动很久才能看到另一个模型
+  const activeTab = tot.models.some((x) => x.name === ui.qhTab) ? ui.qhTab : (tot.focus?.name || tot.models[0]?.name || "");
+  const tabs = tot.models.map((m) => {
+    const on = m.name === activeTab;
+    const isFocus = tot.focus && m === tot.focus;
+    return `<button class="qhd-tab${on ? " on" : ""}${isFocus ? " focus" : ""}" click="actions.setQhTab('${esc(m.name)}')">${esc(m.name)}${isFocus ? `<span class="qh-tag">${t("list.qhFocusTag")}</span>` : ""}</button>`;
+  }).join("");
+  let body = "";
+  const x = tot.models.find((m) => m.name === activeTab);
+  if (x) {
     const pct = x.total > 0 ? Math.max(0, Math.min(100, Math.round((1 - x.remaining / x.total) * 100))) : 0;
     const rows = x.sources.map((src) => {
       const w = src.total > 0 ? Math.max(0, Math.min(100, Math.round((1 - src.remaining / src.total) * 100))) : 0;
@@ -727,20 +736,21 @@ function quotaHeadPopHtml(tot) {
         <span class="qhd-pct">${w}%</span>
       </div>`;
     }).join("");
-    return `<div class="qhd-sec${isFocus ? " focus" : ""}">
-      <div class="qhd-sec-head">
-        <span class="qhd-model">${esc(x.name)}${isFocus ? `<span class="qh-tag">${t("list.qhFocusTag")}</span>` : ""}</span>
+    body = `<div class="qhd-sec-head">
+        <span class="qhd-model">${esc(x.name)}</span>
         <span class="qhd-sum">${esc(fmtTokens(x.remaining))}/${esc(fmtTokens(x.total))} · ${pct}%</span>
       </div>
       <div class="qhd-thead"><span>${t("list.qhColAcct")}</span><span>${t("list.qhColLeft")}</span><span></span><span>${t("list.qhColUsed")}</span></div>
-      ${rows}
-    </div>`;
-  };
+      ${rows}`;
+  } else {
+    body = `<div class="qh-empty">${esc(t("list.qhEmpty"))}</div>`;
+  }
   return `<div class="qh-pop" data-qh-pop>
     <div class="qh-head">${esc(t("list.qhPopTitle", { n: tot.accounts }))}
       <button class="icon-btn sm qh-close" click="actions.toggleQhDetail()" aria-label="close">${ic("x", 12)}</button>
     </div>
-    ${tot.models.map(section).join("") || `<div class="qh-empty">${esc(t("list.qhEmpty"))}</div>`}
+    <div class="qhd-tabs">${tabs}</div>
+    ${body}
   </div>`;
 }
 
@@ -933,6 +943,11 @@ const actions = {
 
   toggleQhDetail() {
     ui.qhOpen = !ui.qhOpen;
+    render();
+  },
+
+  setQhTab(name) {
+    ui.qhTab = name;
     render();
   },
 
@@ -2067,64 +2082,17 @@ function hasQuotaDetail(id) {
   return d.percent_used != null;
 }
 
-/** 堆叠额度条调色板：第 N 个套餐来源固定用第 N 色，图例与悬浮提示一一对应 */
-const STACK_COLORS = ["#62c370", "#e8a33d", "#6aa9e0", "#b48be8", "#e08aa0"];
-
-/** 按模型聚合各套餐来源：一个模型一条堆叠条，一段一色；窗口类（提示次数/时长）单独收集 */
-function modelStacks(plans, winOut) {
-  const order = [];
-  const map = new Map();
-  for (const p of plans || []) {
-    for (const it of p.items || []) {
-      if (itemKind(it) !== "raw") { winOut.push(it); continue; }
-      const m = String(it.name || "?");
-      if (!map.has(m)) {
-        const st = { model: m, sources: [], sumTotal: 0, sumRemaining: 0 };
-        map.set(m, st);
-        order.push(st);
-      }
-      const st = map.get(m);
-      st.sources.push({
-        plan: p.name || p.tier || "",
-        expire: p.expire || it.period_end || "",
-        gift: p.gift === true,
-        total: it.total ?? 0,
-        remaining: it.remaining ?? 0,
-      });
-      st.sumTotal += it.total ?? 0;
-      st.sumRemaining += it.remaining ?? 0;
-    }
-  }
-  return order;
-}
-
-function msSegHtml(src, i, sumRemaining) {
-  // 段宽 = 该来源剩余占总剩余的比例，整段纯色——条读作“剩余额度的构成”
-  const color = STACK_COLORS[i % STACK_COLORS.length];
-  const share = sumRemaining > 0 ? (src.remaining / sumRemaining) * 100 : 0;
-  const tip = `${src.gift ? "🎁 " : ""}${src.plan}：剩余 ${fmtTokens(src.remaining)} / ${fmtTokens(src.total)}${src.expire ? " · 至 " + src.expire : ""}`;
-  return `<span class="ms-seg" style="width:${share}%;background:${color}" title="${esc(tip)}"></span>`;
-}
-
-function modelStackHtml(st) {
-  const segs = st.sumRemaining > 0
-    ? st.sources.map((src, i) => msSegHtml(src, i, st.sumRemaining)).join("")
-    : `<span class="ms-seg empty" style="width:100%"></span>`;
-  const usedPct = st.sumTotal > 0 ? Math.max(0, Math.min(100, Math.round((1 - st.sumRemaining / st.sumTotal) * 100))) : 0;
-  const legend = st.sources.length > 1
-    ? `<div class="ms-legend">${st.sources.map((src, i) => {
-        const color = STACK_COLORS[i % STACK_COLORS.length];
-        return `<span class="ms-leg"><i style="background:${color}"></i>${src.gift ? "🎁 " : ""}${esc(src.plan)} ${esc(fmtTokens(src.remaining))}/${esc(fmtTokens(src.total))}</span>`;
-      }).join("")}</div>`
-    : "";
+function planGroupHtml(p, omitTier = false) {
+  const label = p.tier_code === "other" && !p.pid ? t("q.other") : (p.name || p.tier || "");
+  const exp = expireInfo(p.expire);
   return `
-  <div class="mstack">
-    <span class="ms-model" title="${esc(st.model)}">${esc(st.model)}</span>
-    <div class="ms-main">
-      <div class="ms-bar">${segs}<span class="ms-pct">${usedPct}%</span></div>
-      ${legend}
+  <div class="plan-grp">
+    <div class="pg-head">
+      ${p.tier && !omitTier ? tierChipHtml(p.tier, p.tier_code) : ""}
+      <span class="pg-name" title="${esc(label)}">${esc(label)}</span>
+      ${exp ? `<span class="pg-exp${exp.warn ? " warn-line" : ""}" title="${esc(t("q.validUntil", { date: exp.text }))}">${esc(t("q.validUntilShort", { date: exp.text }))}</span>` : ""}
     </div>
-    <span class="ms-sum">${esc(fmtTokens(st.sumRemaining))}/${esc(fmtTokens(st.sumTotal))}</span>
+    ${slotRowsHtml(p.items)}
   </div>`;
 }
 
@@ -2137,13 +2105,15 @@ function quotaDetailHtml(id) {
     return `<span class="aq-err">${esc(msg)}</span>`;
   }
   if (!q?.data) return "";
-  // 按模型聚合渲染：一个模型一条堆叠条，多套餐来源分色 + 图例/悬浮说明
-  const wins = [];
-  const stacks = modelStacks(q.data.plans || [], wins);
-  if (stacks.length || wins.length) {
-    return wins.map((it) => winRowHtml(it, " mini")).join("") + stacks.map(modelStackHtml).join("");
+  const plans = q.data.plans || [];
+  if (plans.length) {
+    // 按套餐分组：容量差异悬殊（1亿 vs 5M）时任何单条堆叠都会误导，分开各画各的最保真
+    const kinds = new Set(plans.map((p) => tierKind(p.tier, p.tier_code)));
+    return plans.map((p) => planGroupHtml(p, kinds.size === 1)).join("");
   }
   const items = q.data.items || [];
+  const wins = items.filter((it) => itemKind(it) === "prompt_count");
+  if (wins.length) return wins.map((it) => winRowHtml(it, " mini")).join("");
   if (items.length) return slotRowsHtml(items);
   // 没有明细项时用总览兜底，避免展开后一片空白
   if (q.data.percent_used != null) {
@@ -2206,7 +2176,7 @@ function renderSignature() {
   return JSON.stringify([
     state, autoSwitchNote, twoLastStatus,
     [...ui.expanded], [...ui.selected], [...ui.collapsedSections],
-    ui.search, ui.health, ui.sort, ui.density, ui.hideInfo, ui.qhOpen, renaming,
+    ui.search, ui.health, ui.sort, ui.density, ui.hideInfo, ui.qhOpen, ui.qhTab, renaming,
     appVer, autoSwitchRunning, autoClaimRunning, claimActive, busy,
   ]);
 }
@@ -2278,10 +2248,11 @@ function patchQuotaDom() {
   replace("[data-qh-chip]", quotaHeadChipHtml(qt));
   const pop = $app.querySelector("[data-qh-pop]");
   if (pop) {
+    const st = pop.scrollTop;
     const tpl = document.createElement("template");
     tpl.innerHTML = quotaHeadPopHtml(qt).trim();
     const node = tpl.content.firstElementChild;
-    if (node) pop.replaceWith(node); else pop.remove();
+    if (node) { node.scrollTop = st; pop.replaceWith(node); } else pop.remove();
   }
   for (const a of visible) {
     const row = $app.querySelector(`.row[data-id="${CSS.escape(a.id)}"]`);

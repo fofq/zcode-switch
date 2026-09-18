@@ -1771,6 +1771,9 @@ select.two-input { cursor: pointer; }
 .qh-pop {
   position: absolute; top: calc(100% - 4px); right: 12px; z-index: 30;
   width: 600px; max-width: min(92vw, 720px); max-height: 64vh; overflow: auto;
+  scrollbar-width: none;
+}
+.qh-pop::-webkit-scrollbar { width: 0; height: 0; }
   padding: 12px 14px; border-radius: 12px;
   background: var(--panel, #17191f); border: 1px solid rgba(255,255,255,.09);
   box-shadow: 0 16px 40px rgba(0,0,0,.5);
@@ -1780,11 +1783,16 @@ select.two-input { cursor: pointer; }
 .qh-tag { margin-left: 6px; font-size: 10px; padding: 1px 5px; border-radius: 999px; border: 1px solid rgba(232,163,61,.4); }
 .qh-empty { font-size: 12px; color: #8a90a0; padding: 6px 0; }
 /* 统计面板：模型分节 + 账号明细表 */
-.qhd-sec { margin-bottom: 14px; }
-.qhd-sec:last-of-type { margin-bottom: 0; }
+.qhd-tabs { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 10px; }
+.qhd-tab {
+  padding: 3px 11px; border-radius: 999px; font-size: 12px; cursor: pointer;
+  color: #aab0bf; border: 1px solid rgba(255, 255, 255, .1); background: transparent;
+}
+.qhd-tab.on { color: #dfe3ec; border-color: rgba(255, 255, 255, .25); background: rgba(255, 255, 255, .06); }
+.qhd-tab.focus { color: var(--amber); border-color: rgba(232, 163, 61, .4); }
+.qhd-tab.focus.on { background: rgba(232, 163, 61, .12); }
 .qhd-sec-head { display: flex; align-items: baseline; justify-content: space-between; margin-bottom: 5px; }
 .qhd-model { font-size: 13px; color: #dfe3ec; }
-.qhd-sec.focus .qhd-model { color: var(--amber); }
 .qhd-sum { font-size: 12px; color: #aab0bf; font-variant-numeric: tabular-nums; }
 .qhd-thead, .qhd-row {
   display: grid; grid-template-columns: minmax(120px, 1.4fr) auto 88px 42px;
