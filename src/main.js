@@ -1825,10 +1825,10 @@ function fmtTokens(n) {
 }
 function balRowHtml(it) {
   const rem = it.total != null && it.remaining != null ? `${fmtTokens(it.remaining)}/${fmtTokens(it.total)}` : "";
-  const label = it.name.replace(/^GLM-?/i, "");
+  // 对齐官方完整模型名（show_name 本就是 GLM-5.3-Flash 这类全称）
   return `
   <div class="q-win mini">
-    <span class="q-win-label" title="${esc(it.name)}">${esc(label)}</span>
+    <span class="q-win-label" title="${esc(it.name)}">${esc(it.name)}</span>
     ${quotaBarHtml(it.percent_used)}
     <span class="q-win-reset">${esc(rem)}</span>
   </div>`;
