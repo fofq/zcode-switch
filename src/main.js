@@ -681,14 +681,16 @@ function quotaTotals() {
       for (const it of p.items || []) {
         if (itemKind(it) !== "raw") continue;
         const name = String(it.name || "?");
-        const agg = per.get(name) || { name, remaining: 0, total: 0 };
+        const agg = per.get(name) || { name, remaining: 0, total: 0, sources: [] };
         agg.remaining += it.remaining ?? 0;
         agg.total += it.total ?? 0;
+        agg.sources.push({ account: a.name, remaining: it.remaining ?? 0, total: it.total ?? 0 });
         per.set(name, agg);
       }
     }
   }
   const models = [...per.values()].sort((x, y) => y.remaining - x.remaining);
+  for (const m of models) m.sources.sort((x, y) => y.remaining - x.remaining);
   const focus = key ? models.find((x) => modelKeyMatch(x.name.toLowerCase(), key)) || null : null;
   return {
     focus,
@@ -711,14 +713,26 @@ function quotaHeadChipHtml(tot) {
   return `<button class="qh-chip${ui.qhOpen ? " on" : ""}" data-qh-chip title="${esc(t("list.qhTitle"))}" click="actions.toggleQhDetail()">${focus}${focus && all ? `<span class="qh-dot">·</span>` : ""}${all}</button>`;
 }
 
+function qhPopBar(x) {
+  // 堆叠条：一段=一个账号（按剩余降序），悬浮显示该账号的剩余/总额
+  const segs = x.sources.map((src, i) => {
+    const color = STACK_COLORS[i % STACK_COLORS.length];
+    const share = x.total > 0 ? (src.total / x.total) * 100 : 0;
+    const fill = src.total > 0 ? Math.min(100, Math.max(0, (src.remaining / src.total) * 100)) : 0;
+    const tip = `${src.account}：剩余 ${fmtTokens(src.remaining)} / ${fmtTokens(src.total)}`;
+    return `<span class="ms-seg" style="width:${share}%" title="${esc(tip)}"><i style="width:${fill}%;background:${color}"></i></span>`;
+  }).join("");
+  const pct = x.total > 0 ? Math.max(0, Math.min(100, Math.round((1 - x.remaining / x.total) * 100))) : 0;
+  return `<div class="ms-bar">${segs}<span class="ms-pct">${pct}%</span></div>`;
+}
+
 function quotaHeadPopHtml(tot) {
   if (!ui.qhOpen || !tot) return "";
   const rows = tot.models.map((x) => {
-    const w = x.total > 0 ? Math.round((x.remaining / x.total) * 100) : 0;
     const isFocus = tot.focus && x === tot.focus;
     return `<div class="qh-row${isFocus ? " focus" : ""}">
       <span class="qh-name" title="${esc(x.name)}">${esc(x.name)}${isFocus ? `<span class="qh-tag">${t("list.qhFocusTag")}</span>` : ""}</span>
-      <span class="rq"><span class="rq-bar"><i style="width:${w}%"></i></span></span>
+      ${qhPopBar(x)}
       <span class="qh-num">${esc(fmtTokens(x.remaining))}/${esc(fmtTokens(x.total))}</span>
     </div>`;
   }).join("");
