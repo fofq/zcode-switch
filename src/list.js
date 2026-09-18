@@ -2,7 +2,10 @@
 // 不依赖 DOM，便于单独测试。
 
 /** 健康度分级（也是列表里的展示顺序，越靠前越"可用"） */
-export const HEALTH_ORDER = ["gift", "ok", "low", "flowed", "dead", "auth", "fail", "unknown"];
+// gift 不再是健康等级：它与 ok/low 是两个正交维度（有礼物 & 额度状态）。
+// 有礼物额度 = 正交筛选 chip（summarize.counts.gift / filterAccounts 特判）+ 行内徽标，
+// 否则 Weekend Build 全量发放后 gift 桶会吞掉额度充足组。
+export const HEALTH_ORDER = ["ok", "low", "flowed", "dead", "auth", "fail", "unknown"];
 
 /** 剩余额度低于该百分比视为"紧张" */
 export const LOW_THRESHOLD = 20;
@@ -188,7 +191,7 @@ export function healthOf(acct, quota, isAuthErr, model, opts = {}) {
   }
   if (pct != null) {
     // 流转账号单独一档：关注模型已耗尽但其它模型仍可用，组名直接表达主状态
-    const lv = hasGift ? "gift" : fallback ? "flowed" : pct <= 0 ? "dead" : pct <= thr ? "low" : "ok";
+    const lv = fallback ? "flowed" : pct <= 0 ? "dead" : pct <= thr ? "low" : "ok";
     return { level: lv, remainingPct: pct <= 0 ? 0 : pct, modelMatched: mp != null, modelName, fallback, hasGift, focusPct };
   }
   // 没有任何额度数据时才用错误/回退信号（避免刷新失败把账号闪进失败分组）
@@ -217,7 +220,11 @@ export function filterAccounts(accounts, { search = "", health = "all" } = {}, h
   return (accounts || []).filter((a) => {
     if (health !== "all") {
       const h = healthMap?.get(a.id);
-      if (!h || h.level !== health) return false;
+      if (health === "gift") {
+        if (!h?.hasGift) return false;
+      } else if (!h || h.level !== health) {
+        return false;
+      }
     }
     return matchesSearch(a, search);
   });
@@ -308,6 +315,8 @@ export function summarize(accounts, healthMap) {
     const lv = h?.level || "unknown";
     if (counts[lv] == null) counts.unknown++;
     else counts[lv]++;
+    // 礼物是正交维度：按 hasGift 独立计数，不占健康等级
+    if (h?.hasGift) counts.gift++;
     if (h?.remainingPct != null) {
       pctSum += h.remainingPct;
       pctCount++;

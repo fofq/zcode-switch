@@ -644,7 +644,8 @@ function groupedListHtml(accounts, rowHtml, healthMap) {
 }
 
 function chipsHtml(sum) {
-  const levels = ["all", ...HEALTH_ORDER.filter((lv) => lv === ui.health || sum.counts[lv] > 0)];
+  // gift 是正交筛选维度（计数来自 hasGift），永远排在最前
+  const levels = ["all", ...["gift", ...HEALTH_ORDER].filter((lv) => lv === ui.health || sum.counts[lv] > 0)];
   return `<div class="chips" role="group" aria-label="${esc(t("list.filterLabel"))}">` +
     levels.map((lv) => {
       const on = ui.health === lv;
@@ -869,7 +870,7 @@ const actions = {
   },
 
   setHealth(lv) {
-    ui.health = HEALTH_ORDER.includes(lv) ? lv : "all";
+    ui.health = (lv === "gift" || HEALTH_ORDER.includes(lv)) ? lv : "all";
     render();
   },
 
@@ -1880,6 +1881,11 @@ function tierChipHtml(tier, code) {
 }
 
 /** 行内套餐标签：同一等级只显示一次（Start Plan 常有多个 plan 条目），按等级从高到低 */
+function giftBadgeFor(id) {
+  const h = healthMapOf().get(id);
+  return h?.hasGift ? `<span class="gift-badge" title="${esc(healthLabel("gift"))}">${ic("gift", 12)}</span>` : "";
+}
+
 function tierBadgeFor(id) {
   const q = acctQuota[id];
   if (!q?.data) return "";
@@ -2185,7 +2191,7 @@ function render(force = false) {
         ${healthDotHtml(h)}
         ${slim ? "" : `<span class="notch" style="background:${notchColor(a.id)}"></span>`}
         <div class="row-main"${ui.density === "compact" ? ` click="actions.toggleRow(event)" title="${esc(slim ? t("list.expandTitle") : t("list.collapseTitle"))}"` : ""}>
-          <div class="row-name">${ui.density === "compact" ? `<span class="row-chev${slim ? "" : " open"}">${ic("chevDown", 12)}</span>` : ""}${tierBadgeFor(a.id)}<span class="rn-text" title="${esc(displayName)}">${esc(displayName)}</span>${isActive ? `<span class="tag-use">${t("btn.inUse")}</span>` : ""}${a.has_user_info === false ? `<span class="tag-relogin" title="${esc(t("btn.reloginTitle"))}">${t("btn.relogin")}</span>` : ""}</div>
+          <div class="row-name">${ui.density === "compact" ? `<span class="row-chev${slim ? "" : " open"}">${ic("chevDown", 12)}</span>` : ""}${tierBadgeFor(a.id)}${giftBadgeFor(a.id)}<span class="rn-text" title="${esc(displayName)}">${esc(displayName)}</span>${isActive ? `<span class="tag-use">${t("btn.inUse")}</span>` : ""}${a.has_user_info === false ? `<span class="tag-relogin" title="${esc(t("btn.reloginTitle"))}">${t("btn.relogin")}</span>` : ""}</div>
           <div class="row-meta">${meta}</div>
         </div>
         <div class="row-info">${expSoon}${showChip ? quotaChipHtml(a.id, h) : ""}</div>
@@ -2401,8 +2407,9 @@ function scheduleNext(id, base = Date.now()) {
     const h = healthMapOf().get(id);
     const fp = h?.focusPct;
     if (fp != null) {
-      if (fp <= thr) period = 12 * 1000;                        // 关注模型已耗尽：高频盯防（等重置/等待其它账号变化）
-      else if (fp <= thr * 2) period = 20 * 1000;               // 逼近阈值：加密
+      if (fp <= thr) period = 8 * 1000;                         // 关注模型已耗尽：高频盯防（等重置/等待其它账号变化）
+      else if (fp <= thr * 2) period = 12 * 1000;               // 逼近阈值：加密
+      else period = 20 * 1000;                                  // 活跃账号整体提速：正在消耗的就是它，45s 太钝
     }
   }
   quotaDue[id] = base + Math.round(period * jitter);

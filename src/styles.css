@@ -1755,3 +1755,6 @@ select.two-input { cursor: pointer; }
   line-height: 1.7;
   color: var(--ink-mute);
 }
+
+/* 行内礼物徽标（正交维度：有礼物额度，不再占用健康分组） */
+.gift-badge { display: inline-flex; flex: none; color: #e08aa0; vertical-align: -2px; }
