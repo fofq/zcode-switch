@@ -710,7 +710,7 @@ function quotaHeadChipHtml(tot) {
   return `<button class="qh-chip${ui.qhOpen ? " on" : ""}" data-qh-chip title="${esc(t("list.qhTitle"))}" click="actions.toggleQhDetail()">${esc(t("list.qhBtn"))}</button>`;
 }
 
-function quotaHeadPopHtml(tot) {
+function quotaPanelHtml(tot) {
   if (!ui.qhOpen || !tot) return "";
   // Tab 切换模型：账号多时不用滚动很久才能看到另一个模型
   const activeTab = tot.models.some((x) => x.name === ui.qhTab) ? ui.qhTab : (tot.focus?.name || tot.models[0]?.name || "");
