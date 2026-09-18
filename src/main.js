@@ -2040,20 +2040,6 @@ function expireInfo(s) {
   return { text: soon && hasTime ? s : s.slice(0, 10), soon, warn };
 }
 
-function planGroupHtml(p, omitTier = false) {
-  const label = p.tier_code === "other" && !p.pid ? t("q.other") : (p.name || p.tier || "");
-  const exp = expireInfo(p.expire);
-  return `
-  <div class="plan-grp">
-    <div class="pg-head">
-      ${p.tier && !omitTier ? tierChipHtml(p.tier, p.tier_code) : ""}
-      <span class="pg-name" title="${esc(label)}">${esc(label)}</span>
-      ${exp ? `<span class="pg-exp${exp.warn ? " warn-line" : ""}" title="${esc(t("q.validUntil", { date: exp.text }))}">${esc(t("q.validUntilShort", { date: exp.text }))}</span>` : ""}
-    </div>
-    ${slotRowsHtml(p.items)}
-  </div>`;
-}
-
 /** 明细区是否已经有内容（有的话行内就不再重复显示额度小条） */
 function hasQuotaDetail(id) {
   const q = acctQuota[id];
@@ -2065,6 +2051,65 @@ function hasQuotaDetail(id) {
   return d.percent_used != null;
 }
 
+/** 堆叠额度条调色板：第 N 个套餐来源固定用第 N 色，图例与悬浮提示一一对应 */
+const STACK_COLORS = ["#62c370", "#e8a33d", "#6aa9e0", "#b48be8", "#e08aa0"];
+
+/** 按模型聚合各套餐来源：一个模型一条堆叠条，一段一色；窗口类（提示次数/时长）单独收集 */
+function modelStacks(plans, winOut) {
+  const order = [];
+  const map = new Map();
+  for (const p of plans || []) {
+    for (const it of p.items || []) {
+      if (itemKind(it) !== "raw") { winOut.push(it); continue; }
+      const m = String(it.name || "?");
+      if (!map.has(m)) {
+        const st = { model: m, sources: [], sumTotal: 0, sumRemaining: 0 };
+        map.set(m, st);
+        order.push(st);
+      }
+      const st = map.get(m);
+      st.sources.push({
+        plan: p.name || p.tier || "",
+        expire: p.expire || it.period_end || "",
+        gift: p.gift === true,
+        total: it.total ?? 0,
+        remaining: it.remaining ?? 0,
+      });
+      st.sumTotal += it.total ?? 0;
+      st.sumRemaining += it.remaining ?? 0;
+    }
+  }
+  return order;
+}
+
+function msSegHtml(src, i, sumTotal) {
+  const color = STACK_COLORS[i % STACK_COLORS.length];
+  const share = sumTotal > 0 ? (src.total / sumTotal) * 100 : 0;
+  const fill = src.total > 0 ? Math.min(100, Math.max(0, (src.remaining / src.total) * 100)) : 0;
+  const tip = `${src.gift ? "🎁 " : ""}${src.plan}：剩余 ${fmtTokens(src.remaining)} / ${fmtTokens(src.total)}${src.expire ? " · 至 " + src.expire : ""}`;
+  return `<span class="ms-seg" style="width:${share}%" title="${esc(tip)}"><i style="width:${fill}%;background:${color}"></i></span>`;
+}
+
+function modelStackHtml(st) {
+  const segs = st.sources.map((src, i) => msSegHtml(src, i, st.sumTotal)).join("");
+  const usedPct = st.sumTotal > 0 ? Math.max(0, Math.min(100, Math.round((1 - st.sumRemaining / st.sumTotal) * 100))) : 0;
+  const legend = st.sources.length > 1
+    ? `<div class="ms-legend">${st.sources.map((src, i) => {
+        const color = STACK_COLORS[i % STACK_COLORS.length];
+        return `<span class="ms-leg"><i style="background:${color}"></i>${src.gift ? "🎁 " : ""}${esc(src.plan)} ${esc(fmtTokens(src.remaining))}/${esc(fmtTokens(src.total))}</span>`;
+      }).join("")}</div>`
+    : "";
+  return `
+  <div class="mstack">
+    <span class="ms-model" title="${esc(st.model)}">${esc(st.model)}</span>
+    <div class="ms-main">
+      <div class="ms-bar">${segs}<span class="ms-pct">${usedPct}%</span></div>
+      ${legend}
+    </div>
+    <span class="ms-sum">${esc(fmtTokens(st.sumRemaining))}/${esc(fmtTokens(st.sumTotal))}</span>
+  </div>`;
+}
+
 function quotaDetailHtml(id) {
   const q = acctQuota[id];
   if (q?.busy) return `<span class="aq-loading">${t("q.loading")}</span>`;
@@ -2073,17 +2118,13 @@ function quotaDetailHtml(id) {
     return `<span class="aq-err">${esc(msg)}</span>`;
   }
   if (!q?.data) return "";
-  const plans = q.data.plans || [];
-  if (plans.length) {
-    // 行内徽章已展示套餐等级；所有 plan 同级时明细区不再重复渲染等级标签。
-    // 单计划也要走分组渲染：否则像 Weekend Build 这种只有一个计划的账号，
-    // 明细区只剩模型条、看不到计划名（周末活动名只在上游 plans[].name 里）
-    const kinds = new Set(plans.map((p) => tierKind(p.tier, p.tier_code)));
-    return plans.map((p) => planGroupHtml(p, kinds.size === 1)).join("");
+  // 按模型聚合渲染：一个模型一条堆叠条，多套餐来源分色 + 图例/悬浮说明
+  const wins = [];
+  const stacks = modelStacks(q.data.plans || [], wins);
+  if (stacks.length || wins.length) {
+    return wins.map((it) => winRowHtml(it, " mini")).join("") + stacks.map(modelStackHtml).join("");
   }
   const items = q.data.items || [];
-  const wins = items.filter((it) => itemKind(it) === "prompt_count");
-  if (wins.length) return wins.map((it) => winRowHtml(it, " mini")).join("");
   if (items.length) return slotRowsHtml(items);
   // 没有明细项时用总览兜底，避免展开后一片空白
   if (q.data.percent_used != null) {
