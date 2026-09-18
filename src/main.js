@@ -1988,8 +1988,10 @@ function quotaDetailHtml(id) {
   }
   if (!q?.data) return "";
   const plans = q.data.plans || [];
-  if (plans.length >= 2) {
-    // 行内徽章已展示套餐等级；所有 plan 同级时明细区不再重复渲染等级标签
+  if (plans.length) {
+    // 行内徽章已展示套餐等级；所有 plan 同级时明细区不再重复渲染等级标签。
+    // 单计划也要走分组渲染：否则像 Weekend Build 这种只有一个计划的账号，
+    // 明细区只剩模型条、看不到计划名（周末活动名只在上游 plans[].name 里）
     const kinds = new Set(plans.map((p) => tierKind(p.tier, p.tier_code)));
     return plans.map((p) => planGroupHtml(p, kinds.size === 1)).join("");
   }
