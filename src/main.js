@@ -3,7 +3,7 @@ import { listen } from "@tauri-apps/api/event";
 import { esc, toast, openPwModal, openConfirmModal, openProviderModal, installDelegation, dismissSplash } from "./ui.js";
 import { ic } from "./icons.js";
 import { init, t, has, lang, localeTag, stripErr, errCode } from "./i18n.js";
-import { HEALTH_ORDER, healthOf, filterAccounts, sortAccounts, bucketAccounts, summarize } from "./list.js";
+import { HEALTH_ORDER, healthOf, filterAccounts, sortAccounts, bucketAccounts, summarize, modelKeyMatch } from "./list.js";
 
 const $app = document.getElementById("app");
 let state = null;
@@ -79,6 +79,7 @@ const ui = {
   sort: SORTS.includes(savedPrefs.sort) ? savedPrefs.sort : "quota",
   density: savedPrefs.density === "detail" ? "detail" : "compact",
   hideInfo: savedPrefs.hideInfo === true,
+  qhOpen: false,
   modelCustom: false,
   selected: new Set(),
   expanded: new Set(),
@@ -658,8 +659,71 @@ function chipsHtml(sum) {
 function summaryHtml(sum) {
   const avg = sum.avgRemainingPct == null ? "—" : Math.round(sum.avgRemainingPct) + "%";
   const m = focusModel();
+  // 流转显示：活跃账号判定已流转到其它模型时，展示实际生效的模型
+  const activeId = state?.active_account_id;
+  const ah = activeId ? healthMapOf().get(activeId) : null;
+  const eff = m && ah?.fallback && ah?.modelName ? ah.modelName : m;
   const base = t("list.summary", { n: (state?.accounts || []).length, avg });
-  return `<span class="lh-sum">${esc(m ? base + " · " + t("list.focusModel", { model: m }) : base)}</span>`;
+  const label = eff ? t(eff !== m ? "list.focusModelFlow" : "list.focusModel", { model: eff }) : "";
+  return `<span class="lh-sum">${esc(label ? base + " · " + label : base)}</span>`;
+}
+
+/** 全库额度汇总：按模型聚合所有已刷新账号的余额（仅 token 类额度） */
+function quotaTotals() {
+  const key = focusModel().toLowerCase();
+  const per = new Map();
+  let accounts = 0;
+  for (const a of state?.accounts || []) {
+    const q = acctQuota[a.id];
+    if (!q?.data || q.busy || q.err) continue;
+    accounts++;
+    for (const p of q.data.plans || []) {
+      for (const it of p.items || []) {
+        if (itemKind(it) !== "raw") continue;
+        const name = String(it.name || "?");
+        const agg = per.get(name) || { name, remaining: 0, total: 0 };
+        agg.remaining += it.remaining ?? 0;
+        agg.total += it.total ?? 0;
+        per.set(name, agg);
+      }
+    }
+  }
+  const models = [...per.values()].sort((x, y) => y.remaining - x.remaining);
+  const focus = key ? models.find((x) => modelKeyMatch(x.name.toLowerCase(), key)) || null : null;
+  return {
+    focus,
+    models,
+    accounts,
+    all: {
+      remaining: models.reduce((s, x) => s + x.remaining, 0),
+      total: models.reduce((s, x) => s + x.total, 0),
+    },
+  };
+}
+
+function quotaHeadChipHtml(tot) {
+  if (!tot || !tot.accounts) return "";
+  const parts = [];
+  if (tot.focus) parts.push(`${t("list.qhFocus")} ${fmtTokens(tot.focus.remaining)}/${fmtTokens(tot.focus.total)}`);
+  parts.push(`${t("list.qhAll")} ${fmtTokens(tot.all.remaining)}/${fmtTokens(tot.all.total)}`);
+  return `<button class="qh-chip${ui.qhOpen ? " on" : ""}" data-qh-chip title="${esc(t("list.qhTitle"))}" click="actions.toggleQhDetail()">${esc(parts.join(" · "))}</button>`;
+}
+
+function quotaHeadPopHtml(tot) {
+  if (!ui.qhOpen || !tot) return "";
+  const rows = tot.models.map((x) => {
+    const w = x.total > 0 ? Math.round((x.remaining / x.total) * 100) : 0;
+    const isFocus = tot.focus && x === tot.focus;
+    return `<div class="qh-row${isFocus ? " focus" : ""}">
+      <span class="qh-name" title="${esc(x.name)}">${esc(x.name)}${isFocus ? `<span class="qh-tag">${t("list.qhFocusTag")}</span>` : ""}</span>
+      <span class="rq"><span class="rq-bar"><i style="width:${w}%"></i></span></span>
+      <span class="qh-num">${esc(fmtTokens(x.remaining))}/${esc(fmtTokens(x.total))}</span>
+    </div>`;
+  }).join("");
+  return `<div class="qh-pop" data-qh-pop>
+    <div class="qh-head">${esc(t("list.qhPopTitle", { n: tot.accounts }))}</div>
+    ${rows || `<div class="qh-empty">${esc(t("list.qhEmpty"))}</div>`}
+  </div>`;
 }
 
 function bulkBarHtml() {
@@ -675,6 +739,7 @@ function bulkBarHtml() {
 
 function listHeadHtml(s, sum, visible) {
   const allOn = visible.length > 0 && visible.every((a) => ui.selected.has(a.id));
+  const qt = quotaTotals();
   return `
     <div class="list-head">
       <div class="lh-row">
@@ -692,6 +757,7 @@ function listHeadHtml(s, sum, visible) {
       <div class="lh-row">${chipsHtml(sum)}</div>
       <div class="lh-row lh-tools">
         ${summaryHtml(sum)}
+        ${quotaHeadChipHtml(qt)}
         <span class="lh-sp"></span>
         <button class="sel-all" title="${esc(t("list.selectAllVisible"))}" click="actions.selectAllVisible()">
           <span class="rchk sm${allOn ? " on" : ""}" aria-hidden="true">${ic("check", 11)}</span>${t("list.selectAll")}
@@ -705,6 +771,7 @@ function listHeadHtml(s, sum, visible) {
           <button class="vs-opt${ui.density === "detail" ? " on" : ""}" aria-pressed="${ui.density === "detail"}" click="actions.setDensity('detail')">${t("list.density.detail")}</button>
         </div>
       </div>
+      ${quotaHeadPopHtml(qt)}
       ${bulkBarHtml()}
     </div>`;
 }
@@ -844,6 +911,11 @@ const actions = {
     window.__renameBlurTimer = setTimeout(() => {
       if (renaming === id && !window.__renameSaving) actions.cancelRename();
     }, 180);
+  },
+
+  toggleQhDetail() {
+    ui.qhOpen = !ui.qhOpen;
+    render();
   },
 
   async setGrouped(on) {
@@ -1074,7 +1146,10 @@ const actions = {
       const restart = state.launch_after_switch;
       const r = await invoke("switch_to", { id, force, restart });
       if (r.already_active) {
-        toast(t("m.toastAlready", { name: r.name }), "ok");
+        const bits = [];
+        if (r.killed) bits.push(t("m.bitKilled"));
+        if (r.launched) bits.push(t("m.bitLaunched"));
+        toast(t("m.toastAlready", { name: r.name }), "ok", bits.join(t("common.listSep")));
       } else {
         const bits = [];
         if (r.hot) bits.push(t("m.bitHot"));
@@ -2013,11 +2088,13 @@ function quotaDetailHtml(id) {
 }
 
 /** 行内额度区：可领条永远显示；额度明细按展开状态决定 */
+function quotaSlotInner(id, showDetail) {
+  return `${claimStripHtml(id)}${showDetail ? quotaDetailHtml(id) : ""}`;
+}
 function quotaSlotHtml(id, showDetail) {
-  const strip = claimStripHtml(id);
-  const inner = showDetail ? quotaDetailHtml(id) : "";
-  if (!strip && !inner) return "";
-  return `<div class="row-quota-slot">${strip}${inner}</div>`;
+  const inner = quotaSlotInner(id, showDetail);
+  if (!inner) return "";
+  return `<div class="row-quota-slot" data-quota-slot>${inner}</div>`;
 }
 
 function captureScroll() {
@@ -2045,7 +2122,8 @@ function restoreScroll(cap) {
 }
 
 let lastRenderSig = "";
-function renderSignature() {
+let lastQuotaSig = "";
+function renderQuotaSig() {
   // 额度数据用轻量摘要（busy/错误/refreshed_at），避免每次渲染全量序列化大对象
   const qsig = Object.keys(acctQuota).map((k) => {
     const q = acctQuota[k];
@@ -2054,13 +2132,66 @@ function renderSignature() {
     return `${k}:${mark}`;
   }).join("|");
   const csig = Object.keys(claimable).map((k) => `${k}:${claimable[k]?.busy ? "b" : ""}${claimable[k]?.plans?.length ?? 0}`).join("|");
+  return qsig + "" + csig;
+}
+function renderSignature() {
   return JSON.stringify([
-    state, qsig, csig, autoSwitchNote, quotaSweep, refreshClaim,
+    state, autoSwitchNote, quotaSweep, refreshClaim,
     claimAllState, twoLastStatus, [...twoUsageMap.entries()],
     [...ui.expanded], [...ui.selected], [...ui.collapsedSections],
-    ui.search, ui.health, ui.sort, ui.density, ui.hideInfo, renaming,
+    ui.search, ui.health, ui.sort, ui.density, ui.hideInfo, ui.qhOpen, renaming,
     appVer, autoSwitchRunning, autoClaimRunning, claimActive, busy,
   ]);
+}
+
+/** 结构未变、仅额度数据变化时的精准补丁：只就地更新额度相关 DOM，宽度/滚动零扰动 */
+function patchQuotaDom() {
+  const { list: visible, hm } = visibleAccounts();
+  const sum = summarize(state?.accounts || [], hm);
+  const replace = (sel, html) => {
+    const el = $app.querySelector(sel);
+    if (!el) return;
+    const tpl = document.createElement("template");
+    tpl.innerHTML = html.trim();
+    const node = tpl.content.firstElementChild;
+    if (node) el.replaceWith(node);
+  };
+  replace(".lh-sum", summaryHtml(sum));
+  replace(".chips", chipsHtml(sum));
+  const qt = quotaTotals();
+  replace("[data-qh-chip]", quotaHeadChipHtml(qt));
+  const pop = $app.querySelector("[data-qh-pop]");
+  if (pop) {
+    const tpl = document.createElement("template");
+    tpl.innerHTML = quotaHeadPopHtml(qt).trim();
+    const node = tpl.content.firstElementChild;
+    if (node) pop.replaceWith(node); else pop.remove();
+  }
+  for (const a of visible) {
+    const row = $app.querySelector(`.row[data-id="${CSS.escape(a.id)}"]`);
+    if (!row) continue;
+    const h = hm.get(a.id) || { level: "unknown", remainingPct: null };
+    const dot = row.querySelector(".hdot");
+    if (dot) {
+      const tpl = document.createElement("template");
+      tpl.innerHTML = healthDotHtml(h).trim();
+      const node = tpl.content.firstElementChild;
+      if (node) dot.replaceWith(node);
+    }
+    const q = acctQuota[a.id];
+    const exp = expireInfo(q?.data?.plan_expire);
+    const slim = row.classList.contains("slim");
+    const info = row.querySelector(".row-info");
+    if (info) {
+      const expSoon = slim && exp?.warn
+        ? `<span class="meta-chip warn" title="${esc(t("q.validUntil", { date: exp.text }))}">${esc(expSoonLabel(exp))}</span>`
+        : "";
+      const showChip = slim || !hasQuotaDetail(a.id);
+      info.innerHTML = expSoon + (showChip ? quotaChipHtml(a.id, h) : "");
+    }
+    const slot = row.querySelector("[data-quota-slot]");
+    if (slot) slot.innerHTML = quotaSlotInner(a.id, !slim);
+  }
 }
 // 滚动期间延迟重渲染：列表在滚动时被全量重建会造成掉帧
 let scrollDeferUntil = 0;
@@ -2098,7 +2229,15 @@ function render(force = false) {
       return;
     }
     const sig = renderSignature();
-    if (sig === lastRenderSig) return;
+    if (sig === lastRenderSig) {
+      // 结构没变、只有额度数据在动：不整表重建，就地补丁额度显示
+      const qs = renderQuotaSig();
+      if (qs !== lastQuotaSig) {
+        lastQuotaSig = qs;
+        patchQuotaDom();
+      }
+      return;
+    }
     // 批量操作（全量刷新/领取）期间合并重渲染，最多 500ms 一次，避免连续重建掉帧
     if (quotaSweep?.running || refreshClaim?.running || claimAllRunning || autoClaimRunning) {
       const now = Date.now();
@@ -2110,6 +2249,7 @@ function render(force = false) {
       lastBulkRender = now;
     }
     lastRenderSig = sig;
+    lastQuotaSig = renderQuotaSig();
   }
   const scrollCap = captureScroll();
   if (!state) {
@@ -2151,7 +2291,12 @@ function render(force = false) {
         </div>
       </div>`;
     }
-    const ident = [a.identity?.username, a.identity?.email].filter(Boolean).join(" · ");
+    // 身份信息与账号名去重：用户名与账号名相同时不再在 meta 行重复展示
+    const nm = String(a.name || "").trim().toLowerCase();
+    const ident = [a.identity?.username, a.identity?.email]
+      .filter(Boolean)
+      .filter((x) => x.trim().toLowerCase() !== nm)
+      .join(" · ");
     const q = acctQuota[a.id];
     let meta = "";
     if (!a.has_config) meta += `<span class="meta-chip warn" title="${esc(t("q.noCfg"))}">${esc(t("q.noCfgShort"))}</span>`;

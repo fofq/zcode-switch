@@ -38,7 +38,7 @@ export function quotaRemainingPct(q) {
  * 命中 → 返回该模型的剩余百分比；未命中 → null（调用方回退到总额度）。
  */
 /** 模型名匹配：兼容 "GLM-5.3-Flash"（总览条目）与 "5.3-Flash"（套餐明细条目）两种命名 */
-function modelKeyMatch(nameLower, key) {
+export function modelKeyMatch(nameLower, key) {
   if (!key) return false;
   if (nameLower.includes(key)) return true;
   const nk = nameLower.replace(/^glm-/, "");

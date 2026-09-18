@@ -1758,3 +1758,28 @@ select.two-input { cursor: pointer; }
 
 /* 行内礼物徽标（正交维度：有礼物额度，不再占用健康分组） */
 .gift-badge { display: inline-flex; flex: none; color: #e08aa0; vertical-align: -2px; }
+
+/* 头部额度汇总：chip + 详情弹层 */
+.list-head { position: relative; }
+.qh-chip {
+  display: inline-flex; align-items: center; gap: 6px;
+  padding: 3px 10px; border-radius: 999px; font-size: 12px;
+  color: var(--amber); border: 1px solid rgba(232, 163, 61, .35);
+  background: rgba(232, 163, 61, .07); cursor: pointer; white-space: nowrap;
+}
+.qh-chip:hover, .qh-chip.on { background: rgba(232, 163, 61, .16); }
+.qh-pop {
+  position: absolute; top: calc(100% - 4px); right: 12px; z-index: 30;
+  min-width: 320px; max-width: 420px; max-height: 46vh; overflow: auto;
+  padding: 10px 12px; border-radius: 10px;
+  background: var(--panel, #17191f); border: 1px solid rgba(255,255,255,.09);
+  box-shadow: 0 12px 32px rgba(0,0,0,.45);
+}
+.qh-head { font-size: 11px; color: #8a90a0; margin-bottom: 8px; }
+.qh-row { display: flex; align-items: center; gap: 8px; padding: 3px 0; }
+.qh-row .rq { flex: 1; }
+.qh-row.focus .qh-name { color: var(--amber); }
+.qh-name { flex: none; width: 118px; font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.qh-num { flex: none; font-size: 12px; color: #aab0bf; font-variant-numeric: tabular-nums; }
+.qh-tag { margin-left: 6px; font-size: 10px; padding: 1px 5px; border-radius: 999px; border: 1px solid rgba(232,163,61,.4); }
+.qh-empty { font-size: 12px; color: #8a90a0; padding: 6px 0; }
