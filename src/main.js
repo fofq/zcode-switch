@@ -1292,6 +1292,24 @@ const actions = {
 
   openTwoApi() { openTwoApiModal(); },
 
+  /** 悬浮按钮：滚动定位到当前使用的账号 */
+  locateActive() {
+    const row = document.querySelector(".row.active");
+    if (row) {
+      row.scrollIntoView({ behavior: "smooth", block: "center" });
+      return;
+    }
+    // 当前账号被筛选/搜索过滤掉了：清空筛选再定位
+    if (ui.search || ui.health !== "all") {
+      ui.search = "";
+      ui.health = "all";
+      render(true);
+      requestAnimationFrame(() => document.querySelector(".row.active")?.scrollIntoView({ behavior: "smooth", block: "center" }));
+      return;
+    }
+    toast(t("list.locateMissing"), "warn");
+  },
+
   closeTwoApi() { closeTwoApiModal(); },
 
   closeSettings() { closeSettingsModal(); },
@@ -1960,7 +1978,23 @@ function restoreScroll(cap) {
   }
 }
 
-function render() {
+let lastRenderSig = "";
+function renderSignature() {
+  return JSON.stringify([
+    state, acctQuota, claimable, autoSwitchNote, quotaSweep, refreshClaim,
+    claimAllState, twoLastStatus, [...twoUsageMap.entries()],
+    [...ui.expanded], [...ui.selected], [...ui.collapsedSections],
+    ui.search, ui.health, ui.sort, ui.density, ui.hideInfo, renaming,
+    appVer, autoSwitchRunning, autoClaimRunning, claimActive, busy,
+  ]);
+}
+function render(force = false) {
+  // 轮询驱动的重渲染：状态指纹未变则跳过全量重建（避免高度抖动/滚动条漂移）
+  if (!force) {
+    const sig = renderSignature();
+    if (sig === lastRenderSig) return;
+    lastRenderSig = sig;
+  }
   const scrollCap = captureScroll();
   if (!state) {
     $app.innerHTML = `<div class="loading">LOADING</div>`;
@@ -2146,6 +2180,7 @@ function render() {
     ${listHeadHtml(s, sum, visible)}
 
     <main class="list">${listHtml}</main>
+    ${active ? `<button class="fab-locate" title="${t("list.locateActive")}" aria-label="${t("list.locateActive")}" click="actions.locateActive()">${ic("target", 20)}</button>` : ""}
   `;
   restoreScroll(scrollCap);
   const pos = window.__searchPos;

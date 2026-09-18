@@ -194,6 +194,8 @@ export const en = {
   "list.apiKeyCopied": "API key copied",
   "list.apiKeyNone": "No usable API key for this account",
   "list.apiKeysCopied": "Copied API keys of {n} accounts",
+  "list.locateActive": "Locate the active account",
+  "list.locateMissing": "Active account is not in the list (filtered out?)",
   "list.usageTitle": "Total 2API requests",
   "list.copyFail": "Copy failed",
 
