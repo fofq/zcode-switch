@@ -66,12 +66,6 @@ fn stats() -> &'static Arc<Stats> {
     STATS.get_or_init(|| Arc::new(Stats::default()))
 }
 
-#[derive(Clone, Debug)]
-pub struct PoolKey {
-    pub api_key: String,
-    pub provider: String,
-}
-
 pub struct SharedState {
     pub paths: Paths,
     pub token: Mutex<String>,
