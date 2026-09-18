@@ -241,6 +241,9 @@ pub struct PlanSlot {
     pub name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub expire: Option<String>,
+    /// 礼物/赠送类套餐（entitlements 全部为 one_time 一次性发放）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gift: Option<bool>,
     pub total: Option<f64>,
     pub used: Option<f64>,
     pub remaining: Option<f64>,
@@ -1146,6 +1149,14 @@ fn tier_code_from_display(tier: &str) -> String {
     }
 }
 
+/// 套餐名兜底判断是否礼物/赠送类（无 entitlements period 信息时使用）
+fn is_gift_plan_name(name: &str) -> bool {
+    let n = name.to_lowercase();
+    ["gift", "promo", "weekend", "trial", "taste", "experience", "activity", "global build", "体验", "礼包", "赠送", "活动"]
+        .iter()
+        .any(|k| n.contains(k))
+}
+
 fn tier_rank(code: Option<&str>) -> u8 {
     match code.unwrap_or("") {
         "max" => 5,
@@ -1180,12 +1191,22 @@ fn normalize_balance(balance_data: &Value) -> QuotaOverview {
                     let pid = pl.get("plan_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
                     let pname = pl.get("name").and_then(|v| v.as_str()).map(str::to_string);
                     let (tier, tier_code) = plan_tier_from_id(&pid, pname.as_deref());
+                    // 礼物/赠送类套餐：entitlements 全部为一次性发放（one_time），
+                    // 常规订阅是 daily/monthly 周期刷新。名字关键词作兜底。
+                    let ents = pl.get("entitlements").and_then(|e| e.as_array());
+                    let gift = match ents {
+                        Some(list) if !list.is_empty() => list.iter().all(|e| {
+                            e.get("period").and_then(|v| v.as_str()).map(|s| s.eq_ignore_ascii_case("one_time")).unwrap_or(false)
+                        }),
+                        _ => pname.as_deref().map(|n| is_gift_plan_name(n)).unwrap_or(false),
+                    };
                     PlanSlot {
                         pid: pid.clone(),
                         tier: Some(tier),
                         tier_code: Some(tier_code),
                         name: Some(pname.filter(|s| !s.trim().is_empty()).unwrap_or(pid)),
                         expire: extract_expire(pl),
+                        gift: Some(gift),
                         ..Default::default()
                     }
                 })

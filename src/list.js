@@ -72,8 +72,10 @@ function itemKindOf(it) {
   return "raw";
 }
 
-/** 套餐分类：礼物/赠送类（体验、活动、未归类的特殊套餐） vs 常规订阅（max/pro/lite/start） */
+/** 套餐分类：优先用后端 gift 标记（entitlements 全部 one_time = 礼物/赠送），旧数据回退名字启发式 */
 export function planIsGift(p) {
+  if (p?.gift === true) return true;
+  if (p?.gift === false) return false;
   const tier = String(p?.tier_code || p?.tier || "").toLowerCase();
   const name = String(p?.name || "").toLowerCase();
   if (["max", "pro", "lite", "start"].includes(tier)) return false;
