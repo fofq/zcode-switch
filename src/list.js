@@ -2,7 +2,7 @@
 // 不依赖 DOM，便于单独测试。
 
 /** 健康度分级（也是列表里的展示顺序，越靠前越"可用"） */
-export const HEALTH_ORDER = ["ok", "low", "flowed", "dead", "auth", "fail", "unknown"];
+export const HEALTH_ORDER = ["gift", "ok", "low", "flowed", "dead", "auth", "fail", "unknown"];
 
 /** 剩余额度低于该百分比视为"紧张" */
 export const LOW_THRESHOLD = 20;
@@ -167,6 +167,8 @@ export function healthOf(acct, quota, isAuthErr, model, opts = {}) {
       mp = det.gift != null && det.gift > 0 ? det.gift : (det.regular != null ? det.regular : det.gift);
     }
   }
+  // 关注模型的原始百分比（礼物优先调整后、流转前）——自适应刷新频率用它
+  const focusPct = mp;
   // 流转：关注模型在所有套餐里都耗尽时，改用其它剩余最高的模型参与判定。
   // 未设置关注模型时不流转（否则所有账号都会被误判成“关注模型耗尽”）。
   if (opts.modelFallback && model && (mp == null || mp <= 0)) {
@@ -178,19 +180,21 @@ export function healthOf(acct, quota, isAuthErr, model, opts = {}) {
     }
   }
   const pct = mp != null ? mp : quotaRemainingPct(quota);
+  // 有礼物额度的账号单独成组（展示用：提醒还有礼物可消耗）
+  const hasGift = (quota?.data?.plans || []).some((p) => p.gift === true && Number(p.remaining ?? 1) > 0);
   // 鉴权失效永远优先（token 过期等，旧数据不可信）
   if (quota?.err && isAuthErr && isAuthErr(quota)) {
-    return { level: "auth", remainingPct: pct, modelMatched: mp != null, modelName, fallback };
+    return { level: "auth", remainingPct: pct, modelMatched: mp != null, modelName, fallback, hasGift, focusPct };
   }
   if (pct != null) {
     // 流转账号单独一档：关注模型已耗尽但其它模型仍可用，组名直接表达主状态
-    const lv = fallback ? "flowed" : pct <= 0 ? "dead" : pct <= thr ? "low" : "ok";
-    return { level: lv, remainingPct: pct <= 0 ? 0 : pct, modelMatched: mp != null, modelName, fallback };
+    const lv = hasGift ? "gift" : fallback ? "flowed" : pct <= 0 ? "dead" : pct <= thr ? "low" : "ok";
+    return { level: lv, remainingPct: pct <= 0 ? 0 : pct, modelMatched: mp != null, modelName, fallback, hasGift, focusPct };
   }
   // 没有任何额度数据时才用错误/回退信号（避免刷新失败把账号闪进失败分组）
-  if (quota?.err) return { level: "fail", remainingPct: null, modelMatched: false, modelName: null, fallback: false };
-  if (acct?.has_user_info === false) return { level: "auth", remainingPct: null, modelMatched: false, modelName: null, fallback: false };
-  return { level: "unknown", remainingPct: null, modelMatched: false, modelName: null, fallback: false };
+  if (quota?.err) return { level: "fail", remainingPct: null, modelMatched: false, modelName: null, fallback: false, hasGift, focusPct: null };
+  if (acct?.has_user_info === false) return { level: "auth", remainingPct: null, modelMatched: false, modelName: null, fallback: false, hasGift, focusPct: null };
+  return { level: "unknown", remainingPct: null, modelMatched: false, modelName: null, fallback: false, hasGift, focusPct: null };
 }
 
 /** 搜索匹配：名称 / 用户名 / 邮箱 / 分组 / 提供方 */
@@ -296,7 +300,7 @@ export function bucketAccounts(accounts, { localeTag = "zh-CN", healthLabel = ()
  * 合计：各健康度计数 + 平均剩余额度百分比（仅统计已拿到额度的账号，单位无关）。
  */
 export function summarize(accounts, healthMap) {
-  const counts = { ok: 0, low: 0, flowed: 0, dead: 0, auth: 0, fail: 0, unknown: 0 };
+  const counts = { gift: 0, ok: 0, low: 0, flowed: 0, dead: 0, auth: 0, fail: 0, unknown: 0 };
   let pctSum = 0;
   let pctCount = 0;
   for (const a of accounts || []) {

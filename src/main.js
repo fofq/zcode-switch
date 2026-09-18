@@ -740,8 +740,8 @@ async function loadAcctQuota(id) {
     acctQuota[id] = { data: cur.data || null, err: stripErr(e), code: errCode(e), busy: false };
   }
   if (!uiLocked()) render();
-  // 刷新的是当前账号 → 数据一到手立即判定（不再等 60s 巡检；冷却等约束照常生效）
-  if (state?.auto_switch && state?.accounts?.some((a) => a.id === id && a.is_active)) {
+  // 任意账号的额度数据更新 → 立即跑一次切换判定（目标账号拿到额度/当前账号耗尽都能秒级反应）
+  if (state?.auto_switch) {
     autoSwitchTick(false);
   }
 }
@@ -803,8 +803,8 @@ const actions = {
       toast(t("m.toastSaved", { name: r.name }), "ok", t("m.toastSavedDetail"));
       await refresh(); render();
       enrollAccounts();
-      // 新账号入库后立即拉额度，不等巡检节奏
-      loadAcctQuota(r.id);
+      // 新账号入库：稍等 ZCode 落盘凭据后立刻拉额度（立即拉可能与写盘竞争）
+      setTimeout(() => loadAcctQuota(r.id), 1500);
     });
   },
 
@@ -1026,23 +1026,25 @@ const actions = {
     }
   },
 
-  /** 行内快捷「常规切换」：无视热切换设置，强制关闭再打开 ZCode 完成切换 */
+  /** 行内快捷「强制重启」：关闭并重新打开 ZCode（活跃账号也可用，等于对当前账号重启应用配置） */
   askColdSwitch(id) {
     const a = state.accounts.find((x) => x.id === id);
     if (!a) return;
+    const isActive = !!a.is_active;
     openConfirmModal({
       kind: "warn",
-      icon: "power",
-      title: t("m.coldSwitchTitle", { name: a.name }),
+      icon: "restart",
+      title: isActive ? t("m.coldRestartTitle") : t("m.coldSwitchTitle", { name: a.name }),
       desc: t("m.coldSwitchDesc"),
-      yesLabel: t("m.switchYes"),
+      yesLabel: t("m.coldSwitchYes"),
       onYes: () => actions.doColdSwitch(id),
     });
   },
 
   async doColdSwitch(id) {
     await guard(async () => {
-      const r = await invoke("switch_to", { id, force: false, restart: state.launch_after_switch, hot: false });
+      // force=true：目标已是活跃账号也重新落盘应用（等效对当前账号重启 ZCode）
+      const r = await invoke("switch_to", { id, force: true, restart: true, hot: false });
       if (r.already_active) {
         toast(t("m.toastAlready", { name: r.name }), "ok");
         return;
@@ -1320,7 +1322,7 @@ const actions = {
     try {
       const r = await invoke("account_api_key", { id });
       if (!r?.apiKey) { toast(t("list.apiKeyNone"), "warn"); return; }
-      if (await copyText(r.apiKey)) toast(t("list.apiKeyCopied"));
+      if (await copyText(r.apiKey)) toast(`${t("list.apiKeyCopied")}（${r.label || "?"}）`);
       else toast(t("list.copyFail"), "err");
     } catch (e) { toast(stripErr(e), "err"); }
   },
@@ -2369,13 +2371,15 @@ function scheduleNext(id, base = Date.now()) {
   const jitter = 1 + (Math.random() * 2 - 1) * SWEEP_JITTER;
   let period = SWEEP_PERIOD;
   if (state?.accounts?.some((a) => a.id === id && a.is_active)) {
-    // 活跃账号自适应频率：越接近切换阈值刷新越勤，切换触发更及时
+    // 活跃账号自适应频率：看关注模型的原始百分比（流转后判定高不代表关注模型没耗尽），
+    // 越接近切换阈值刷新越勤——每日重置等额度恢复能第一时间发现并切回
     period = SWEEP_PERIOD_ACTIVE;
     const thr = Number(state?.auto_switch_threshold ?? 10);
     const h = healthMapOf().get(id);
-    if (h?.remainingPct != null) {
-      if (h.remainingPct <= thr) period = 12 * 1000;        // 已在阈值下：高频盯防
-      else if (h.remainingPct <= thr * 2) period = 20 * 1000; // 逼近阈值：加密
+    const fp = h?.focusPct;
+    if (fp != null) {
+      if (fp <= thr) period = 12 * 1000;                        // 关注模型已耗尽：高频盯防（等重置/等待其它账号变化）
+      else if (fp <= thr * 2) period = 20 * 1000;               // 逼近阈值：加密
     }
   }
   quotaDue[id] = base + Math.round(period * jitter);
@@ -2421,7 +2425,11 @@ async function autoSwitchTick(manual = false) {
   const shouldSwitch = cur.fallback
     ? (focusCandExists || cur.remainingPct <= thr)
     : cur.remainingPct <= thr;
-  if (!shouldSwitch) return;
+  if (!shouldSwitch) {
+    // 让“为什么不切”对用户可见：关注模型全场耗尽时已流转其它模型，暂无更优目标
+    if (cur.fallback) autoSwitchNote = t("as.noteFlowed", { model: cur.modelName || "", pct: Math.round(cur.remainingPct) });
+    return;
+  }
 
   // 冷却豁免：紧急情况（当前账号关注模型已耗尽且有关注模型候选）不受 5 分钟冷却限制，
   // 否则刚切过去的号 Flash 烧完后要干等 5 分钟
@@ -2430,7 +2438,10 @@ async function autoSwitchTick(manual = false) {
 
   // 目标池：关注模型候选优先；关注模型全面耗尽时才轮到流转候选
   const targetPool = focusCandExists ? focusCands : flowCands;
-  if (!targetPool.length) return;
+  if (!targetPool.length) {
+    autoSwitchNote = t("as.noteNoCand");
+    return;
+  }
   // 候选排序：额度高者优先；礼物/套餐临期的账号再插队，尽快把赠送额度用掉
   const giftSoon = (a) => (acctQuota[a.id]?.data?.plans || []).some((p) => expireInfo(p.expire)?.warn);
   const best = targetPool

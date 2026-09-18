@@ -70,6 +70,8 @@ const ICONS = {
   plug: P("M6 2v3.2") + P("M10 2v3.2") + `<path d="M4.2 5.2h7.6v2.4A3.8 3.8 0 0 1 8 11.4a3.8 3.8 0 0 1-3.8-3.8z"/>` + P("M8 11.4v2.6"),
 
   target: `<circle cx="8" cy="8" r="5"/>` + `<circle cx="8" cy="8" r="1.2" fill="currentColor" stroke="none"/>` + P("M8 1v2.2") + P("M8 12.8V15") + P("M1 8h2.2") + P("M12.8 8H15"),
+
+  restart: P("M13.4 8a5.4 5.4 0 1 1-1.58-3.82") + P("M13.5 2.6v3.2h-3.2") + P("M8 5.4v2.6"),
 };
 
 export function ic(name, size = 16, cls = "") {
