@@ -1,6 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { esc, toast, openPwModal, openConfirmModal, openProviderModal, openGroupModal, installDelegation, dismissSplash } from "./ui.js";
+import { esc, toast, openPwModal, openConfirmModal, openProviderModal, installDelegation, dismissSplash } from "./ui.js";
 import { ic } from "./icons.js";
 import { init, t, has, lang, localeTag, stripErr, errCode } from "./i18n.js";
 import { HEALTH_ORDER, healthOf, filterAccounts, sortAccounts, bucketAccounts, summarize } from "./list.js";
@@ -199,6 +199,7 @@ function healthMapOf() {
   const opts = {
     giftFirst: !!state?.auto_switch_gift_first,
     modelFallback: !!state?.auto_switch_model_fallback,
+    threshold: Number(state?.auto_switch_threshold ?? 10),
   };
   const map = new Map();
   for (const a of state?.accounts || []) map.set(a.id, healthOf(a, acctQuota[a.id], isAuthErr, model, opts));
@@ -242,11 +243,6 @@ function expSoonLabel(exp) {
   const todayStr = `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}`;
   if (day === todayStr) return t("list.expToday");
   return t("list.expShort", { date: day.slice(5) });
-}
-function groupTagHtml(a) {
-  const g = acctGroup(a);
-  if (!g) return "";
-  return `<span class="tag-grp" title="${esc(t("grp.tagTitle", { group: g }))}">${ic("folder", 11)} ${esc(g)}</span>`;
 }
 /** 从已读到的额度数据里汇总可用模型（只取“额度池/模型”条目，跳过 提示次数/使用时长 这类窗口） */
 function detectedModels() {
@@ -612,14 +608,6 @@ async function openTwoApiModal() {
   }, 2000);
 }
 
-function customGroups(accounts) {
-  const set = new Set();
-  for (const a of accounts) {
-    const g = acctGroup(a);
-    if (g) set.add(g);
-  }
-  return [...set].sort((x, y) => x.localeCompare(y, localeTag(), { sensitivity: "base" }));
-}
 function selectedIds() {
   const all = new Set((state?.accounts || []).map((a) => a.id));
   return [...ui.selected].filter((id) => all.has(id));
@@ -675,7 +663,6 @@ function bulkBarHtml() {
   return `<div class="bulk-bar">
     <span class="bulk-n">${esc(t("list.selected", { n }))}</span>
     <span class="lh-sp"></span>
-    <button class="btn-ghost has-ic" click="actions.askBulkGroup()">${ic("folder", 13)} ${t("list.bulkGroup")}</button>
     <button class="btn-ghost danger has-ic" click="actions.askBulkDelete()">${ic("x", 13)} ${t("list.bulkDelete")}</button>
     <button class="btn-ghost" click="actions.clearSelection()">${t("list.clearSel")}</button>
   </div>`;
@@ -961,31 +948,6 @@ const actions = {
     });
   },
 
-  askBulkGroup() {
-    const ids = selectedIds();
-    if (!ids.length) return;
-    openGroupModal({
-      name: t("list.bulkGroupName", { n: ids.length }),
-      current: "",
-      groups: customGroups(state?.accounts || []),
-      onPick: (g) => actions.doBulkGroup(ids, g),
-      onCreate: (g) => actions.doBulkGroup(ids, g),
-    });
-  },
-
-  async doBulkGroup(ids, group) {
-    const next = String(group || "").trim();
-    await guard(async () => {
-      let ok = 0;
-      for (const id of ids) {
-        try { await invoke("set_account_group", { id, group: next || null }); ok++; } catch { /* 单个失败不阻断 */ }
-      }
-      if (next) toast(t("grp.toastBulkGrouped", { n: ok, group: next }), "ok");
-      else toast(t("grp.toastBulkUngrouped", { n: ok }));
-      await refresh(); render();
-    });
-  },
-
   /** 刷新额度（顺带按节流刷新领取资格）；再点一次 = 停止 */
   async refreshAll(quotaOnly) {
     if (quotaSweep.running) {
@@ -1021,31 +983,6 @@ const actions = {
       render();
       if (state?.auto_switch) autoSwitchTick(true);
     }
-  },
-
-  setGroup(id) {
-    const a = state?.accounts.find((x) => x.id === id);
-    if (!a) return;
-    openGroupModal({
-      name: a.name,
-      current: acctGroup(a),
-      groups: customGroups(state?.accounts || []),
-      onPick: (g) => actions.applyGroup(id, g),
-      onCreate: (g) => actions.applyGroup(id, g),
-    });
-  },
-
-  async applyGroup(id, group) {
-    const a = state?.accounts.find((x) => x.id === id);
-    const next = String(group || "").trim();
-    if (next === acctGroup(a)) return;
-    await guard(async () => {
-      const r = await invoke("set_account_group", { id, group: next || null });
-      const applied = acctGroup(r);
-      if (applied) toast(t("grp.toastGrouped", { name: a?.name, group: applied }), "ok");
-      else toast(t("grp.toastUngrouped", { name: a?.name }));
-      await refresh(); render();
-    });
   },
 
   async delete(id) {
@@ -2104,13 +2041,12 @@ function render() {
         ${healthDotHtml(h)}
         ${slim ? "" : `<span class="notch" style="background:${notchColor(a.id)}"></span>`}
         <div class="row-main"${ui.density === "compact" ? ` click="actions.toggleRow(event)" title="${esc(slim ? t("list.expandTitle") : t("list.collapseTitle"))}"` : ""}>
-          <div class="row-name">${ui.density === "compact" ? `<span class="row-chev${slim ? "" : " open"}">${ic("chevDown", 12)}</span>` : ""}${tierBadgeFor(a.id)}<span class="rn-text" title="${esc(displayName)}">${esc(displayName)}</span>${groupTagHtml(a)}${isActive ? `<span class="tag-use">${t("btn.inUse")}</span>` : ""}${a.has_user_info === false ? `<span class="tag-relogin" title="${esc(t("btn.reloginTitle"))}">${t("btn.relogin")}</span>` : ""}</div>
+          <div class="row-name">${ui.density === "compact" ? `<span class="row-chev${slim ? "" : " open"}">${ic("chevDown", 12)}</span>` : ""}${tierBadgeFor(a.id)}<span class="rn-text" title="${esc(displayName)}">${esc(displayName)}</span>${isActive ? `<span class="tag-use">${t("btn.inUse")}</span>` : ""}${a.has_user_info === false ? `<span class="tag-relogin" title="${esc(t("btn.reloginTitle"))}">${t("btn.relogin")}</span>` : ""}</div>
           <div class="row-meta">${meta}</div>
         </div>
         <div class="row-info">${expSoon}${showChip ? quotaChipHtml(a.id, h) : ""}</div>
         <div class="row-actions">
           <span class="row-tools">
-            <button class="icon-btn" title="${t("btn.group")}" aria-label="${t("btn.group")}" click="actions.setGroup('${a.id}')">${ic("folder", 15)}</button>
             <button class="icon-btn" title="${t("btn.copyKey")}" aria-label="${t("btn.copyKey")}" click="actions.copyApiKey('${a.id}')">${ic("copy", 15)}</button>
             <button class="icon-btn" title="${t("btn.refreshQuota")}" aria-label="${t("btn.refreshQuota")}" click="actions.acctQuota('${a.id}')">${ic("refresh", 15)}</button>
             <button class="icon-btn" title="${t("btn.rename")}" aria-label="${t("btn.rename")}" click="actions.rename('${a.id}')">${ic("pen", 15)}</button>
@@ -2333,27 +2269,45 @@ async function autoSwitchTick(manual = false) {
   if (!(s.accounts || []).length) return;
   if (quotaSweep.running || refreshClaim.running || claimAllRunning || autoClaimRunning || claimActive) return;
   // 手动刷新是显式触发，跳过冷却；定时巡检仍受冷却约束，避免来回切换
-  if (!manual && Date.now() - lastAutoSwitchAt < AUTO_SWITCH_COOLDOWN_MS) return;
   const active = s.accounts.find((a) => a.is_active);
   if (!active) return;
   const hm = healthMapOf();
   const cur = hm.get(active.id);
-  const thr = Number(s.auto_switch_threshold ?? 10);
   if (!cur || cur.remainingPct == null) return;
-  if (cur.remainingPct > thr) return;
-  const cands = s.accounts
+  const thr = Number(s.auto_switch_threshold ?? 10);
+
+  // 候选池：其它账号中判定额度 > 阈值 且 非鉴权失效/查询失败
+  const pool = s.accounts
     .filter((a) => a.id !== active.id)
     .map((a) => ({ a, h: hm.get(a.id) }))
-    // 鉴权失效/查询失败的账号不可作为切换目标（auth 可能带旧数据，需显式排除）
     .filter((x) => x.h && x.h.level !== "auth" && x.h.level !== "fail")
     .filter((x) => x.h?.remainingPct != null && x.h.remainingPct > thr);
-  // 关注模型时，优先在「确实还有关注模型额度」的账号里挑。
-  // 流转账号的 modelMatched 来自其它模型（如 GLM-5.3），必须排除——
-  // 否则 Flash 耗尽但 5.3 满额的账号会抢在真有关注模型额度的账号前面。
-  const withModel = cands.filter((x) => x.h.modelMatched && !x.h.fallback);
+  // 关注模型仍有额度的账号优先；流转账号（判定来自其它模型）只做兜底
+  const focusCands = pool.filter((x) => x.h.modelMatched && !x.h.fallback);
+  const flowCands = pool.filter((x) => x.h.fallback);
+
+  // 触发判定：
+  // - 当前账号非流转：判定额度 ≤ 阈值 → 触发
+  // - 当前账号已流转（关注模型在所有套餐耗尽，判定来自其它模型）：
+  //     其它账号还有关注模型额度 → 立即触发（Flash 优先，不能赖在 5.3 上）
+  //     否则当前账号的流转判定额度 ≤ 阈值（5.3 也快没了）→ 触发
+  const focusCandExists = focusCands.length > 0;
+  const shouldSwitch = cur.fallback
+    ? (focusCandExists || cur.remainingPct <= thr)
+    : cur.remainingPct <= thr;
+  if (!shouldSwitch) return;
+
+  // 冷却豁免：紧急情况（当前账号关注模型已耗尽且有关注模型候选）不受 5 分钟冷却限制，
+  // 否则刚切过去的号 Flash 烧完后要干等 5 分钟
+  const emergency = cur.fallback && focusCandExists;
+  if (!manual && !emergency && Date.now() - lastAutoSwitchAt < AUTO_SWITCH_COOLDOWN_MS) return;
+
+  // 目标池：关注模型候选优先；关注模型全面耗尽时才轮到流转候选
+  const targetPool = focusCandExists ? focusCands : flowCands;
+  if (!targetPool.length) return;
   // 候选排序：额度高者优先；礼物/套餐临期的账号再插队，尽快把赠送额度用掉
   const giftSoon = (a) => (acctQuota[a.id]?.data?.plans || []).some((p) => expireInfo(p.expire)?.warn);
-  const best = (withModel.length ? withModel : cands)
+  const best = targetPool
     .map((x) => ({ ...x, gift: giftSoon(x.a) ? 1 : 0 }))
     .sort((x, y) => (y.gift - x.gift) || (y.h.remainingPct - x.h.remainingPct))[0];
   if (!best) return;

@@ -137,6 +137,7 @@ export const en = {
   "grp.viewLabel": "Account list view",
   "grp.health.ok": "Quota available",
   "grp.health.low": "Quota low",
+  "grp.health.flowed": "Focus model exhausted",
   "grp.health.dead": "Quota exhausted",
   "grp.health.auth": "Re-login needed",
   "grp.health.fail": "Quota query failed",

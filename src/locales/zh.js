@@ -137,6 +137,7 @@ export const zh = {
   "grp.viewLabel": "账号列表视图",
   "grp.health.ok": "额度充足",
   "grp.health.low": "额度紧张",
+  "grp.health.flowed": "关注模型耗尽",
   "grp.health.dead": "额度耗尽",
   "grp.health.auth": "需重新登录",
   "grp.health.fail": "额度查询失败",

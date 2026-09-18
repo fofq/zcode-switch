@@ -2,7 +2,7 @@
 // 不依赖 DOM，便于单独测试。
 
 /** 健康度分级（也是列表里的展示顺序，越靠前越"可用"） */
-export const HEALTH_ORDER = ["ok", "low", "dead", "auth", "fail", "unknown"];
+export const HEALTH_ORDER = ["ok", "low", "flowed", "dead", "auth", "fail", "unknown"];
 
 /** 剩余额度低于该百分比视为"紧张" */
 export const LOW_THRESHOLD = 20;
@@ -118,6 +118,7 @@ export function modelRemainingPctDetailed(q, model) {
 /** 流转用：关注模型之外、剩余额度最高的其它模型（仅统计额度池/模型条目） */
 export function bestOtherModel(q, model) {
   const key = String(model || "").trim().toLowerCase();
+  if (!key) return null; // 未设置关注模型时不流转
   const d = q?.data;
   if (!d) return null;
   const best = new Map();
@@ -156,6 +157,8 @@ export function healthOf(acct, quota, isAuthErr, model, opts = {}) {
   let mp = modelRemainingPct(quota, model);
   let modelName = mp != null ? (model || null) : null;
   let fallback = false;
+  // 额度紧张的分界 = 用户的自动切换阈值（分组与切换行为一致），未传时用 20
+  const thr = Number(opts.threshold ?? LOW_THRESHOLD);
   // 礼物优先：礼物套餐还有额度就只看礼物套餐；全部用尽才回落常规套餐。
   // 若两个类别在套餐层都匹配不上（数据命名差异），保留原有的全源判定不被破坏。
   if (mp != null && opts.giftFirst) {
@@ -164,8 +167,9 @@ export function healthOf(acct, quota, isAuthErr, model, opts = {}) {
       mp = det.gift != null && det.gift > 0 ? det.gift : (det.regular != null ? det.regular : det.gift);
     }
   }
-  // 流转：关注模型在所有套餐里都耗尽时，改用其它剩余最高的模型参与判定
-  if (opts.modelFallback && (mp == null || mp <= 0)) {
+  // 流转：关注模型在所有套餐里都耗尽时，改用其它剩余最高的模型参与判定。
+  // 未设置关注模型时不流转（否则所有账号都会被误判成“关注模型耗尽”）。
+  if (opts.modelFallback && model && (mp == null || mp <= 0)) {
     const alt = bestOtherModel(quota, model);
     if (alt && alt.pct > 0) {
       mp = alt.pct;
@@ -179,9 +183,9 @@ export function healthOf(acct, quota, isAuthErr, model, opts = {}) {
     return { level: "auth", remainingPct: pct, modelMatched: mp != null, modelName, fallback };
   }
   if (pct != null) {
-    if (pct <= 0) return { level: "dead", remainingPct: 0, modelMatched: mp != null, modelName, fallback };
-    if (pct <= LOW_THRESHOLD) return { level: "low", remainingPct: pct, modelMatched: mp != null, modelName, fallback };
-    return { level: "ok", remainingPct: pct, modelMatched: mp != null, modelName, fallback };
+    // 流转账号单独一档：关注模型已耗尽但其它模型仍可用，组名直接表达主状态
+    const lv = fallback ? "flowed" : pct <= 0 ? "dead" : pct <= thr ? "low" : "ok";
+    return { level: lv, remainingPct: pct <= 0 ? 0 : pct, modelMatched: mp != null, modelName, fallback };
   }
   // 没有任何额度数据时才用错误/回退信号（避免刷新失败把账号闪进失败分组）
   if (quota?.err) return { level: "fail", remainingPct: null, modelMatched: false, modelName: null, fallback: false };
@@ -267,38 +271,32 @@ export function sortAccounts(accounts, sort, healthMap, localeTag = "zh-CN", opt
 }
 
 /**
- * 分组：自定义分组优先，未分组的按健康度分桶。
- * 返回 [{ key, label, kind: 'group'|'health', items: [] }]，顺序：
- *   自定义分组（按名称） → 健康度桶（HEALTH_ORDER）
+ * 分组：按健康度分桶（自定义分组已移除）。
+ * 返回 [{ key, label, kind: 'health', items: [] }]，顺序按 HEALTH_ORDER。
  */
 export function bucketAccounts(accounts, { localeTag = "zh-CN", healthLabel = () => "" } = {}, healthMap) {
   const buckets = new Map();
   for (const a of accounts) {
-    const g = String(a.group || "").trim();
     const h = healthMap?.get(a.id)?.level || "unknown";
-    const key = g ? `g:${g}` : `h:${h}`;
+    const key = `h:${h}`;
     if (!buckets.has(key)) {
       buckets.set(key, {
         key,
-        label: g || healthLabel(h),
-        kind: g ? "group" : "health",
+        label: healthLabel(h),
+        kind: "health",
         items: [],
       });
     }
     buckets.get(key).items.push(a);
   }
-  const custom = [...buckets.values()]
-    .filter((b) => b.kind === "group")
-    .sort((x, y) => x.label.localeCompare(y.label, localeTag, { sensitivity: "base" }));
-  const health = HEALTH_ORDER.map((lv) => buckets.get(`h:${lv}`)).filter(Boolean);
-  return [...custom, ...health];
+  return HEALTH_ORDER.map((lv) => buckets.get(`h:${lv}`)).filter(Boolean);
 }
 
 /**
  * 合计：各健康度计数 + 平均剩余额度百分比（仅统计已拿到额度的账号，单位无关）。
  */
 export function summarize(accounts, healthMap) {
-  const counts = { ok: 0, low: 0, dead: 0, auth: 0, fail: 0, unknown: 0 };
+  const counts = { ok: 0, low: 0, flowed: 0, dead: 0, auth: 0, fail: 0, unknown: 0 };
   let pctSum = 0;
   let pctCount = 0;
   for (const a of accounts || []) {
