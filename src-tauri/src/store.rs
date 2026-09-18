@@ -92,6 +92,11 @@ pub struct Account {
     pub virtual_arms_uid: Option<String>,
     #[serde(default)]
     pub group: Option<String>,
+    /// 本账号自己铸造的 z.ai/bigmodel 平台 API Key（`apiKey.secretKey`，49 位）。
+    /// config.json 里的 coding-plan key 会在切号时残留成别的账号的 key，不可信；
+    /// 这里存的是用本账号 access_token 找官方接口要到的，属于该账号本人。
+    #[serde(default)]
+    pub api_key: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
@@ -628,6 +633,7 @@ pub fn capture_current(paths: &Paths, name: Option<String>) -> Result<Account, S
         virtual_device_mid: None,
         virtual_arms_uid: None,
         group: None,
+        api_key: None,
     };
     adopt_virtual_device_mid(paths, &mut acc)?;
     adopt_virtual_arms_uid(paths, &mut acc)?;
@@ -672,6 +678,7 @@ fn auto_preserve(paths: &Paths, accounts: &[Account], target_hash: &str) -> Resu
         virtual_device_mid: None,
         virtual_arms_uid: None,
         group: None,
+        api_key: None,
     };
     adopt_virtual_device_mid(paths, &mut acc)?;
     adopt_virtual_arms_uid(paths, &mut acc)?;
@@ -1167,76 +1174,30 @@ pub struct ApiKeyInfo {
     pub kind: String,
 }
 
-/// 供"复制 API Key"和 2API 使用：从账号快照里解析可用的 (apiKey, baseURL)。
-/// 优先 enabled 的 coding-plan 条目，其次其它 anthropic 条目，最后回退 start-plan JWT。
-fn decrypt_opt(v: &str, home: &std::path::Path) -> Option<String> {
-    if zcrypto::is_encrypted(v) {
-        zcrypto::decrypt_with_secret(v, &zcrypto::default_secret(home)).ok()
-    } else {
-        Some(v.to_string())
-    }
+/// 账号家族：zai / bigmodel，未知时按 zai 处理（新客户端默认）。
+fn account_family(acc: &Account, home: &std::path::Path) -> String {
+    cred_plain(&acc.credentials, "oauth:active_provider", home)
+        .filter(|p| p == "bigmodel" || p == "zai")
+        .unwrap_or_else(|| "zai".into())
 }
 
-/// 纯本地解析：账号 config 快照里的 coding-plan key，回退 start-plan JWT。不发网络请求。
+/// 纯本地解析：只认本账号自己铸造并存下来的平台 key，回退 start-plan JWT。不发网络请求。
+///
+/// 这里**刻意不再读 config.json 的 coding-plan key**：那个字段是 zcode 写给"当前登录账号"的，
+/// 切号时若上一个账号留下的 key 非空，`rematerialize_wiped_builtins` 不会覆盖它，
+/// 于是 `sync_live_back_to_source` 会把别人的 key 抄进本账号快照。
+/// 实测 11 个账号共用同一把 key，复制出来自然在自己的控制台查不到、也调不通。
 fn local_api_key(acc: &Account, home: &std::path::Path) -> Option<ApiKeyInfo> {
-    if let Some(cfg) = acc.config.as_ref() {
-        if let Some(providers) = cfg.get("provider").and_then(|p| p.as_object()) {
-            // 只认 zcode 官方 builtin 条目：用户自定义的第三方 openai-compatible 条目
-            // （sk- 中转 key）不能作为账号的 z.ai API Key，否则复制/2API 都会拿到无效 key
-            let mut scored: Vec<(u32, &String, &Value)> = providers
-                .iter()
-                .filter(|(pid, _)| pid.starts_with("builtin:"))
-                .map(|(pid, p)| {
-                    let enabled = p.get("enabled").and_then(|e| e.as_bool()).unwrap_or(false);
-                    let is_plan = !pid.contains("coding-plan");
-                    let key = p
-                        .get("options")
-                        .and_then(|o| o.get("apiKey"))
-                        .and_then(|k| k.as_str())
-                        .unwrap_or("");
-                    let has_key = key.len() > 20;
-                    (
-                        u32::from(!enabled) * 4 + u32::from(is_plan) * 2 + u32::from(!has_key),
-                        pid,
-                        p,
-                    )
-                })
-                .collect();
-            scored.sort_by_key(|(s, _, _)| *s);
-            for (_, pid, p) in scored {
-                let key = p
-                    .get("options")
-                    .and_then(|o| o.get("apiKey"))
-                    .and_then(|k| k.as_str())
-                    .and_then(|k| decrypt_opt(k, home))
-                    .unwrap_or_default();
-                if key.trim().len() <= 20 {
-                    continue;
-                }
-                let base = p
-                    .get("options")
-                    .and_then(|o| o.get("baseURL"))
-                    .and_then(|b| b.as_str())
-                    .unwrap_or("");
-                if base.is_empty() {
-                    continue;
-                }
-                let label = p
-                    .get("name")
-                    .and_then(|n| n.as_str())
-                    .unwrap_or(pid.as_str());
-                let provider = if pid.contains("zai") { "zai" } else { "bigmodel" };
-                // start-plan 条目存的是 JWT，只对 coding endpoint 有效，不能进 paas/v4 key 池
-                let kind = if pid.contains("start-plan") { "jwt" } else { "plan" };
-                return Some(ApiKeyInfo {
-                    label: label.to_string(),
-                    api_key: key.trim().to_string(),
-                    base_url: base.to_string(),
-                    provider: provider.into(),
-                    kind: kind.into(),
-                });
-            }
-        }
+    if let Some(key) = acc.api_key.as_deref().map(str::trim).filter(|k| k.len() > 20) {
+        let provider = account_family(acc, home);
+        let base = if provider == "zai" { oauth::ZAI_ANTHROPIC_BASE } else { oauth::BIGMODEL_ANTHROPIC_BASE };
+        return Some(ApiKeyInfo {
+            label: "Coding Plan".into(),
+            api_key: key.to_string(),
+            base_url: base.into(),
+            provider,
+            kind: "plan".into(),
+        });
     }
     if let Some(jwt) = cred_plain(&acc.credentials, "zcodejwttoken", home) {
         if jwt.trim().len() > 20 {
@@ -1255,40 +1216,59 @@ fn local_api_key(acc: &Account, home: &std::path::Path) -> Option<ApiKeyInfo> {
     None
 }
 
+/// 用本账号的 access_token 去官方 biz 接口铸一把属于它自己的平台 API Key，并存进账号快照。
+///
+/// 走的就是 zcode 登录时那套接口（getCustomerInfo → organization/projects → api_keys → copy），
+/// 但**直接用 access_token 当 Authorization**：`POST /api/auth/z/login` 实测对所有账号都回
+/// 500「Z.ai user information is invalid」，走它等于永远铸不出来。
+pub fn mint_account_api_key(paths: &Paths, id: &str) -> Result<Option<String>, String> {
+    let acc = load_account(paths, id)?;
+    let (creds, _) = effective_snapshot(paths, &acc);
+    let provider = cred_plain(&creds, "oauth:active_provider", &paths.home)
+        .filter(|p| p == "bigmodel" || p == "zai")
+        .unwrap_or_else(|| "zai".into());
+    let access = cred_plain(&creds, &format!("oauth:{provider}:access_token"), &paths.home)
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| tr("err.key.no_access_token"))?;
+
+    let key = match provider.as_str() {
+        "zai" => oauth::resolve_biz_api_key(oauth::ZAI_API_BASE, &format!("Bearer {access}"), true),
+        _ => oauth::resolve_biz_api_key(oauth::BIGMODEL_BIZ_BASE, &access, false),
+    }
+    .map(|k| k.trim().to_string())
+    .filter(|k| k.len() > 20);
+
+    let Some(key) = key else { return Ok(None) };
+    let mut acc = load_account(paths, id)?;
+    if acc.api_key.as_deref() != Some(key.as_str()) {
+        acc.api_key = Some(key.clone());
+        acc.updated_at = now_ts();
+        save_account(paths, &acc)?;
+    }
+    Ok(Some(key))
+}
+
 pub fn account_api_key(paths: &Paths, id: &str) -> Result<Option<ApiKeyInfo>, String> {
     let acc = load_account(paths, id)?;
     // 激活账号优先用 live 凭据（zcode 轮换 JWT 后快照里的会过期）
     let (creds, config) = effective_snapshot(paths, &acc);
     let acc_eff = Account { credentials: creds, config, ..acc };
-    if let Some(info) = local_api_key(&acc_eff, &paths.home) {
-        return Ok(Some(info));
-    }
-    // 配置快照里没有现成 key：像登录/热切换那样现场解析（上游会自动创建 zcode-api-key）
-    let provider = cred_plain(&acc_eff.credentials, "oauth:active_provider", &paths.home)
-        .filter(|p| p == "bigmodel" || p == "zai");
-    if let Some(provider) = provider {
-        let access = cred_plain(
-            &acc_eff.credentials,
-            &format!("oauth:{provider}:access_token"),
-            &paths.home,
-        ).unwrap_or_default();
-        let key = match provider.as_str() {
-            "zai" => oauth::resolve_zai_business_token(&access)
-                .and_then(|biz| oauth::resolve_biz_api_key(oauth::ZAI_API_BASE, &format!("Bearer {biz}"), true)),
-            _ => oauth::resolve_biz_api_key(oauth::BIGMODEL_BIZ_BASE, &access, false),
-        };
-        if let Some(key) = key.filter(|k| k.trim().len() > 20) {
+    // 已有本账号自己的 key 就直接用；否则现场铸一把（网络调用，调用方须在阻塞线程里）
+    if acc_eff.api_key.as_deref().map(str::trim).map(|k| k.len() > 20) != Some(true) {
+        if let Ok(Some(key)) = mint_account_api_key(paths, id) {
+            let provider = account_family(&acc_eff, &paths.home);
             let base = if provider == "zai" { oauth::ZAI_ANTHROPIC_BASE } else { oauth::BIGMODEL_ANTHROPIC_BASE };
             return Ok(Some(ApiKeyInfo {
                 label: "Coding Plan".into(),
-                api_key: key.trim().to_string(),
+                api_key: key,
                 base_url: base.into(),
-                provider: provider.clone(),
+                provider,
                 kind: "plan".into(),
             }));
         }
     }
-    Ok(None)
+    Ok(local_api_key(&acc_eff, &paths.home))
 }
 
 #[derive(serde::Serialize, Clone, Debug)]
@@ -1697,6 +1677,7 @@ pub fn import_values(paths: &Paths, files: &[(String, Value)]) -> Result<ImportR
                 virtual_device_mid: None,
                 virtual_arms_uid: None,
                 group,
+                api_key: None,
             };
             new_accounts.push(acc);
             report.added.push(name);

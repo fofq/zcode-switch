@@ -371,6 +371,20 @@ fn http_get_json(url: &str, token: &str, retry_429: bool) -> Result<Value, Strin
                     if v.get("code").and_then(|c| c.as_i64()) == Some(401) {
                         return Err(crate::i18n::coded("token_biz401", "err.token.biz401", &[]));
                     }
+                    // 3012 = 短时间内查询过多被风控拦截，和 429 同类：可重试，
+                    // 绝不能当成“该账号无套餐/凭据失效”
+                    if is_blocked(&v) {
+                        match backoff.next() {
+                            Some(d) => {
+                                last_err = Some(crate::i18n::coded("quota_blocked", "err.quota.blocked", &[]));
+                                sleep(Duration::from_millis(*d));
+                                continue;
+                            }
+                            None => {
+                                return Err(crate::i18n::coded("quota_blocked", "err.quota.blocked", &[]))
+                            }
+                        }
+                    }
                 }
                 if code == 429 {
                     match backoff.next() {
@@ -494,6 +508,26 @@ fn is_no_plan_message(msg: &str) -> bool {
     msg.contains("不存在coding plan") || msg.contains("没有资格")
 }
 
+/// 上游风控：短时间内集中刷额度会触发 code 3012
+/// 「request has been blocked due to unusual activity」，属于临时限流，
+/// 必须与「无套餐」区分开，否则账号会被误判成没套餐而从自动切换候选池里除名。
+fn is_blocked(v: &Value) -> bool {
+    let code = v.get("code").and_then(|c| c.as_i64());
+    let msg = ["msg", "message", "error"]
+        .iter()
+        .find_map(|k| v.get(k).and_then(|x| x.as_str()))
+        .unwrap_or_default();
+    code == Some(3012) || msg.contains("unusual activity")
+}
+
+/// 鉴权失败/限流等“硬错误”：不能被另一频道的“无套餐”结论掩盖。
+fn is_hard_err(e: &str) -> bool {
+    matches!(
+        crate::i18n::code_of(e),
+        Some("token_biz401") | Some("token_http401") | Some("token_expired") | Some("quota_blocked")
+    ) || e.contains("429")
+}
+
 pub(crate) fn zai_billing_token(creds: &Value, config: Option<&Value>, secret: &str) -> Option<String> {
     let jwt = safe_decrypt(creds.get("zcodejwttoken").and_then(|v| v.as_str()), secret);
     let active = safe_decrypt(
@@ -558,6 +592,12 @@ fn pick_channels(creds: &Value, config: Option<&Value>, secret: &str) -> Vec<Cha
                 }
             }
         } else if id.contains("coding-plan") {
+            // Monitor 频道打的是 open.bigmodel.cn，只能用 bigmodel 家族的 key。
+            // 把 zai 家族的 key 送过去，上游一律回「当前用户不存在coding plan」，
+            // 这个假信号会把同批 ZaiBilling 频道的真实错误盖成「无套餐」。
+            if id.starts_with("builtin:zai") {
+                continue;
+            }
             if let Some(k) = key {
                 if !chans.contains(&Channel::Monitor(k.clone())) {
                     chans.push(Channel::Monitor(k));
@@ -579,6 +619,9 @@ fn no_plan_overview() -> QuotaOverview {
 
 fn query_channels_via(channels: &[Channel], fetch: &FetchFn) -> Result<QuotaOverview, String> {
     let mut best_err: Option<String> = None;
+    // 鉴权失败/被限流属于“硬错误”：即使另一个频道回了“无套餐”，也不能当成无套餐，
+    // 否则 JWT 过期的账号会显示成 0 套餐、被自动切换的候选池永久除名。
+    let mut hard_err: Option<String> = None;
     let mut saw_no_plan = false;
     let mut parts: Vec<QuotaOverview> = vec![];
     for ch in channels {
@@ -596,7 +639,9 @@ fn query_channels_via(channels: &[Channel], fetch: &FetchFn) -> Result<QuotaOver
                             .iter()
                             .find_map(|k| resp.get(k).and_then(|x| x.as_str()).map(String::from))
                             .unwrap_or_default();
-                        if is_no_plan_message(&msg) {
+                        if is_blocked(&resp) && hard_err.is_none() {
+                            hard_err = Some(crate::i18n::coded("quota_blocked", "err.quota.blocked", &[]));
+                        } else if is_no_plan_message(&msg) {
                             saw_no_plan = true;
                         } else if best_err.is_none() {
                             let code = resp.get("code").and_then(|c| c.as_i64()).unwrap_or(0);
@@ -605,6 +650,9 @@ fn query_channels_via(channels: &[Channel], fetch: &FetchFn) -> Result<QuotaOver
                     }
                 }
                 Err(e) => {
+                    if is_hard_err(&e) && hard_err.is_none() {
+                        hard_err = Some(e.clone());
+                    }
                     if best_err.is_none() {
                         best_err = Some(e);
                     }
@@ -625,16 +673,23 @@ fn query_channels_via(channels: &[Channel], fetch: &FetchFn) -> Result<QuotaOver
                         }
                     }
                     Ok(resp) => {
+                        let msg = ["msg", "message", "error"]
+                            .iter()
+                            .find_map(|k| resp.get(k).and_then(|x| x.as_str()).map(String::from))
+                            .unwrap_or_default();
+                        let code = resp.get("code").and_then(|c| c.as_i64()).unwrap_or(0);
+                        let e = crate::i18n::trf("err.quota.biz", &[("code", &code.to_string()), ("msg", &msg)]);
+                        if is_blocked(&resp) && hard_err.is_none() {
+                            hard_err = Some(crate::i18n::coded("quota_blocked", "err.quota.blocked", &[]));
+                        }
                         if best_err.is_none() {
-                            let msg = ["msg", "message", "error"]
-                                .iter()
-                                .find_map(|k| resp.get(k).and_then(|x| x.as_str()).map(String::from))
-                                .unwrap_or_default();
-                            let code = resp.get("code").and_then(|c| c.as_i64()).unwrap_or(0);
-                            best_err = Some(crate::i18n::trf("err.quota.biz", &[("code", &code.to_string()), ("msg", &msg)]));
+                            best_err = Some(e);
                         }
                     }
                     Err(e) => {
+                        if is_hard_err(&e) && hard_err.is_none() {
+                            hard_err = Some(e.clone());
+                        }
                         if best_err.is_none() {
                             best_err = Some(e);
                         }
@@ -644,6 +699,10 @@ fn query_channels_via(channels: &[Channel], fetch: &FetchFn) -> Result<QuotaOver
         }
     }
     if parts.is_empty() {
+        // 硬错误优先于“无套餐”：token 失效/被限流时必须报错，让前端显示需重新登录
+        if let Some(e) = hard_err {
+            return Err(e);
+        }
         if saw_no_plan {
             return Ok(no_plan_overview());
         }

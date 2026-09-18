@@ -216,7 +216,10 @@ async fn get_account_quota(id: String) -> Result<quota::QuotaOverview, String> {
 
 #[tauri::command]
 async fn account_api_key(id: String) -> Result<Option<store::ApiKeyInfo>, String> {
-    store::account_api_key(&Paths::detect(), &id)
+    // 无自有 key 时会现场铸 key（网络请求），必须放阻塞线程避免卡 UI
+    tauri::async_runtime::spawn_blocking(move || store::account_api_key(&Paths::detect(), &id))
+        .await
+        .map_err(|e| format!("内部任务失败: {e}"))?
 }
 
 #[tauri::command]
@@ -803,6 +806,7 @@ fn persist_oauth_account(
         virtual_device_mid: Some(mid.to_string()),
         virtual_arms_uid: Some(store::new_arms_uid()),
         group: None,
+        api_key: None,
     };
     if !flow_still_ours() {
         return Err("__superseded__".into());
