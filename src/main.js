@@ -710,14 +710,21 @@ function quotaHeadChipHtml(tot) {
   return `<button class="qh-chip${ui.qhOpen ? " on" : ""}" data-qh-chip title="${esc(t("list.qhTitle"))}" click="actions.toggleQhDetail()">${esc(t("list.qhBtn"))}</button>`;
 }
 
+// 模型专属颜色：按模型名稳定散列取色（标题/Tab 标识用，不参与额度状态色）
+const MODEL_COLORS = ["#e8a33d", "#6aa9e0", "#b48be8", "#e08aa0", "#62c370"];
+function modelColor(name) {
+  let h = 0;
+  for (let i = 0; i < String(name).length; i++) h = (h * 31 + String(name).charCodeAt(i)) >>> 0;
+  return MODEL_COLORS[h % MODEL_COLORS.length];
+}
+
 function quotaPanelHtml(tot) {
   if (!ui.qhOpen || !tot) return "";
   // Tab 切换模型：账号多时不用滚动很久才能看到另一个模型
   const activeTab = tot.models.some((x) => x.name === ui.qhTab) ? ui.qhTab : (tot.focus?.name || tot.models[0]?.name || "");
   const tabs = tot.models.map((m) => {
     const on = m.name === activeTab;
-    const isFocus = tot.focus && m === tot.focus;
-    return `<button class="qhd-tab${on ? " on" : ""}${isFocus ? " focus" : ""}" click="actions.setQhTab('${esc(m.name)}')">${esc(m.name)}${isFocus ? `<span class="qh-tag">${t("list.qhFocusTag")}</span>` : ""}</button>`;
+    return `<button class="qhd-tab${on ? " on" : ""}" style="color:${modelColor(m.name)}" click="actions.setQhTab('${esc(m.name)}')">${esc(m.name)}</button>`;
   }).join("");
   let body = "";
   const x = tot.models.find((m) => m.name === activeTab);
@@ -725,15 +732,20 @@ function quotaPanelHtml(tot) {
     const pct = x.total > 0 ? Math.max(0, Math.min(100, Math.round((1 - x.remaining / x.total) * 100))) : 0;
     const rows = x.sources.map((src) => {
       const w = src.total > 0 ? Math.max(0, Math.min(100, Math.round((1 - src.remaining / src.total) * 100))) : 0;
+      const bar = w <= 0
+        ? `<i style="width:100%;background:${BAR_GREEN}"></i>`
+        : w >= 100
+          ? `<i style="width:100%;background:${BAR_RED}"></i>`
+          : `<i style="width:${w}%;background:${BAR_RED}"></i><i style="width:${100 - w}%;background:${BAR_YELLOW}"></i>`;
       return `<div class="qhd-row">
         <span class="qhd-acct" title="${esc(src.account)}">${esc(src.account)}</span>
         <span class="qhd-num">${esc(fmtTokens(src.remaining))}/${esc(fmtTokens(src.total))}</span>
-        <span class="qhd-bar"><i style="width:${w}%"></i></span>
+        <span class="qhd-bar">${bar}</span>
         <span class="qhd-pct">${w}%</span>
       </div>`;
     }).join("");
     body = `<div class="qhd-sec-head">
-        <span class="qhd-model">${esc(x.name)}</span>
+        <span class="qhd-model" style="color:${modelColor(x.name)}">${esc(x.name)}</span>
         <span class="qhd-sum">${esc(fmtTokens(x.remaining))}/${esc(fmtTokens(x.total))} · ${pct}%</span>
       </div>
       <div class="qhd-thead"><span>${t("list.qhColAcct")}</span><span>${t("list.qhColLeft")}</span><span></span><span>${t("list.qhColUsed")}</span></div>
@@ -1899,13 +1911,19 @@ async function autoClaimTick() {
   }
 }
 
+// 额度状态色：没用过=绿、用尽=红、部分使用=红(已用)+黄(剩余) 双色
+const BAR_GREEN = "#62c370", BAR_RED = "#e0566a", BAR_YELLOW = "#e6c84a";
+
 function quotaBarHtml(pct) {
   const used = pct == null ? null : Math.min(100, Math.max(0, pct));
-  const remaining = used == null ? null : 100 - used;
-  const danger = used != null && used >= 90 ? " danger" : used != null && used >= 70 ? " warn" : "";
-  const txt = remaining == null ? "--" : remaining.toFixed(0) + "%";
-  const txtCls = (remaining ?? 100) >= 58 ? " in-fill" : "";
-  return `<div class="qbar${danger}"><div class="qbar-fill" style="width:${remaining ?? 100}%"></div><span class="qbar-pct${txtCls}">${txt}</span></div>`;
+  const txt = used == null ? "--" : used.toFixed(0) + "%";
+  let body = "";
+  if (used != null) {
+    if (used <= 0) body = `<span class="qb-seg" style="width:100%;background:${BAR_GREEN}"></span>`;
+    else if (used >= 100) body = `<span class="qb-seg" style="width:100%;background:${BAR_RED}"></span>`;
+    else body = `<span class="qb-seg" style="width:${used}%;background:${BAR_RED}"></span><span class="qb-seg" style="width:${100 - used}%;background:${BAR_YELLOW}"></span>`;
+  }
+  return `<div class="qbar">${body}<span class="qbar-pct in-fill">${txt}</span></div>`;
 }
 
 function itemKind(it) {
@@ -2207,6 +2225,8 @@ function closeQuotaModal() {
 
 function openQuotaModal() {
   closeQuotaModal();
+  // 防御：清掉任何残留面板，保证全局只有一个实例
+  document.querySelectorAll(".qh-panel").forEach((n) => n.remove());
   ui.qhOpen = true;
   const mask = document.createElement("div");
   mask.className = "st-mask pv-mask";
@@ -2221,6 +2241,7 @@ function openQuotaModal() {
 
 /** 面板打开期间的局部刷新：重建面板内容但保持滚动位置（Tab 切换 / 额度数据更新共用） */
 function refreshQuotaModal() {
+  if (!ui.qhOpen) { closeQuotaModal(); return; }
   const pop = document.querySelector("[data-qh-pop]");
   if (!pop) return;
   const sc = pop.querySelector("[data-qh-scroll]");
