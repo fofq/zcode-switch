@@ -703,10 +703,12 @@ function quotaTotals() {
 
 function quotaHeadChipHtml(tot) {
   if (!tot || !tot.accounts) return "";
-  const parts = [];
-  if (tot.focus) parts.push(`${t("list.qhFocus")} ${fmtTokens(tot.focus.remaining)}/${fmtTokens(tot.focus.total)}`);
-  parts.push(`${t("list.qhAll")} ${fmtTokens(tot.all.remaining)}/${fmtTokens(tot.all.total)}`);
-  return `<button class="qh-chip${ui.qhOpen ? " on" : ""}" data-qh-chip title="${esc(t("list.qhTitle"))}" click="actions.toggleQhDetail()">${esc(parts.join(" · "))}</button>`;
+  // 不用文字标注“关注”：第一对数字用琥珀色即关注模型，灰色为全部模型；tabular-nums 稳定宽度
+  const focus = tot.focus
+    ? `<span class="qh-pair focus" title="${esc(t("list.qhFocus"))}">${esc(fmtTokens(tot.focus.remaining))}/${esc(fmtTokens(tot.focus.total))}</span>`
+    : "";
+  const all = `<span class="qh-pair" title="${esc(t("list.qhAll"))}">${esc(fmtTokens(tot.all.remaining))}/${esc(fmtTokens(tot.all.total))}</span>`;
+  return `<button class="qh-chip${ui.qhOpen ? " on" : ""}" data-qh-chip title="${esc(t("list.qhTitle"))}" click="actions.toggleQhDetail()">${focus}${focus && all ? `<span class="qh-dot">·</span>` : ""}${all}</button>`;
 }
 
 function quotaHeadPopHtml(tot) {
@@ -1127,7 +1129,10 @@ const actions = {
       // force=true：目标已是活跃账号也重新落盘应用（等效对当前账号重启 ZCode）
       const r = await invoke("switch_to", { id, force: true, restart: true, hot: false });
       if (r.already_active) {
-        toast(t("m.toastAlready", { name: r.name }), "ok");
+        const bits = [];
+        if (r.killed) bits.push(t("m.bitKilled"));
+        if (r.launched) bits.push(t("m.bitLaunched"));
+        toast(t("m.toastAlready", { name: r.name }), "ok", bits.join(t("common.listSep")));
         return;
       }
       const bits = [];
@@ -2123,6 +2128,7 @@ function restoreScroll(cap) {
 
 let lastRenderSig = "";
 let lastQuotaSig = "";
+let lastProgressSig = "";
 function renderQuotaSig() {
   // 额度数据用轻量摘要（busy/错误/refreshed_at），避免每次渲染全量序列化大对象
   const qsig = Object.keys(acctQuota).map((k) => {
@@ -2135,13 +2141,63 @@ function renderQuotaSig() {
   return qsig + "" + csig;
 }
 function renderSignature() {
+  // 进度对象（批量刷新/领取计数）与 2API 用量计数不进结构签名：
+  // 它们高频变化，若混进来会把“结构未变”的判定打穿、退化回整表重建（宽度抖动元凶）
   return JSON.stringify([
-    state, autoSwitchNote, quotaSweep, refreshClaim,
-    claimAllState, twoLastStatus, [...twoUsageMap.entries()],
+    state, autoSwitchNote, twoLastStatus,
     [...ui.expanded], [...ui.selected], [...ui.collapsedSections],
     ui.search, ui.health, ui.sort, ui.density, ui.hideInfo, ui.qhOpen, renaming,
     appVer, autoSwitchRunning, autoClaimRunning, claimActive, busy,
   ]);
+}
+function renderProgressSig() {
+  return JSON.stringify([quotaSweep, refreshClaim, claimAllState, [...twoUsageMap.entries()]]);
+}
+
+function giftBtnHtml(claimableCount) {
+  return `<button class="icon-btn tb-btn tb-gift${claimAllState.running ? " running" : ""}" data-gift-btn click="actions.claimAll()" ${claimAllRunning || refreshClaim.running || autoClaimRunning ? "disabled" : ""}
+      aria-label="${t("btn.claimAll")}" title="${claimAllState.running
+        ? esc(t("btn.claimAllRunning", { done: claimAllState.done, total: claimAllState.total }))
+        : esc(t("btn.claimAllTitle"))}${claimableCount > 1 ? ` (${claimableCount})` : ""}">
+      ${ic("gift", 17)}${claimAllState.running
+        ? `<span class="tb-badge">${claimAllState.done}/${claimAllState.total}</span>`
+        : claimableCount > 1 ? `<span class="tb-badge">${claimableCount}</span>` : ""}
+    </button>`;
+}
+
+/** 进度/用量类就地补丁：批量刷新计数、礼物按钮徽标、行内 2API 用量 */
+function patchProgressDom() {
+  const replace = (sel, html) => {
+    const el = $app.querySelector(sel);
+    if (!el) return;
+    const tpl = document.createElement("template");
+    tpl.innerHTML = html.trim();
+    const node = tpl.content.firstElementChild;
+    if (node) el.replaceWith(node);
+  };
+  if ((state?.accounts || []).length) {
+    replace("[data-sweep-btn]", `<button class="icon-btn tb-btn tb-refresh${quotaSweep.running ? " running" : ""}" data-sweep-btn click="actions.refreshAll()"
+        aria-label="${t("btn.refreshAll")}" title="${esc(refreshAllTitle())}">
+        ${ic("refresh", 17)}${refreshAllBadge()}
+      </button>`);
+  }
+  const claimableCount = (state?.accounts || []).filter((a) => (claimable[a.id]?.plans || []).length > 0).length;
+  if (claimableCount > 0 || claimAllState.running) {
+    replace("[data-gift-btn]", giftBtnHtml(claimableCount));
+  }
+  for (const a of state?.accounts || []) {
+    const row = $app.querySelector(`.row[data-id="${CSS.escape(a.id)}"]`);
+    if (!row) continue;
+    const usage = twoUsageMap.get(a.id) || 0;
+    const cur = row.querySelector("[data-usage]");
+    if (!usage) { if (cur) cur.remove(); continue; }
+    const html = `<span class="row-usage" data-usage title="${esc(t("list.usageTitle"))}">${usage > 999 ? (usage / 1000).toFixed(1) + "k" : usage}</span>`;
+    if (!cur) row.insertAdjacentHTML("afterbegin", html);
+    else {
+      const wantText = usage > 999 ? (usage / 1000).toFixed(1) + "k" : String(usage);
+      if (cur.textContent !== wantText) cur.outerHTML = html;
+    }
+  }
 }
 
 /** 结构未变、仅额度数据变化时的精准补丁：只就地更新额度相关 DOM，宽度/滚动零扰动 */
@@ -2230,11 +2286,14 @@ function render(force = false) {
     }
     const sig = renderSignature();
     if (sig === lastRenderSig) {
-      // 结构没变、只有额度数据在动：不整表重建，就地补丁额度显示
+      // 结构没变、只有额度/进度/用量数据在动：不整表重建，就地补丁对应 DOM
       const qs = renderQuotaSig();
-      if (qs !== lastQuotaSig) {
+      const ps = renderProgressSig();
+      if (qs !== lastQuotaSig || ps !== lastProgressSig) {
         lastQuotaSig = qs;
+        lastProgressSig = ps;
         patchQuotaDom();
+        patchProgressDom();
       }
       return;
     }
@@ -2250,6 +2309,7 @@ function render(force = false) {
     }
     lastRenderSig = sig;
     lastQuotaSig = renderQuotaSig();
+    lastProgressSig = renderProgressSig();
   }
   const scrollCap = captureScroll();
   if (!state) {
@@ -2326,7 +2386,7 @@ function render(force = false) {
     // 2API 累计请求数（左上角小计数，0 不显示）
     const usage = twoUsageMap.get(a.id) || 0;
     const usageBadge = usage
-      ? `<span class="row-usage" title="${esc(t("list.usageTitle"))}">${usage > 999 ? (usage / 1000).toFixed(1) + "k" : usage}</span>`
+      ? `<span class="row-usage" data-usage title="${esc(t("list.usageTitle"))}">${usage > 999 ? (usage / 1000).toFixed(1) + "k" : usage}</span>`
       : "";
     return `
     <div class="row${isActive ? " active" : ""}${checked ? " picked" : ""}${slim ? " slim" : ""}" data-id="${a.id}">
@@ -2346,7 +2406,7 @@ function render(force = false) {
             <button class="icon-btn" title="${t("btn.refreshQuota")}" aria-label="${t("btn.refreshQuota")}" click="actions.acctQuota('${a.id}')">${ic("refresh", 15)}</button>
             <button class="icon-btn" title="${t("btn.rename")}" aria-label="${t("btn.rename")}" click="actions.rename('${a.id}')">${ic("pen", 15)}</button>
             <button class="icon-btn" title="${t("btn.export")}" aria-label="${t("btn.export")}" click="actions.exportOne('${a.id}')">${ic("export", 15)}</button>
-            <button class="icon-btn${isActive ? " on" : ""}" title="${t("btn.coldSwitch")}" aria-label="${t("btn.coldSwitch")}" click="actions.askColdSwitch('${a.id}')" ${isActive ? "disabled" : ""}>${ic("power", 15)}</button>
+            <button class="icon-btn${isActive ? " on" : ""}" title="${t("btn.coldSwitch")}" aria-label="${t("btn.coldSwitch")}" click="actions.askColdSwitch('${a.id}')">${ic("power", 15)}</button>
             <button class="icon-btn danger" title="${t("btn.delete")}" aria-label="${t("btn.delete")}" click="actions.delete('${a.id}')">${ic("x", 15)}</button>
           </span>
           <button class="btn-switch has-ic" click="actions.askSwitch('${a.id}')" ${isActive ? "disabled" : ""}>
@@ -2397,16 +2457,7 @@ function render(force = false) {
       </div>
       <span class="tb-sep"></span>
       <div class="tb-group">
-        ${(claimableCount > 0 || claimAllState.running)
-          ? `<button class="icon-btn tb-btn tb-gift${claimAllState.running ? " running" : ""}" click="actions.claimAll()" ${claimAllRunning || refreshClaim.running || autoClaimRunning ? "disabled" : ""}
-              aria-label="${t("btn.claimAll")}" title="${claimAllState.running
-                ? esc(t("btn.claimAllRunning", { done: claimAllState.done, total: claimAllState.total }))
-                : esc(t("btn.claimAllTitle"))}${claimableCount > 1 ? ` (${claimableCount})` : ""}">
-              ${ic("gift", 17)}${claimAllState.running
-                ? `<span class="tb-badge">${claimAllState.done}/${claimAllState.total}</span>`
-                : claimableCount > 1 ? `<span class="tb-badge">${claimableCount}</span>` : ""}
-            </button>`
-          : ""}
+        ${(claimableCount > 0 || claimAllState.running) ? giftBtnHtml(claimableCount) : ""}
         <button class="icon-btn tb-btn tb-autoclaim${s.auto_claim ? " on" : ""}${autoClaimRunning ? " running" : ""}"
           role="switch" aria-checked="${s.auto_claim}" aria-label="${t("btn.autoClaim")}"
           title="${autoPillTitle(s)}" click="actions.toggleAutoClaim()">
@@ -2418,7 +2469,7 @@ function render(force = false) {
           ${ic("bolt", 17)}
         </button>
         ${(s.accounts.length > 0)
-          ? `<button class="icon-btn tb-btn tb-refresh${quotaSweep.running ? " running" : ""}" click="actions.refreshAll()"
+          ? `<button class="icon-btn tb-btn tb-refresh${quotaSweep.running ? " running" : ""}" data-sweep-btn click="actions.refreshAll()"
               aria-label="${t("btn.refreshAll")}" title="${esc(refreshAllTitle())}">
               ${ic("refresh", 17)}${refreshAllBadge()}
             </button>`

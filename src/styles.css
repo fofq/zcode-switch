@@ -1783,3 +1783,9 @@ select.two-input { cursor: pointer; }
 .qh-num { flex: none; font-size: 12px; color: #aab0bf; font-variant-numeric: tabular-nums; }
 .qh-tag { margin-left: 6px; font-size: 10px; padding: 1px 5px; border-radius: 999px; border: 1px solid rgba(232,163,61,.4); }
 .qh-empty { font-size: 12px; color: #8a90a0; padding: 6px 0; }
+
+/* qh chip 数字对：琥珀色=关注模型，灰=全部模型；tabular-nums 稳定宽度 */
+.qh-chip { font-variant-numeric: tabular-nums; }
+.qh-pair { font-variant-numeric: tabular-nums; color: #aab0bf; }
+.qh-pair.focus { color: var(--amber); }
+.qh-dot { color: #5a5f6d; margin: 0 2px; }
