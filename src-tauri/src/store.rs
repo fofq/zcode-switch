@@ -1181,9 +1181,11 @@ fn decrypt_opt(v: &str, home: &std::path::Path) -> Option<String> {
 fn local_api_key(acc: &Account, home: &std::path::Path) -> Option<ApiKeyInfo> {
     if let Some(cfg) = acc.config.as_ref() {
         if let Some(providers) = cfg.get("provider").and_then(|p| p.as_object()) {
-            // 打分（越小越优先）：enabled 优先；coding-plan 家族优先；apiKey 非空优先
+            // 只认 zcode 官方 builtin 条目：用户自定义的第三方 openai-compatible 条目
+            // （sk- 中转 key）不能作为账号的 z.ai API Key，否则复制/2API 都会拿到无效 key
             let mut scored: Vec<(u32, &String, &Value)> = providers
                 .iter()
+                .filter(|(pid, _)| pid.starts_with("builtin:"))
                 .map(|(pid, p)| {
                     let enabled = p.get("enabled").and_then(|e| e.as_bool()).unwrap_or(false);
                     let is_plan = !pid.contains("coding-plan");
