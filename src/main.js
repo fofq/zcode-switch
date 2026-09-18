@@ -629,6 +629,7 @@ function visibleAccounts() {
   const list = sortAccounts(
     filterAccounts(state?.accounts || [], { search: ui.search, health: ui.health }, hm),
     ui.sort, hm, localeTag(),
+    { threshold: Number(state?.auto_switch_threshold ?? 10) },
   );
   return { list, hm };
 }
@@ -751,6 +752,10 @@ async function loadAcctQuota(id) {
     acctQuota[id] = { data: cur.data || null, err: stripErr(e), code: errCode(e), busy: false };
   }
   if (!uiLocked()) render();
+  // 刷新的是当前账号 → 数据一到手立即判定（不再等 60s 巡检；冷却等约束照常生效）
+  if (state?.auto_switch && state?.accounts?.some((a) => a.id === id && a.is_active)) {
+    autoSwitchTick(false);
+  }
 }
 
 async function loadClaimPreview(id) {
@@ -2300,9 +2305,17 @@ let ticking = false;
 
 function scheduleNext(id, base = Date.now()) {
   const jitter = 1 + (Math.random() * 2 - 1) * SWEEP_JITTER;
-  const period = state?.accounts?.some((a) => a.id === id && a.is_active)
-    ? SWEEP_PERIOD_ACTIVE
-    : SWEEP_PERIOD;
+  let period = SWEEP_PERIOD;
+  if (state?.accounts?.some((a) => a.id === id && a.is_active)) {
+    // 活跃账号自适应频率：越接近切换阈值刷新越勤，切换触发更及时
+    period = SWEEP_PERIOD_ACTIVE;
+    const thr = Number(state?.auto_switch_threshold ?? 10);
+    const h = healthMapOf().get(id);
+    if (h?.remainingPct != null) {
+      if (h.remainingPct <= thr) period = 12 * 1000;        // 已在阈值下：高频盯防
+      else if (h.remainingPct <= thr * 2) period = 20 * 1000; // 逼近阈值：加密
+    }
+  }
   quotaDue[id] = base + Math.round(period * jitter);
 }
 function enrollAccounts() {

@@ -155,6 +155,7 @@ export function bestOtherModel(q, model) {
 export function healthOf(acct, quota, isAuthErr, model, opts = {}) {
   let mp = modelRemainingPct(quota, model);
   let modelName = mp != null ? (model || null) : null;
+  let fallback = false;
   // 礼物优先：礼物套餐还有额度就只看礼物套餐；全部用尽才回落常规套餐。
   // 若两个类别在套餐层都匹配不上（数据命名差异），保留原有的全源判定不被破坏。
   if (mp != null && opts.giftFirst) {
@@ -169,22 +170,23 @@ export function healthOf(acct, quota, isAuthErr, model, opts = {}) {
     if (alt && alt.pct > 0) {
       mp = alt.pct;
       modelName = alt.name;
+      fallback = true;
     }
   }
   const pct = mp != null ? mp : quotaRemainingPct(quota);
   // 鉴权失效永远优先（token 过期等，旧数据不可信）
   if (quota?.err && isAuthErr && isAuthErr(quota)) {
-    return { level: "auth", remainingPct: pct, modelMatched: mp != null, modelName };
+    return { level: "auth", remainingPct: pct, modelMatched: mp != null, modelName, fallback };
   }
   if (pct != null) {
-    if (pct <= 0) return { level: "dead", remainingPct: 0, modelMatched: mp != null, modelName };
-    if (pct <= LOW_THRESHOLD) return { level: "low", remainingPct: pct, modelMatched: mp != null, modelName };
-    return { level: "ok", remainingPct: pct, modelMatched: mp != null, modelName };
+    if (pct <= 0) return { level: "dead", remainingPct: 0, modelMatched: mp != null, modelName, fallback };
+    if (pct <= LOW_THRESHOLD) return { level: "low", remainingPct: pct, modelMatched: mp != null, modelName, fallback };
+    return { level: "ok", remainingPct: pct, modelMatched: mp != null, modelName, fallback };
   }
   // 没有任何额度数据时才用错误/回退信号（避免刷新失败把账号闪进失败分组）
-  if (quota?.err) return { level: "fail", remainingPct: null, modelMatched: false, modelName: null };
-  if (acct?.has_user_info === false) return { level: "auth", remainingPct: null, modelMatched: false, modelName: null };
-  return { level: "unknown", remainingPct: null, modelMatched: false, modelName: null };
+  if (quota?.err) return { level: "fail", remainingPct: null, modelMatched: false, modelName: null, fallback: false };
+  if (acct?.has_user_info === false) return { level: "auth", remainingPct: null, modelMatched: false, modelName: null, fallback: false };
+  return { level: "unknown", remainingPct: null, modelMatched: false, modelName: null, fallback: false };
 }
 
 /** 搜索匹配：名称 / 用户名 / 邮箱 / 分组 / 提供方 */
@@ -218,7 +220,7 @@ export function filterAccounts(accounts, { search = "", health = "all" } = {}, h
  * quota: 健康度分级优先（充足→…→待查询），同级按剩余额度降序
  * name / created / updated: 文本或时间序
  */
-export function sortAccounts(accounts, sort, healthMap, localeTag = "zh-CN") {
+export function sortAccounts(accounts, sort, healthMap, localeTag = "zh-CN", opts = {}) {
   const arr = [...(accounts || [])];
   const pctOf = (a) => {
     const p = healthMap?.get(a.id)?.remainingPct;
@@ -239,8 +241,28 @@ export function sortAccounts(accounts, sort, healthMap, localeTag = "zh-CN") {
     case "created":
       return arr.sort((a, b) => String(a.created_at || "").localeCompare(String(b.created_at || "")) || byName(a, b));
     case "quota":
-    default:
-      return arr.sort((a, b) => rankOf(a) - rankOf(b) || pctOf(b) - pctOf(a) || byName(a, b));
+    default: {
+      // 分层排序：
+      // 0 = 使用中且判定额度仍在阈值上（正常使用中，置顶）
+      // 1 = 普通账号（判定来自关注模型/总览），按判定额度降序
+      // 2 = 流转账号（关注模型耗尽、判定来自其它模型），永远排在普通账号之后
+      // 使用中的账号一旦判定额度 ≤ 阈值（紧张/耗尽），不再置顶，按判定额度落入 1 层自然靠后
+      const thr = Number(opts.threshold ?? 10);
+      const tierOf = (a) => {
+        const h = healthMap?.get(a.id) || {};
+        if (a.is_active && h.remainingPct != null && h.remainingPct > thr) return 0;
+        return h.fallback ? 2 : 1;
+      };
+      const noData = (a) => (pctOf(a) < 0 ? 1 : 0);
+      return arr.sort(
+        (a, b) =>
+          tierOf(a) - tierOf(b)
+          || noData(a) - noData(b)
+          || pctOf(b) - pctOf(a)
+          || rankOf(a) - rankOf(b)
+          || byName(a, b),
+      );
+    }
   }
 }
 
