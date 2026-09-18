@@ -955,6 +955,8 @@ async fn set_behavior(
     auto_switch: Option<bool>,
     auto_switch_threshold: Option<u32>,
     auto_switch_model: Option<String>,
+    auto_switch_gift_first: Option<bool>,
+    auto_switch_model_fallback: Option<bool>,
 ) -> Result<(), String> {
     let _guard = store_guard();
     let paths = Paths::detect();
@@ -986,6 +988,12 @@ async fn set_behavior(
     if let Some(v) = auto_switch_model {
         let t = v.trim();
         s.auto_switch_model = if t.is_empty() { None } else { Some(t.chars().take(40).collect()) };
+    }
+    if let Some(v) = auto_switch_gift_first {
+        s.auto_switch_gift_first = Some(v);
+    }
+    if let Some(v) = auto_switch_model_fallback {
+        s.auto_switch_model_fallback = Some(v);
     }
     let r = save_settings(&paths, &s);
     rebuild_tray(&app);

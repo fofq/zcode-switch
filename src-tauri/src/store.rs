@@ -120,6 +120,10 @@ pub struct Settings {
     #[serde(default)]
     pub auto_switch_model: Option<String>,
     #[serde(default)]
+    pub auto_switch_gift_first: Option<bool>,
+    #[serde(default)]
+    pub auto_switch_model_fallback: Option<bool>,
+    #[serde(default)]
     pub two_api_on: Option<bool>,
     #[serde(default)]
     pub two_api_port: Option<u16>,
@@ -147,6 +151,8 @@ impl Settings {
             .filter(|s| !s.is_empty())
             .map(|s| s.chars().take(40).collect())
     }
+    pub fn auto_switch_gift_first(&self) -> bool { self.auto_switch_gift_first.unwrap_or(false) }
+    pub fn auto_switch_model_fallback(&self) -> bool { self.auto_switch_model_fallback.unwrap_or(false) }
     pub fn auth_proxy(&self) -> Option<&str> {
         if self.auth_proxy_on.unwrap_or(false) {
             self.auth_proxy_url.as_deref().map(str::trim).filter(|s| !s.is_empty())
@@ -205,6 +211,8 @@ pub struct AppState {
     pub auto_switch: bool,
     pub auto_switch_threshold: u32,
     pub auto_switch_model: Option<String>,
+    pub auto_switch_gift_first: bool,
+    pub auto_switch_model_fallback: bool,
     pub auth_proxy_on: bool,
     pub auth_proxy_url: Option<String>,
     pub language: String,
@@ -1748,6 +1756,8 @@ pub fn get_state(paths: &Paths) -> Result<AppState, String> {
         auto_switch: settings.auto_switch(),
         auto_switch_threshold: settings.auto_switch_threshold(),
         auto_switch_model: settings.auto_switch_model(),
+        auto_switch_gift_first: settings.auto_switch_gift_first(),
+        auto_switch_model_fallback: settings.auto_switch_model_fallback(),
         auth_proxy_on: settings.auth_proxy_on.unwrap_or(false),
         auth_proxy_url: settings.auth_proxy_url.clone(),
         language: crate::i18n::current().as_str().to_string(),

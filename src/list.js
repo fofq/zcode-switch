@@ -56,27 +56,121 @@ export function modelRemainingPct(q, model) {
   return Math.max(0, Math.min(100, 100 - bestUsed));
 }
 
+function itemKindOf(it) {
+  if (it.kind) return it.kind;
+  if (it.name.includes("提示次数")) return "prompt_count";
+  if (it.name.includes("使用时长")) return "duration";
+  return "raw";
+}
+
+/** 套餐分类：礼物/赠送类（体验、活动、未归类的特殊套餐） vs 常规订阅（max/pro/lite/start） */
+export function planIsGift(p) {
+  const tier = String(p?.tier_code || p?.tier || "").toLowerCase();
+  const name = String(p?.name || "").toLowerCase();
+  if (["max", "pro", "lite", "start"].includes(tier)) return false;
+  if (tier === "trial") return true;
+  return /gift|promo|weekend|taste|experience|activity|体验|礼包|global build/.test(name);
+}
+
+/** 按套餐类别计算关注模型剩余：wantGift=true 只看礼物/赠送类套餐 */
+function modelPctInPlans(q, model, wantGift) {
+  const key = String(model || "").trim().toLowerCase();
+  if (!key) return null;
+  const d = q?.data;
+  if (!d) return null;
+  const pcts = [];
+  const consider = (it) => {
+    if (!it || typeof it.name !== "string") return;
+    if (!it.name.toLowerCase().includes(key)) return;
+    const p = Number(it.percent_used);
+    if (isFinite(p)) { pcts.push(p); return; }
+    const total = Number(it.total);
+    const used = Number(it.used);
+    if (isFinite(total) && total > 0 && isFinite(used)) pcts.push((used / total) * 100);
+  };
+  for (const p of d.plans || []) {
+    if (planIsGift(p) !== wantGift) continue;
+    for (const it of p.items || []) consider(it);
+  }
+  if (!pcts.length) return null;
+  const bestUsed = Math.min(...pcts);
+  return Math.max(0, Math.min(100, 100 - bestUsed));
+}
+
+export function modelRemainingPctDetailed(q, model) {
+  return {
+    gift: modelPctInPlans(q, model, true),
+    regular: modelPctInPlans(q, model, false),
+  };
+}
+
+/** 流转用：关注模型之外、剩余额度最高的其它模型（仅统计额度池/模型条目） */
+export function bestOtherModel(q, model) {
+  const key = String(model || "").trim().toLowerCase();
+  const d = q?.data;
+  if (!d) return null;
+  const best = new Map();
+  const consider = (it) => {
+    if (!it || typeof it.name !== "string") return;
+    if (itemKindOf(it) !== "raw") return;
+    const nameLower = it.name.toLowerCase();
+    if (key && nameLower.includes(key)) return;
+    const p = Number(it.percent_used);
+    const used = isFinite(p) ? p
+      : (isFinite(Number(it.total)) && Number(it.total) > 0 && isFinite(Number(it.used)))
+        ? (Number(it.used) / Number(it.total)) * 100
+        : null;
+    if (used == null) return;
+    const cur = best.get(nameLower);
+    if (!cur || used < cur.used) best.set(nameLower, { name: it.name, used });
+  };
+  for (const it of d.items || []) consider(it);
+  for (const p of d.plans || []) for (const it of p.items || []) consider(it);
+  let out = null;
+  for (const b of best.values()) {
+    const pct = Math.max(0, Math.min(100, 100 - b.used));
+    if (!out || pct > out.pct) out = { name: b.name, pct };
+  }
+  return out;
+}
+
 /**
  * 账号健康度：以额度为主，额度查不到时回退到快照信号。
  * 传了 model 时优先用该模型的额度，modelMatched 表示是否命中。
- * 返回 { level, remainingPct, modelMatched }
+ * opts.giftFirst: 优先判定礼物/赠送类套餐额度，礼物耗尽才回落常规套餐。
+ * opts.modelFallback: 关注模型耗尽时流转到剩余最高的其它模型（如 GLM-5.3）。
+ * 返回 { level, remainingPct, modelMatched, modelName }
  */
-export function healthOf(acct, quota, isAuthErr, model) {
-  const mp = modelRemainingPct(quota, model);
+export function healthOf(acct, quota, isAuthErr, model, opts = {}) {
+  let mp = modelRemainingPct(quota, model);
+  let modelName = mp != null ? (model || null) : null;
+  // 礼物优先：礼物套餐还有额度就只看礼物套餐；全部用尽才回落常规套餐
+  if (mp != null && opts.giftFirst) {
+    const det = modelRemainingPctDetailed(quota, model);
+    mp = det.gift != null && det.gift > 0 ? det.gift : (det.regular != null ? det.regular : det.gift);
+  }
+  // 流转：关注模型在所有套餐里都耗尽时，改用其它剩余最高的模型参与判定
+  if (opts.modelFallback && (mp == null || mp <= 0)) {
+    const alt = bestOtherModel(quota, model);
+    if (alt && alt.pct > 0) {
+      mp = alt.pct;
+      modelName = alt.name;
+    }
+  }
   const pct = mp != null ? mp : quotaRemainingPct(quota);
   // 鉴权失效永远优先（token 过期等，旧数据不可信）
   if (quota?.err && isAuthErr && isAuthErr(quota)) {
-    return { level: "auth", remainingPct: pct, modelMatched: mp != null };
+    return { level: "auth", remainingPct: pct, modelMatched: mp != null, modelName };
   }
   if (pct != null) {
-    if (pct <= 0) return { level: "dead", remainingPct: 0, modelMatched: mp != null };
-    if (pct <= LOW_THRESHOLD) return { level: "low", remainingPct: pct, modelMatched: mp != null };
-    return { level: "ok", remainingPct: pct, modelMatched: mp != null };
+    if (pct <= 0) return { level: "dead", remainingPct: 0, modelMatched: mp != null, modelName };
+    if (pct <= LOW_THRESHOLD) return { level: "low", remainingPct: pct, modelMatched: mp != null, modelName };
+    return { level: "ok", remainingPct: pct, modelMatched: mp != null, modelName };
   }
   // 没有任何额度数据时才用错误/回退信号（避免刷新失败把账号闪进失败分组）
-  if (quota?.err) return { level: "fail", remainingPct: null, modelMatched: false };
-  if (acct?.has_user_info === false) return { level: "auth", remainingPct: null, modelMatched: false };
-  return { level: "unknown", remainingPct: null, modelMatched: false };
+  if (quota?.err) return { level: "fail", remainingPct: null, modelMatched: false, modelName: null };
+  if (acct?.has_user_info === false) return { level: "auth", remainingPct: null, modelMatched: false, modelName: null };
+  return { level: "unknown", remainingPct: null, modelMatched: false, modelName: null };
 }
 
 /** 搜索匹配：名称 / 用户名 / 邮箱 / 分组 / 提供方 */

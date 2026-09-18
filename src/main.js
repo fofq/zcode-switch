@@ -196,8 +196,12 @@ function healthLabel(level) {
 }
 function healthMapOf() {
   const model = state?.auto_switch_model || "";
+  const opts = {
+    giftFirst: !!state?.auto_switch_gift_first,
+    modelFallback: !!state?.auto_switch_model_fallback,
+  };
   const map = new Map();
-  for (const a of state?.accounts || []) map.set(a.id, healthOf(a, acctQuota[a.id], isAuthErr, model));
+  for (const a of state?.accounts || []) map.set(a.id, healthOf(a, acctQuota[a.id], isAuthErr, model, opts));
   return map;
 }
 function focusModel() {
@@ -206,6 +210,7 @@ function focusModel() {
 function pctLabel(h) {
   if (h.remainingPct == null) return t("list.pctUnknown");
   const m = focusModel();
+  if (h.modelName) return t("list.modelPct", { model: h.modelName, pct: Math.round(h.remainingPct) });
   if (m && h.modelMatched) return t("list.modelPct", { model: m, pct: Math.round(h.remainingPct) });
   return t("list.pctLeft", { pct: Math.round(h.remainingPct) });
 }
@@ -301,6 +306,14 @@ function stAutoSwitchExtra() {
         <select class="st-model" aria-label="${esc(t("st.model"))}" change="actions.stSetModel(event)">${opts}</select>
         ${isCustom ? `<input class="focus-model" type="text" maxlength="40" placeholder="${esc(t("s.focusModelPh"))}" value="${esc(models.includes(cur) ? "" : cur)}" change="actions.stSetModelCustom(event)">` : ""}
       </div>
+    </div>
+    <div class="tog-row">
+      <div class="tog-info"><div class="tog-label">${t("st.giftFirst")}</div><div class="tog-desc">${t("st.giftFirstDesc")}</div></div>
+      <button class="toggle${state?.auto_switch_gift_first ? " on" : ""}" role="switch" aria-checked="${!!state?.auto_switch_gift_first}" aria-label="${esc(t("st.giftFirst"))}" click="actions.stToggle('giftFirst')"><span class="knob"></span></button>
+    </div>
+    <div class="tog-row">
+      <div class="tog-info"><div class="tog-label">${t("st.modelFallback")}</div><div class="tog-desc">${t("st.modelFallbackDesc")}</div></div>
+      <button class="toggle${state?.auto_switch_model_fallback ? " on" : ""}" role="switch" aria-checked="${!!state?.auto_switch_model_fallback}" aria-label="${esc(t("st.modelFallback"))}" click="actions.stToggle('modelFallback')"><span class="knob"></span></button>
     </div>
     <div class="st-note">${models.length ? t("st.modelDesc", { n: models.length }) : t("st.modelNone")}</div>
   </div>`;
@@ -1168,6 +1181,8 @@ const actions = {
       hot: ["hotSwitch", "hot_switch"],
       grouped: ["grouped", "grouped"],
       oauthBrowser: ["oauthBrowser", "oauth_browser"],
+      giftFirst: ["autoSwitchGiftFirst", "auto_switch_gift_first"],
+      modelFallback: ["autoSwitchModelFallback", "auto_switch_model_fallback"],
     };
     const hit = map[key];
     if (!hit) return;
