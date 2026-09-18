@@ -233,7 +233,7 @@ export const zh = {
   "two.snippetPi": "pi",
   "two.copySnippet": "复制配置",
   "two.saved": "已保存并应用到服务",
-  "two.hint": "服务只监听 127.0.0.1；令牌为空时本机任意程序可直接访问。流量默认跟随主窗口当前账号，也可锁定到指定账号。",
+  "two.hint": "服务只监听 127.0.0.1。免费模型（4.5/4.6v/4.7-flash）走全账号 API Key 池轮询；套餐模型走跟随/锁定账号自己的 coding endpoint——start-plan 账号的套餐模型受 ZCode 客户端签名风控限制暂无法转发（免费模型不受影响），coding-plan 订阅账号不受限。",
   "list.noMatch": "没有匹配的账号",
   "list.clearFilters": "清空筛选",
   "btn.refreshAll": "刷新额度与领取资格",

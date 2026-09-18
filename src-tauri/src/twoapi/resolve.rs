@@ -33,11 +33,10 @@ pub async fn resolve(st: &SharedState) -> Result<(String, String), String> {
             }
         }
     };
-    // 每次解析对应一次真实请求，记入该账号的累计计数
-    if let Some(c) = st.usage.lock().unwrap().get_mut(&id) {
-        *c += 1;
-    } else {
-        st.usage.lock().unwrap().insert(id.clone(), 1);
+    // 每次解析对应一次真实请求，记入该账号的累计计数（单次加锁，勿在 if-let 条件里持锁再锁）
+    {
+        let mut u = st.usage.lock().unwrap();
+        *u.entry(id.clone()).or_insert(0) += 1;
     }
     {
         let cache = st.cache.lock().unwrap();

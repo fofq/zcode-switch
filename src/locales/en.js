@@ -233,7 +233,7 @@ export const en = {
   "two.snippetPi": "pi",
   "two.copySnippet": "Copy config",
   "two.saved": "Saved and applied to the service",
-  "two.hint": "The service listens on 127.0.0.1 only; with an empty token any local program can access it. Traffic follows the currently active account by default, or can be pinned to a specific account.",
+  "two.hint": "The service listens on 127.0.0.1 only. Free models (4.5/4.6v/4.7-flash) use a rotating pool of all accounts' API keys; plan models go through the followed/pinned account's own coding endpoint — start-plan accounts cannot forward plan models due to ZCode client signature risk control (free models are unaffected); coding-plan subscriptions are not limited.",
   "list.noMatch": "No matching accounts",
   "list.clearFilters": "Clear filters",
   "btn.refreshAll": "Refresh quota & eligibility",

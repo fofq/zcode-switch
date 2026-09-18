@@ -258,7 +258,7 @@ async fn regen_two_api_token(app: AppHandle) -> Result<String, String> {
 }
 
 #[tauri::command]
-fn two_api_status() -> twoapi::Status {
+async fn two_api_status() -> twoapi::Status {
     twoapi::status()
 }
 
