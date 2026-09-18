@@ -34,6 +34,15 @@ export function quotaRemainingPct(q) {
  * 关注模型（可选）：只统计名称命中该模型的额度项（不区分大小写，子串匹配）。
  * 命中 → 返回该模型的剩余百分比；未命中 → null（调用方回退到总额度）。
  */
+/** 模型名匹配：兼容 "GLM-5.3-Flash"（总览条目）与 "5.3-Flash"（套餐明细条目）两种命名 */
+function modelKeyMatch(nameLower, key) {
+  if (!key) return false;
+  if (nameLower.includes(key)) return true;
+  const nk = nameLower.replace(/^glm-/, "");
+  const kk = key.replace(/^glm-/, "");
+  return nk === kk;
+}
+
 export function modelRemainingPct(q, model) {
   const key = String(model || "").trim().toLowerCase();
   if (!key) return null;
@@ -42,7 +51,7 @@ export function modelRemainingPct(q, model) {
   const pcts = [];
   const consider = (it) => {
     if (!it || typeof it.name !== "string") return;
-    if (!it.name.toLowerCase().includes(key)) return;
+    if (!modelKeyMatch(it.name.toLowerCase(), key)) return;
     const p = Number(it.percent_used);
     if (isFinite(p)) { pcts.push(p); return; }
     const total = Number(it.total);
@@ -81,7 +90,7 @@ function modelPctInPlans(q, model, wantGift) {
   const pcts = [];
   const consider = (it) => {
     if (!it || typeof it.name !== "string") return;
-    if (!it.name.toLowerCase().includes(key)) return;
+    if (!modelKeyMatch(it.name.toLowerCase(), key)) return;
     const p = Number(it.percent_used);
     if (isFinite(p)) { pcts.push(p); return; }
     const total = Number(it.total);
@@ -114,7 +123,7 @@ export function bestOtherModel(q, model) {
     if (!it || typeof it.name !== "string") return;
     if (itemKindOf(it) !== "raw") return;
     const nameLower = it.name.toLowerCase();
-    if (key && nameLower.includes(key)) return;
+    if (modelKeyMatch(nameLower, key)) return;
     const p = Number(it.percent_used);
     const used = isFinite(p) ? p
       : (isFinite(Number(it.total)) && Number(it.total) > 0 && isFinite(Number(it.used)))
@@ -144,10 +153,13 @@ export function bestOtherModel(q, model) {
 export function healthOf(acct, quota, isAuthErr, model, opts = {}) {
   let mp = modelRemainingPct(quota, model);
   let modelName = mp != null ? (model || null) : null;
-  // 礼物优先：礼物套餐还有额度就只看礼物套餐；全部用尽才回落常规套餐
+  // 礼物优先：礼物套餐还有额度就只看礼物套餐；全部用尽才回落常规套餐。
+  // 若两个类别在套餐层都匹配不上（数据命名差异），保留原有的全源判定不被破坏。
   if (mp != null && opts.giftFirst) {
     const det = modelRemainingPctDetailed(quota, model);
-    mp = det.gift != null && det.gift > 0 ? det.gift : (det.regular != null ? det.regular : det.gift);
+    if (det.gift != null || det.regular != null) {
+      mp = det.gift != null && det.gift > 0 ? det.gift : (det.regular != null ? det.regular : det.gift);
+    }
   }
   // 流转：关注模型在所有套餐里都耗尽时，改用其它剩余最高的模型参与判定
   if (opts.modelFallback && (mp == null || mp <= 0)) {
