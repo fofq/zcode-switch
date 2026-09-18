@@ -968,7 +968,8 @@ select.two-input { cursor: pointer; }
   gap: 4px;
 }
 .q-win.mini {
-  grid-template-columns: 52px 1fr 128px;
+  /* 左列放宽以完整显示官方模型全称（GLM-5.3-Flash），右侧数值列收窄让位 */
+  grid-template-columns: 112px 1fr 92px;
   gap: 6px;
   margin-bottom: 0;
 }
