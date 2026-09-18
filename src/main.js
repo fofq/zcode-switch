@@ -2230,7 +2230,8 @@ function openQuotaModal() {
   ui.qhOpen = true;
   const mask = document.createElement("div");
   mask.className = "st-mask pv-mask";
-  mask.innerHTML = `<div class="qh-panel" data-qh-pop>${quotaPanelHtml(quotaTotals())}</div>`;
+  // quotaPanelHtml 自身已返回 .qh-panel，不再额外包裹（否则出现双层错位面板）
+  mask.innerHTML = quotaPanelHtml(quotaTotals());
   document.body.appendChild(mask);
   quotaModalEl = mask;
   const close = () => { closeQuotaModal(); render(); };
@@ -2247,7 +2248,7 @@ function refreshQuotaModal() {
   const sc = pop.querySelector("[data-qh-scroll]");
   const st = sc ? sc.scrollTop : 0;
   const tpl = document.createElement("template");
-  tpl.innerHTML = `<div class="qh-panel" data-qh-pop>${quotaPanelHtml(quotaTotals())}</div>`.trim();
+  tpl.innerHTML = quotaPanelHtml(quotaTotals()).trim();
   const node = tpl.content.firstElementChild;
   if (!node) return;
   const nsc = node.querySelector("[data-qh-scroll]");
