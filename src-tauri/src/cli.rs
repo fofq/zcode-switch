@@ -177,8 +177,38 @@ pub fn run(args: &[String]) -> (String, i32) {
                 if let Err(e) = crate::twoapi::start_for_test(&paths, port_override).await {
                     return err(&format!("2API 启动失败: {e}"));
                 }
+                // 预热免费 key 池：网络抖动时铸 6 个账号远超测试客户端 25s 上限，
+                // 先用长超时请求把池建好（缓存在服务进程内），test_service 再跑就是秒级
+                let s0 = load_settings(&paths);
+                let port0 = port_override.unwrap_or_else(|| s0.two_api_port());
+                let token0 = s0.two_api_token();
+                let warm = json!({
+                    "model": "glm-4.5-flash",
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "max_tokens": 1,
+                });
+                let warm_agent = ureq::AgentBuilder::new()
+                    .timeout_connect(std::time::Duration::from_secs(10))
+                    .timeout(std::time::Duration::from_secs(180))
+                    .build();
+                let warmup = warm_agent
+                    .post(&format!("http://127.0.0.1:{port0}/v1/chat/completions"))
+                    .set("Authorization", &format!("Bearer {token0}"))
+                    .set("Content-Type", "application/json")
+                    .send_string(&warm.to_string());
+                let warmup_status = match warmup {
+                    Ok(r) => r.status(),
+                    Err(ureq::Error::Status(code, _)) => code,
+                    Err(e) => {
+                        return err(&format!("池预热失败: {e}"));
+                    }
+                };
+
                 let test = crate::twoapi::test_service().await;
                 let mut result = serde_json::to_value(&test).unwrap_or(Value::Null);
+                if let Some(obj) = result.as_object_mut() {
+                    obj.insert("warmup_status".into(), json!(warmup_status));
+                }
 
                 let s = load_settings(&paths);
                 let port = port_override.unwrap_or_else(|| s.two_api_port());
@@ -214,6 +244,20 @@ pub fn run(args: &[String]) -> (String, i32) {
                 }
                 ok(result)
             })
+        }
+        // 铸/取本账号自己的平台 API Key（官方 zcode-api-key），成功即写入账号快照。
+        // 复制功能/免费模型/2API 池都依赖它；输出打码，完整 key 用界面复制。
+        "mint-key" => {
+            let Some(id) = flag(rest, "--id") else {
+                return (err(&crate::i18n::tr("cli.usage.mint_key")), 2);
+            };
+            match mint_account_api_key(&paths, &id) {
+                Ok(key) => {
+                    let mask = format!("{}…{}", &key[..8.min(key.len())], &key[key.len().saturating_sub(4)..]);
+                    ok(json!({ "ok": true, "key": mask, "length": key.len(), "saved": true }))
+                }
+                Err(e) => return (err(&e), 1),
+            }
         }
         "claim-preview" => {
             let only = flag(rest, "--id");
