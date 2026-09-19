@@ -84,7 +84,8 @@ async function run() {
     submitted = true;
     clearTimeout(tracelessTimer);
     status(t("c.passed"));
-    invoke("claim_captcha_submit", { param, region }).catch((e) => {
+    // 统一路由：有待领奖 → 领奖；否则 → 2API 套餐路由的验证码桥接
+    invoke("captcha_submit", { param, region }).catch((e) => {
       status(t("c.claimReqFail"), "err");
       detail(stripErr(e));
     });

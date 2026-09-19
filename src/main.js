@@ -1486,6 +1486,8 @@ const actions = {
     try {
       const r = await invoke("account_api_key", { id });
       if (!r?.apiKey) { toast(t("list.apiKeyNone"), "warn"); return; }
+      // 铸造失败 = 拿到的是 JWT 兜底，拿去 paas/v4 必 401：不复制，把原因亮出来
+      if (r?.mintError) { toast(`${t("list.apiKeyMintFail")}\n${stripErr(r.mintError)}`, "err"); return; }
       if (await copyText(r.apiKey)) toast(`${t("list.apiKeyCopied")}（${r.label || "?"}）`);
       else toast(t("list.copyFail"), "err");
     } catch (e) { toast(stripErr(e), "err"); }
@@ -1557,11 +1559,12 @@ const actions = {
     }
   },
 
-  /** 一键复制所有账号的 API Key（名称 + key 逐行） */
+  /** 一键复制所有账号的 API Key（名称 + key 逐行；JWT 兜底行带标记，避免误拿去 paas/v4） */
   async copyAllKeys() {
     try {
       const rows = await invoke("all_account_api_keys");
-      const lines = (rows || []).filter((r) => r.hasKey).map((r) => `${r.name}  ${r.apiKey}`);
+      const lines = (rows || []).filter((r) => r.hasKey)
+        .map((r) => `${r.name}  ${r.apiKey}${r.kind === "jwt" ? "  " + t("list.apiKeyJwtTag") : ""}`);
       if (!lines.length) { toast(t("list.apiKeyNone"), "warn"); return; }
       const ok = await copyText(lines.join("\n"));
       toast(ok ? t("list.apiKeysCopied", { n: lines.length }) : t("list.copyFail"), ok ? "ok" : "err");

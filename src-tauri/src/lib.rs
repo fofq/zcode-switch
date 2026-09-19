@@ -241,6 +241,7 @@ async fn set_two_api(
         save_settings(&paths, &s)?;
     }
     twoapi::sync(&paths).await?;
+    twoapi::set_app_handle(app.clone());
     rebuild_tray(&app);
     let _ = app.emit("state-changed", ());
     Ok(())
@@ -344,8 +345,22 @@ async fn claim_captcha_config() -> Result<claim::CaptchaConfig, String> {
     claim::fetch_captcha_config()
 }
 
+/// 验证码窗口统一提交入口：有 pending 领奖 → 走领奖；否则 → 2API 套餐路由验证码桥接
 #[tauri::command]
-async fn claim_captcha_submit(
+async fn captcha_submit(
+    app: AppHandle,
+    param: String,
+    region: Option<String>,
+) -> Result<serde_json::Value, String> {
+    if pending_guard().is_some() {
+        return claim_captcha_submit_inner(app, param, region).await;
+    }
+    twoapi::submit_captcha_param(param, region);
+    close_captcha_window(&app);
+    Ok(json!({ "routed": "twoapi" }))
+}
+
+async fn claim_captcha_submit_inner(
     app: AppHandle,
     param: String,
     region: Option<String>,
@@ -897,7 +912,7 @@ fn spawn_poll_loop(app: AppHandle, provider: String, flow: String, mid: String, 
     });
 }
 
-fn open_captcha_window(app: &AppHandle, auto: bool) -> Result<(), String> {
+pub(crate) fn open_captcha_window(app: &AppHandle, auto: bool) -> Result<(), String> {
     let (w, h) = (380.0, 320.0);
     if let Some(win) = app.get_webview_window("captcha") {
         let _ = win.eval("location.reload()");
@@ -1263,7 +1278,7 @@ pub fn run() {
             claim_refresh,
             claim_start,
             claim_captcha_config,
-            claim_captcha_submit,
+            captcha_submit,
             claim_cancel,
             oauth_providers,
             oauth_begin,
@@ -1313,6 +1328,7 @@ pub fn run() {
                     }
                 });
             }
+            twoapi::set_app_handle(app.handle().clone());
             let _tray = TrayIconBuilder::with_id(TRAY_ID)
                 .icon(app.default_window_icon().expect("no window icon").clone())
                 .tooltip("Z·SWITCH")

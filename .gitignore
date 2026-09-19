@@ -31,3 +31,6 @@ nul
 .zcode/
 
 __pycache__/
+
+# 本地诊断脚本/流程文档（永不推送）
+.tmpdiag/

@@ -1,4 +1,5 @@
 
+use crate::flowlog;
 use crate::quota;
 use serde_json::{json, Value};
 use std::time::Duration;
@@ -544,51 +545,86 @@ fn keys_array(v: &Value) -> Vec<&Value> {
     }
 }
 
-pub fn resolve_biz_api_key(base: &str, auth: &str, require_secret: bool) -> Option<String> {
+/// 铸/取平台 API Key（官方 console 的 zcode-api-key：登录 zcode 时官方也会自动创建同名 key）。
+/// 返回 Result：Err 为逐步骤诊断（HTTP 状态 + 响应摘要），让「铸不出来」不再静默——
+/// 此前失败一律返回 None，2API 池空、复制回退 JWT，用户完全看不到原因。
+pub fn resolve_biz_api_key(base: &str, auth: &str, require_secret: bool) -> Result<String, String> {
+    let ua = format!("ZCode/{}", crate::quota::zcode_app_version());
     let agent = web_agent();
-    let get_json = |url: &str| -> Option<Value> {
-        agent
-            .get(url)
-            .set("Authorization", auth)
-            .set("Content-Type", "application/json")
-            .call()
-            .ok()?
-            .into_string()
-            .ok()
-            .and_then(|s| serde_json::from_str(&s).ok())
+    // 带上官方客户端指纹头：api.z.ai 的 WAF 可能按 UA/头区分对待（ureq 默认 UA 是 ureq/x.y）
+    let finish = |resp: Result<ureq::Response, ureq::Error>| -> Result<Value, String> {
+        let resp = resp.map_err(|e| match e {
+            ureq::Error::Status(code, r) => {
+                let body = r.into_string().unwrap_or_default();
+                format!("HTTP {code} {}", body.chars().take(200).collect::<String>())
+            }
+            other => format!("{other}"),
+        })?;
+        let text = resp.into_string().map_err(|e| format!("读响应失败: {e}"))?;
+        serde_json::from_str(&text)
+            .map_err(|e| format!("响应非 JSON: {e}（{}）", text.chars().take(120).collect::<String>()))
     };
-    let cust = get_json(&format!("{base}/api/biz/customer/getCustomerInfo"))?;
-    let (org, proj) = pick_org_project(&cust)?;
+    let get_json = |url: &str| -> Result<Value, String> {
+        finish(
+            agent
+                .get(url)
+                .set("Authorization", auth)
+                .set("User-Agent", &ua)
+                .set("Content-Type", "application/json")
+                .call(),
+        )
+    };
+    let cust = get_json(&format!("{base}/api/biz/customer/getCustomerInfo"))
+        .map_err(|e| format!("getCustomerInfo: {e}"))?;
+    let Some((org, proj)) = pick_org_project(&cust) else {
+        return Err(format!(
+            "组织/项目解析失败: {}",
+            serde_json::to_string(&cust).unwrap_or_default().chars().take(200).collect::<String>()
+        ));
+    };
     let keys_url = format!("{base}/api/biz/v1/organization/{org}/projects/{proj}/api_keys");
-    let list = get_json(&keys_url)?;
+    let list = get_json(&keys_url).map_err(|e| format!("api_keys 列表: {e}"))?;
     let mut found = keys_array(&list)
         .into_iter()
         .find(|k| k.get("name").and_then(|n| n.as_str()) == Some(API_KEY_NAME))
         .map(|k| k.clone());
     if found.is_none() {
-        found = agent
-            .post(&keys_url)
-            .set("Authorization", auth)
-            .set("Content-Type", "application/json")
-            .send_json(json!({ "name": API_KEY_NAME }))
-            .ok()?
-            .into_string()
-            .ok()
-            .and_then(|s| serde_json::from_str(&s).ok());
+        found = Some(
+            finish(
+                agent
+                    .post(&keys_url)
+                    .set("Authorization", auth)
+                    .set("User-Agent", &ua)
+                    .set("Content-Type", "application/json")
+                    .send_json(json!({ "name": API_KEY_NAME })),
+            )
+            .map_err(|e| format!("api_keys 创建: {e}"))?,
+        );
     }
     let key = found
         .as_ref()
         .and_then(|k| k.get("apiKey").and_then(|v| v.as_str()))
         .map(str::trim)
-        .filter(|s| !s.is_empty())?
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| {
+            format!(
+                "api_keys 响应缺少 apiKey 字段: {}",
+                serde_json::to_string(&found).unwrap_or_default().chars().take(200).collect::<String>()
+            )
+        })?
         .to_string();
     let secret = get_json(&format!("{keys_url}/copy/{}", urlencode(&key)))
+        .ok()
         .and_then(|v| v.get("secretKey").and_then(|s| s.as_str()).map(String::from))
         .unwrap_or_default();
     if secret.trim().is_empty() {
-        return if require_secret { None } else { Some(key) };
+        return if require_secret {
+            Err(format!("copy secretKey 失败（key={key}）"))
+        } else {
+            Ok(key)
+        };
     }
-    Some(format!("{key}.{}", secret.trim()))
+    Ok(format!("{key}.{}", secret.trim()))
 }
 
 pub fn resolve_zai_business_token(zai_access_token: &str) -> Option<String> {
@@ -637,6 +673,8 @@ pub fn assemble_config(provider: &str, jwt: &str, access_token: &str) -> Value {
                 None
             } else {
                 resolve_biz_api_key(BIGMODEL_BIZ_BASE, access_token.trim(), false)
+                    .map_err(|e| flowlog::log("oauth", "bigmodel_key_fail", &e))
+                    .ok()
             }
             .unwrap_or_default();
             providers.insert("builtin:bigmodel".into(), entry("Bigmodel - API Key", &key, BIGMODEL_ANTHROPIC_BASE));
@@ -662,6 +700,8 @@ pub fn assemble_config(provider: &str, jwt: &str, access_token: &str) -> Value {
                 None
             } else {
                 resolve_biz_api_key(ZAI_API_BASE, &format!("Bearer {}", access_token.trim()), true)
+                    .map_err(|e| flowlog::log("oauth", "zai_key_fail", &e))
+                    .ok()
             }
             .unwrap_or_default();
             providers.insert(

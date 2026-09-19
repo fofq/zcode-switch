@@ -210,6 +210,8 @@ export const en = {
   "list.unnamed": "Unnamed account",
   "list.apiKeyCopied": "API key copied",
   "list.apiKeyNone": "No usable API key for this account",
+  "list.apiKeyMintFail": "Failed to obtain the platform API key (copy cancelled)",
+  "list.apiKeyJwtTag": "[Start Plan JWT · zcode-plan endpoint only]",
   "list.apiKeysCopied": "Copied API keys of {n} accounts",
   "list.locateActive": "Locate the active account",
   "list.locateMissing": "Active account is not in the list (filtered out?)",

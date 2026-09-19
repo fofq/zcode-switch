@@ -16,14 +16,14 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::Router;
 use serde_json::{json, Value};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io::{BufRead, Read};
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use crate::oauth::{BIGMODEL_ANTHROPIC_BASE, ZAI_ANTHROPIC_BASE};
-use crate::store::{self, Paths};
+use crate::store::{self, ApiKeyInfo, Paths};
 
 const DEFAULT_ANTHROPIC_VERSION: &str = "2023-06-01";
 const CACHE_TTL: Duration = Duration::from_secs(600);
@@ -66,6 +66,92 @@ fn stats() -> &'static Arc<Stats> {
     STATS.get_or_init(|| Arc::new(Stats::default()))
 }
 
+// ===== start-plan 验证码桥接 =====
+// zcode-plan/anthropic 对 start-plan JWT 有阿里云验证码墙（HTTP 400 code=3007），
+// 无验证码参数一律拒绝（带全套官方头也一样）。官方客户端由渲染端阿里云 SDK 生成
+// captchaVerifyParam（优先无感通过）。我们复用 claim 的验证码窗口：套餐路由收到 3007 时
+// 打开窗口（无感优先、滑块兜底），拿到的参数进队列，等待中的请求取出后带
+// X-Aliyun-Captcha-Verify-Param 重试一次。参数单次有效，同一窗口可能需要反复解。
+
+fn captcha_params() -> &'static Mutex<VecDeque<(String, Option<String>)>> {
+    static P: OnceLock<Mutex<VecDeque<(String, Option<String>)>>> = OnceLock::new();
+    P.get_or_init(|| Mutex::new(VecDeque::new()))
+}
+
+static CAPTCHA_APP: Mutex<Option<tauri::AppHandle>> = Mutex::new(None);
+/// 窗口去重：记录本次解题开始时间，窗口已被打开且未超时就不再重复拉起
+static CAPTCHA_SOLVING: Mutex<Option<std::time::Instant>> = Mutex::new(None);
+const CAPTCHA_SOLVE_STALE: Duration = Duration::from_secs(120);
+const CAPTCHA_WAIT_TIMEOUT: Duration = Duration::from_secs(75);
+
+pub fn set_app_handle(app: tauri::AppHandle) {
+    *CAPTCHA_APP.lock().unwrap() = Some(app);
+}
+
+/// 验证码窗口提交参数（captcha_submit 命令的 2API 分支）
+pub fn submit_captcha_param(param: String, region: Option<String>) {
+    captcha_params().lock().unwrap().push_back((param, region));
+    captcha_notify().notify_waiters();
+}
+
+fn captcha_notify() -> &'static tokio::sync::Notify {
+    static N: OnceLock<tokio::sync::Notify> = OnceLock::new();
+    N.get_or_init(tokio::sync::Notify::new)
+}
+
+fn ensure_captcha_window() {
+    let mut solving = CAPTCHA_SOLVING.lock().unwrap();
+    if let Some(at) = solving.as_ref() {
+        if at.elapsed() < CAPTCHA_SOLVE_STALE {
+            return; // 已有窗口在解
+        }
+    }
+    let Some(app) = CAPTCHA_APP.lock().unwrap().clone() else { return };
+    *solving = Some(std::time::Instant::now());
+    drop(solving);
+    let _ = crate::open_captcha_window(&app, false);
+}
+
+async fn wait_captcha_param() -> Option<(String, Option<String>)> {
+    // 无界面环境（CLI 等）没有验证码窗口可开，直接放弃等待
+    if CAPTCHA_APP.lock().unwrap().is_none() {
+        return None;
+    }
+    ensure_captcha_window();
+    let deadline = std::time::Instant::now() + CAPTCHA_WAIT_TIMEOUT;
+    loop {
+        if let Some(p) = captcha_params().lock().unwrap().pop_front() {
+            return Some(p);
+        }
+        if std::time::Instant::now() >= deadline {
+            return None;
+        }
+        // 窗口提交/新参数到达都会 notify；超时片段醒来后再查队列与截止时间
+        let _ = tokio::time::timeout(Duration::from_secs(3), captcha_notify().notified()).await;
+    }
+}
+
+fn is_captcha_challenge(text: &str) -> bool {
+    let Ok(v) = serde_json::from_str::<Value>(text) else {
+        return text.contains("3007");
+    };
+    v.get("code").and_then(|c| c.as_i64()) == Some(3007)
+        || v.get("msg")
+            .and_then(|m| m.as_str())
+            .map(|m| m.contains("captcha"))
+            .unwrap_or(false)
+}
+
+/// 套餐路由的鉴权头：start-plan JWT → Bearer（官方 3.14 同款，x-api-key 会 401）；
+/// 平台 key → x-api-key（api.z.ai coding/paas 端点实测两种都收，维持原样）
+fn auth_style_for(info: &ApiKeyInfo, anthropic_version: &str) -> AuthStyle {
+    if info.kind == "jwt" {
+        AuthStyle::Bearer(info.api_key.clone())
+    } else {
+        AuthStyle::Anthropic { key: info.api_key.clone(), version: anthropic_version.to_string() }
+    }
+}
+
 pub struct SharedState {
     pub paths: Paths,
     pub token: Mutex<String>,
@@ -74,8 +160,8 @@ pub struct SharedState {
     pub cache: Mutex<HashMap<String, (std::time::Instant, store::ApiKeyInfo)>>,
     /// 2API 每账号累计请求数（跟随/锁定都以解析到的账号 id 计）
     pub usage: Mutex<HashMap<String, u64>>,
-    /// 免费模型 key 池（全账号平台 key）缓存
-    pub pool: Mutex<Option<(std::time::Instant, Vec<PoolKey>)>>,
+    /// 免费模型 key 池（全账号平台 key）缓存：(时间, 池, 缓存时长——空池短缓存)
+    pub pool: Mutex<Option<(std::time::Instant, Vec<PoolKey>, Duration)>>,
     /// 激活账号 id 短缓存（避免每个请求全量解密账号）
     pub active_cache: Mutex<Option<(std::time::Instant, Option<String>)>>,
     /// 轮询游标
@@ -170,6 +256,47 @@ pub fn update_token(token: &str) {
     if let Some(m) = mgr.as_ref() {
         *m.state.token.lock().unwrap() = token.to_string();
     }
+}
+
+/// CLI 测试专用：不看 two_api_on 开关，按当前设置强起服务（供 twoapi-test 命令做无界面 E2E）
+pub async fn start_for_test(paths: &Paths, port_override: Option<u16>) -> Result<(), String> {
+    let s = store::load_settings(paths);
+    let cfg = Cfg {
+        port: port_override.unwrap_or_else(|| s.two_api_port()),
+        token: s.two_api_token(),
+        account: s.two_api_account(),
+        models: parse_models(&s.two_api_models()),
+    };
+    if let Some(m) = MANAGER.lock().unwrap().take() {
+        if let Some(tx) = m.shutdown {
+            let _ = tx.send(true);
+        }
+    }
+    let state = Arc::new(SharedState {
+        paths: Paths::detect(),
+        token: Mutex::new(cfg.token.clone()),
+        account: Mutex::new(cfg.account.clone()),
+        models: Mutex::new(cfg.models.clone()),
+        cache: Mutex::new(HashMap::new()),
+        usage: Mutex::new(HashMap::new()),
+        pool: Mutex::new(None),
+        active_cache: Mutex::new(None),
+        rr: AtomicU64::new(0),
+    });
+    let app = router(state.clone());
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", cfg.port))
+        .await
+        .map_err(|e| format!("127.0.0.1:{} 监听失败: {e}", cfg.port))?;
+    let (tx, rx) = tokio::sync::watch::channel(false);
+    tauri::async_runtime::spawn(async move {
+        let shutdown = async move {
+            let mut rx = rx;
+            let _ = rx.changed().await;
+        };
+        let _ = axum::serve(listener, app).with_graceful_shutdown(shutdown).await;
+    });
+    *MANAGER.lock().unwrap() = Some(Manager { shutdown: Some(tx), cfg, state });
+    Ok(())
 }
 
 #[derive(serde::Serialize)]
@@ -370,9 +497,11 @@ async fn messages_count_tokens(State(st): State<Arc<SharedState>>, headers: Head
     relay_anthropic(&st, &headers, &body, "/v1/messages/count_tokens").await
 }
 
-/// Anthropic 格式纯透传：只替换鉴权，逐字节转发（含 SSE）。
+/// Anthropic 格式套餐路由：解析账号 → 鉴权头按 key 类型选择 → 透传。
+/// start-plan JWT 上游（zcode.z.ai）有 3007 验证码墙：错误响应体会被缓冲检查，
+/// 命中时走验证码桥接（窗口解出参数 → 带头重试一次）。
 async fn relay_anthropic(st: &Arc<SharedState>, headers: &HeaderMap, body: &[u8], path: &str) -> Response {
-    let (api_key, base_url) = match resolve::resolve(st).await {
+    let info = match resolve::resolve(st).await {
         Ok(x) => x,
         Err(e) => {
             stats().errors.fetch_add(1, Ordering::Relaxed);
@@ -384,14 +513,123 @@ async fn relay_anthropic(st: &Arc<SharedState>, headers: &HeaderMap, body: &[u8]
         .and_then(|v| v.to_str().ok())
         .unwrap_or(DEFAULT_ANTHROPIC_VERSION)
         .to_string();
-    let url = format!("{}{}", base_url.trim_end_matches('/'), path);
-    pump_request(
-        url,
-        AuthStyle::Anthropic { key: api_key, version },
-        body.to_vec(),
+    relay_plan(
+        st,
+        info,
+        &version,
+        body,
+        path,
         PumpMode::Raw,
     )
     .await
+}
+
+/// 套餐路由统一入口（anthropic 入站 Raw / OpenAI 入站翻译模式共用）：
+/// 首次请求 → 错误缓冲检查 3007 → 验证码桥接重试一次 → 200 响应原样流式。
+async fn relay_plan(
+    _st: &Arc<SharedState>,
+    info: ApiKeyInfo,
+    anthropic_version: &str,
+    body: &[u8],
+    path: &str,
+    mode: PumpMode,
+) -> Response {
+    let url = format!("{}{}", info.base_url.trim_end_matches('/'), path);
+    let auth = auth_style_for(&info, anthropic_version);
+    // 验证码墙只在 zcode-plan 端点（start-plan JWT）；平台 key 的 coding 端点没有
+    let captcha_wall = info.kind == "jwt" && info.base_url.contains("zcode.z.ai");
+    match plan_request_once(url.clone(), auth.clone(), Vec::new(), body.to_vec(), mode.clone()).await {
+        Ok(resp) => resp,
+        Err((status, text)) => {
+            if !(captcha_wall && status == 400 && is_captcha_challenge(&text)) {
+                return buffered_error_response(status, &text, &mode);
+            }
+            stats().errors.fetch_add(1, Ordering::Relaxed);
+            let Some((param, region)) = wait_captcha_param().await else {
+                // 没等到参数：原样回传上游 3007 响应（无界面环境/窗口超时）
+                return buffered_error_response(status, &text, &mode);
+            };
+            let mut extra = vec![("X-Aliyun-Captcha-Verify-Param".to_string(), param)];
+            if let Some(r) = region.filter(|r| !r.trim().is_empty()) {
+                extra.push(("X-Aliyun-Captcha-Verify-Region".to_string(), r));
+            }
+            match plan_request_once(url, auth, extra, body.to_vec(), mode.clone()).await {
+                Ok(resp) => resp,
+                Err((status2, text2)) => buffered_error_response(status2, &text2, &mode),
+            }
+        }
+    }
+}
+
+/// 单次套餐请求：200（及所有流式响应）走现有泵；非 2xx 缓冲完整响应体交上层处置
+/// （错误体都很小；无法 buffered 的极端大响应按 502 处理）。
+async fn plan_request_once(
+    url: String,
+    auth: AuthStyle,
+    extra_headers: Vec<(String, String)>,
+    body: Vec<u8>,
+    mode: PumpMode,
+) -> Result<Response, (u16, String)> {
+    let (meta_tx, meta_rx) = tokio::sync::oneshot::channel::<Result<(u16, String), (u16, String)>>();
+    let (body_tx, body_rx) = tokio::sync::mpsc::channel::<Result<Vec<u8>, std::io::Error>>(32);
+    tauri::async_runtime::spawn_blocking(move || {
+        let send_meta = |r: Result<(u16, String), (u16, String)>| {
+            let _ = meta_tx.send(r);
+        };
+        let rb = upstream_agent().post(&url).set("content-type", "application/json");
+        let rb = match &auth {
+            AuthStyle::Anthropic { key, version } => rb
+                .set("x-api-key", key)
+                .set("anthropic-version", version),
+            AuthStyle::Bearer(k) => rb.set("Authorization", &format!("Bearer {k}")),
+        };
+        let rb = extra_headers.iter().fold(rb, |acc, (k, v)| acc.set(k, v));
+        // 与 pump_request 相同：body 按 UTF-8 字符串发送（上游均为 JSON）
+        let body_str = String::from_utf8_lossy(&body);
+        match rb.send_string(&body_str) {
+            Ok(resp) => {
+                let status = resp.status();
+                let ctype = resp.content_type().to_string();
+                send_meta(Ok((status, ctype)));
+                pump_ok(resp, mode, &body_tx);
+            }
+            Err(ureq::Error::Status(code, resp)) => {
+                let text = resp.into_string().unwrap_or_default();
+                send_meta(Err((code, text)));
+            }
+            Err(e) => send_meta(Err((0, format!("上游请求失败: {e}")))),
+        }
+    });
+    match meta_rx.await {
+        Ok(Ok((status, ctype))) => {
+            let code = StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY);
+            let stream = tokio_stream::wrappers::ReceiverStream::new(body_rx);
+            Response::builder()
+                .status(code)
+                .header(header::CONTENT_TYPE, ctype)
+                .body(Body::from_stream(stream))
+                .map_err(|e| (500u16, format!("响应构建失败: {e}")))
+        }
+        Ok(Err((code, text))) => Err((code, text)),
+        Err(_) => Err((502, "内部管道错误".into())),
+    }
+}
+
+/// 把缓冲的上游错误按入站协议回传：Raw 原样透传；OpenAI 模式包一层 error JSON
+fn buffered_error_response(status: u16, text: &str, mode: &PumpMode) -> Response {
+    let code = StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY);
+    let body = match mode {
+        PumpMode::Raw => text.to_string(),
+        _ => json!({
+            "error": {"message": upstream_error_message(text, status), "type": "upstream_error", "code": status}
+        })
+        .to_string(),
+    };
+    Response::builder()
+        .status(code)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(body))
+        .unwrap_or_else(|_| err_json(StatusCode::INTERNAL_SERVER_ERROR, "响应构建失败"))
 }
 
 async fn chat_completions(State(st): State<Arc<SharedState>>, body: axum::body::Bytes) -> Response {
@@ -414,22 +652,15 @@ async fn chat_completions(State(st): State<Arc<SharedState>>, body: axum::body::
         Ok(r) => r,
         Err(e) => return err_json(StatusCode::BAD_REQUEST, &e),
     };
-    let (api_key, base_url) = match resolve::resolve(&st).await {
+    let info = match resolve::resolve(&st).await {
         Ok(x) => x,
         Err(e) => {
             stats().errors.fetch_add(1, Ordering::Relaxed);
             return err_json(StatusCode::BAD_GATEWAY, &e);
         }
     };
-    let url = format!("{}/v1/messages", base_url.trim_end_matches('/'));
     let mode = if stream { PumpMode::OpenAiStream(model) } else { PumpMode::OpenAiJson(model) };
-    pump_request(
-        url,
-        AuthStyle::Anthropic { key: api_key, version: DEFAULT_ANTHROPIC_VERSION.to_string() },
-        translated.to_string().into_bytes(),
-        mode,
-    )
-    .await
+    relay_plan(&st, info, DEFAULT_ANTHROPIC_VERSION, translated.to_string().as_bytes(), "/v1/messages", mode).await
 }
 
 #[derive(Clone)]
@@ -463,28 +694,30 @@ impl PoolKey {
     }
 }
 
-/// 免费模型 key 池：全账号平台 key（本地优先，不足时现场向上游申请），5 分钟缓存。
+/// 免费模型 key 池：全账号平台 key（本地优先，不足时现场向上游申请），5 分钟缓存；
+/// 空池只短缓存 20 秒——负缓存太久会让刚修好的原因（如登录态恢复）迟迟不生效。
 /// 解密与网络都放进阻塞线程，绝不占用异步运行时。
-async fn get_pool(st: &Arc<SharedState>) -> Vec<PoolKey> {
+async fn get_pool(st: &Arc<SharedState>) -> (Vec<PoolKey>, Option<String>) {
     {
         let pool = st.pool.lock().unwrap();
-        if let Some((at, p)) = pool.as_ref() {
-            if at.elapsed() < POOL_TTL {
-                return p.clone();
+        if let Some((at, p, ttl)) = pool.as_ref() {
+            if at.elapsed() < *ttl {
+                return (p.clone(), None);
             }
         }
     }
-    let pairs = tauri::async_runtime::spawn_blocking(move || {
+    let (pairs, diag) = tauri::async_runtime::spawn_blocking(move || {
         store::free_key_pool(&Paths::detect(), 6)
     })
     .await
-    .unwrap_or_default();
+    .unwrap_or((Vec::new(), Some("内部任务失败".into())));
     let pool: Vec<PoolKey> = pairs
         .into_iter()
         .map(|(provider, api_key)| PoolKey { api_key, provider })
         .collect();
-    *st.pool.lock().unwrap() = Some((std::time::Instant::now(), pool.clone()));
-    pool
+    let ttl = if pool.is_empty() { Duration::from_secs(20) } else { POOL_TTL };
+    *st.pool.lock().unwrap() = Some((std::time::Instant::now(), pool.clone(), ttl));
+    (pool, diag)
 }
 
 /// 免费模型统一入口：key 池轮询，401/403/429 自动换下一个 key 重试。
@@ -496,10 +729,14 @@ async fn free_call(
     auth_of: fn(&PoolKey) -> AuthStyle,
     mode: PumpMode,
 ) -> Response {
-    let pool = get_pool(st).await;
+    let (pool, mint_diag) = get_pool(st).await;
     if pool.is_empty() {
         stats().errors.fetch_add(1, Ordering::Relaxed);
-        return err_json(StatusCode::BAD_GATEWAY, "没有可用的平台 API Key：免费模型需要账号的 API Key（已尝试现场申请仍失败，请检查账号登录状态）");
+        let mut msg = "没有可用的平台 API Key：免费模型需要账号的 API Key（已尝试现场申请仍失败，请检查账号登录状态）".to_string();
+        if let Some(d) = mint_diag {
+            msg.push_str(&format!("｜铸造诊断：{d}"));
+        }
+        return err_json(StatusCode::BAD_GATEWAY, &msg);
     }
     let n = pool.len();
     let start = st.rr.fetch_add(1, Ordering::Relaxed) as usize;

@@ -10,8 +10,9 @@ use super::SharedState;
 const TTL: Duration = Duration::from_secs(600);
 const ACTIVE_TTL: Duration = Duration::from_secs(3);
 
-/// 解析当前应该使用的 (apiKey, baseURL)：锁定账号优先，否则跟随激活账号；带 10 分钟缓存。
-pub async fn resolve(st: &SharedState) -> Result<(String, String), String> {
+/// 解析当前应该使用的 ApiKeyInfo：锁定账号优先，否则跟随激活账号；带 10 分钟缓存。
+/// kind 决定上游鉴权头：jwt（start-plan）→ Bearer；平台 key → x-api-key。
+pub async fn resolve(st: &SharedState) -> Result<ApiKeyInfo, String> {
     let pinned = st.account.lock().unwrap().clone();
     let id = match pinned {
         Some(id) => id,
@@ -42,7 +43,7 @@ pub async fn resolve(st: &SharedState) -> Result<(String, String), String> {
         let cache = st.cache.lock().unwrap();
         if let Some((at, info)) = cache.get(&id) {
             if at.elapsed() < TTL {
-                return Ok((info.api_key.clone(), info.base_url.clone()));
+                return Ok(info.clone());
             }
         }
     }
@@ -54,5 +55,5 @@ pub async fn resolve(st: &SharedState) -> Result<(String, String), String> {
     .map_err(|e| format!("内部任务失败: {e}"))??
     .ok_or("该账号没有可用的 API Key，请先在账号详情里确认已同步配置")?;
     st.cache.lock().unwrap().insert(id, (Instant::now(), info.clone()));
-    Ok((info.api_key, info.base_url))
+    Ok(info)
 }

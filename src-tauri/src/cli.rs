@@ -169,6 +169,53 @@ pub fn run(args: &[String]) -> (String, i32) {
                 Err(e) => return (err(&e), 1),
             }
         }
+        // 无界面验证 2API：强起服务（忽略开关）→ 免费模型 E2E → 套餐路由 /v1/messages 实测
+        // （套餐路由预期携带验证码墙信息：401=Bearer 修复未生效，3007=已过鉴权只差验证码）
+        "twoapi-test" => {
+            let port_override = flag(rest, "--port").and_then(|v| v.parse::<u16>().ok());
+            let out = tauri::async_runtime::block_on(async {
+                if let Err(e) = crate::twoapi::start_for_test(&paths, port_override).await {
+                    return (err(&format!("2API 启动失败: {e}")), 1);
+                }
+                let test = crate::twoapi::test_service().await;
+                let mut result = serde_json::to_value(&test).unwrap_or(Value::Null);
+
+                let s = load_settings(&paths);
+                let port = port_override.unwrap_or_else(|| s.two_api_port());
+                let token = s.two_api_token();
+                let body = json!({
+                    "model": "glm-5.3-flash",
+                    "max_tokens": 32,
+                    "messages": [{"role": "user", "content": "reply OK"}],
+                });
+                let agent = ureq::AgentBuilder::new()
+                    .timeout_connect(std::time::Duration::from_secs(10))
+                    .timeout(std::time::Duration::from_secs(90))
+                    .build();
+                let resp = agent
+                    .post(&format!("http://127.0.0.1:{port}/v1/messages"))
+                    .set("Authorization", &format!("Bearer {token}"))
+                    .set("Content-Type", "application/json")
+                    .send_string(&body.to_string());
+                let plan = match resp {
+                    Ok(r) => {
+                        let st = r.status();
+                        let text = r.into_string().unwrap_or_default();
+                        json!({ "status": st, "ok": st == 200, "body": text.chars().take(400).collect::<String>() })
+                    }
+                    Err(ureq::Error::Status(code, r)) => {
+                        let text = r.into_string().unwrap_or_default();
+                        json!({ "status": code, "ok": false, "body": text.chars().take(400).collect::<String>() })
+                    }
+                    Err(e) => json!({ "status": 0, "ok": false, "body": format!("{e}") }),
+                };
+                if let Some(obj) = result.as_object_mut() {
+                    obj.insert("plan_route".into(), plan);
+                }
+                (ok(result), 0)
+            });
+            out
+        }
         "claim-preview" => {
             let only = flag(rest, "--id");
             let accounts = match list_accounts(&paths) {

@@ -1189,6 +1189,9 @@ pub struct ApiKeyInfo {
     pub provider: String,
     /// key 类型：plan（套餐平台 key，可用于 paas/v4 与 coding endpoint）/ jwt（start-plan JWT）
     pub kind: String,
+    /// 现场铸造失败的原因（有值 = 当前 key 是 JWT 兜底，不是真正的平台 key）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mint_error: Option<String>,
 }
 
 /// 账号家族：zai / bigmodel，未知时按 zai 处理（新客户端默认）。
@@ -1214,6 +1217,7 @@ fn local_api_key(acc: &Account, home: &std::path::Path) -> Option<ApiKeyInfo> {
             base_url: base.into(),
             provider,
             kind: "plan".into(),
+            mint_error: None,
         });
     }
     if let Some(jwt) = cred_plain(&acc.credentials, "zcodejwttoken", home) {
@@ -1222,23 +1226,27 @@ fn local_api_key(acc: &Account, home: &std::path::Path) -> Option<ApiKeyInfo> {
                 .filter(|p| p == "bigmodel" || p == "zai")
                 .unwrap_or_else(|| "zai".into());
             return Some(ApiKeyInfo {
-                label: "Start Plan".into(),
+                // 名字里带 JWT：提示这是 zcode 登录态令牌，只能配 zcode-plan 端点用，
+                // 拿去 api.z.ai/api/paas/v4 一定是 401
+                label: "Start Plan JWT".into(),
                 api_key: jwt.trim().to_string(),
                 base_url: oauth::START_PLAN_ANTHROPIC_BASE.into(),
                 provider,
                 kind: "jwt".into(),
+                mint_error: None,
             });
         }
     }
     None
 }
 
-/// 用本账号的 access_token 去官方 biz 接口铸一把属于它自己的平台 API Key，并存进账号快照。
+/// 用本账号的 access_token 去官方 biz 接口取/铸一把属于它自己的平台 API Key，并存进账号快照。
 ///
-/// 走的就是 zcode 登录时那套接口（getCustomerInfo → organization/projects → api_keys → copy），
+/// 走的就是 zcode 登录时那套接口（官方登录 zcode 时也会自动创建 zcode-api-key），
 /// 但**直接用 access_token 当 Authorization**：`POST /api/auth/z/login` 实测对所有账号都回
 /// 500「Z.ai user information is invalid」，走它等于永远铸不出来。
-pub fn mint_account_api_key(paths: &Paths, id: &str) -> Result<Option<String>, String> {
+/// Err(String) = 铸造失败的逐步骤诊断；不再吞错——调用方决定怎么呈现。
+pub fn mint_account_api_key(paths: &Paths, id: &str) -> Result<String, String> {
     let acc = load_account(paths, id)?;
     let (creds, _) = effective_snapshot(paths, &acc);
     let provider = cred_plain(&creds, "oauth:active_provider", &paths.home)
@@ -1252,18 +1260,20 @@ pub fn mint_account_api_key(paths: &Paths, id: &str) -> Result<Option<String>, S
     let key = match provider.as_str() {
         "zai" => oauth::resolve_biz_api_key(oauth::ZAI_API_BASE, &format!("Bearer {access}"), true),
         _ => oauth::resolve_biz_api_key(oauth::BIGMODEL_BIZ_BASE, &access, false),
+    }?
+    .trim()
+    .to_string();
+    if key.len() <= 20 {
+        return Err(format!("铸造返回的 key 异常（长度 {}）", key.len()));
     }
-    .map(|k| k.trim().to_string())
-    .filter(|k| k.len() > 20);
 
-    let Some(key) = key else { return Ok(None) };
     let mut acc = load_account(paths, id)?;
     if acc.api_key.as_deref() != Some(key.as_str()) {
         acc.api_key = Some(key.clone());
         acc.updated_at = now_ts();
         save_account(paths, &acc)?;
     }
-    Ok(Some(key))
+    Ok(key)
 }
 
 pub fn account_api_key(paths: &Paths, id: &str) -> Result<Option<ApiKeyInfo>, String> {
@@ -1272,20 +1282,32 @@ pub fn account_api_key(paths: &Paths, id: &str) -> Result<Option<ApiKeyInfo>, St
     let (creds, config) = effective_snapshot(paths, &acc);
     let acc_eff = Account { credentials: creds, config, ..acc };
     // 已有本账号自己的 key 就直接用；否则现场铸一把（网络调用，调用方须在阻塞线程里）
+    let mut mint_error: Option<String> = None;
     if acc_eff.api_key.as_deref().map(str::trim).map(|k| k.len() > 20) != Some(true) {
-        if let Ok(Some(key)) = mint_account_api_key(paths, id) {
-            let provider = account_family(&acc_eff, &paths.home);
-            let base = if provider == "zai" { oauth::ZAI_ANTHROPIC_BASE } else { oauth::BIGMODEL_ANTHROPIC_BASE };
-            return Ok(Some(ApiKeyInfo {
-                label: "Coding Plan".into(),
-                api_key: key,
-                base_url: base.into(),
-                provider,
-                kind: "plan".into(),
-            }));
+        match mint_account_api_key(paths, id) {
+            Ok(key) => {
+                let provider = account_family(&acc_eff, &paths.home);
+                let base = if provider == "zai" { oauth::ZAI_ANTHROPIC_BASE } else { oauth::BIGMODEL_ANTHROPIC_BASE };
+                return Ok(Some(ApiKeyInfo {
+                    label: "Coding Plan".into(),
+                    api_key: key,
+                    base_url: base.into(),
+                    provider,
+                    kind: "plan".into(),
+                    mint_error: None,
+                }));
+            }
+            Err(e) => {
+                crate::flowlog::log("mint", "api_key_fail", &e);
+                mint_error = Some(e);
+            }
         }
     }
-    Ok(local_api_key(&acc_eff, &paths.home))
+    let mut info = local_api_key(&acc_eff, &paths.home);
+    if let Some(i) = info.as_mut() {
+        i.mint_error = mint_error;
+    }
+    Ok(info)
 }
 
 #[derive(serde::Serialize, Clone, Debug)]
@@ -1316,12 +1338,13 @@ pub fn all_account_api_keys(paths: &Paths) -> Result<Vec<AccountKeyLine>, String
         .collect())
 }
 
-/// 免费模型 key 池（2API 用）：返回 (provider, api_key) 列表，已按 key 去重。
+/// 免费模型 key 池（2API 用）：返回 (provider, api_key) 列表 + 最后一次铸造失败的诊断。
 /// 先扫全部账号的本地 plan key；不足时对前 `max_resolve` 个账号现场解析
-/// （上游会自动创建 zcode-api-key，网络调用，调用方须放在阻塞线程里）。
-pub fn free_key_pool(paths: &Paths, max_resolve: usize) -> Vec<(String, String)> {
+/// （上游会自动取/建 zcode-api-key，网络调用，调用方须放在阻塞线程里）。
+pub fn free_key_pool(paths: &Paths, max_resolve: usize) -> (Vec<(String, String)>, Option<String>) {
     let accounts = list_accounts(paths).unwrap_or_default();
     let mut out: Vec<(String, String)> = vec![];
+    let mut last_err: Option<String> = None;
     let mut need_network: Vec<String> = vec![];
     for a in &accounts {
         match local_api_key(a, &paths.home) {
@@ -1334,15 +1357,23 @@ pub fn free_key_pool(paths: &Paths, max_resolve: usize) -> Vec<(String, String)>
         }
     }
     for id in need_network.into_iter().take(max_resolve) {
-        if let Ok(Some(info)) = account_api_key(paths, &id) {
-            if info.kind == "plan" && (info.provider == "zai" || info.provider == "bigmodel")
-                && !out.iter().any(|(_, k)| k == &info.api_key)
-            {
-                out.push((info.provider.clone(), info.api_key.clone()));
+        match account_api_key(paths, &id) {
+            Ok(Some(info)) => {
+                if info.kind == "plan"
+                    && (info.provider == "zai" || info.provider == "bigmodel")
+                    && !out.iter().any(|(_, k)| k == &info.api_key)
+                {
+                    out.push((info.provider.clone(), info.api_key.clone()));
+                }
+                if let Some(e) = info.mint_error {
+                    last_err = Some(e);
+                }
             }
+            Ok(None) => {}
+            Err(e) => last_err = Some(e),
         }
     }
-    out
+    (out, last_err)
 }
 
 fn ensure_virtual_device_mid_locked(paths: &Paths, id: &str) -> Result<String, String> {

@@ -206,6 +206,8 @@ export const zh = {
   "list.unnamed": "未命名账号",
   "list.apiKeyCopied": "API Key 已复制",
   "list.apiKeyNone": "该账号没有可用的 API Key",
+  "list.apiKeyMintFail": "未能获取平台 API Key（复制已取消）",
+  "list.apiKeyJwtTag": "[Start Plan JWT·仅配 zcode-plan 端点]",
   "list.apiKeysCopied": "已复制 {n} 个账号的 API Key",
   "list.locateActive": "定位当前使用的账号",
   "list.locateMissing": "当前账号不在列表中（可能被筛选隐藏）",
