@@ -613,13 +613,37 @@ pub fn resolve_biz_api_key(base: &str, auth: &str, require_secret: bool) -> Resu
             )
         })?
         .to_string();
-    let secret = get_json(&format!("{keys_url}/copy/{}", urlencode(&key)))
-        .ok()
-        .and_then(|v| v.get("secretKey").and_then(|s| s.as_str()).map(String::from))
-        .unwrap_or_default();
+    // copy secret：网络对 api.z.ai 时有抖动（TLS 重置/超时），重试 3 次 + 退避；
+    // 失败必须带原因（此前 .ok() 吞错，链路死在最后一步却查无此错）
+    let copy_url = format!("{keys_url}/copy/{}", urlencode(&key));
+    let mut copy_diag = String::new();
+    let mut secret = String::new();
+    for attempt in 0..3 {
+        match get_json(&copy_url) {
+            Ok(v) => {
+                secret = v
+                    .get("secretKey")
+                    .or_else(|| v.pointer("/data/secretKey"))
+                    .and_then(|s| s.as_str())
+                    .unwrap_or_default()
+                    .to_string();
+                if !secret.trim().is_empty() {
+                    break;
+                }
+                copy_diag = format!(
+                    "copy 响应缺少 secretKey: {}",
+                    serde_json::to_string(&v).unwrap_or_default().chars().take(160).collect::<String>()
+                );
+            }
+            Err(e) => copy_diag = e,
+        }
+        if attempt + 1 < 3 {
+            std::thread::sleep(Duration::from_millis(800 * (attempt as u64 + 1)));
+        }
+    }
     if secret.trim().is_empty() {
         return if require_secret {
-            Err(format!("copy secretKey 失败（key={key}）"))
+            Err(format!("copy secretKey 失败（key={key}）：{copy_diag}"))
         } else {
             Ok(key)
         };
