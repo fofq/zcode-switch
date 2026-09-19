@@ -173,9 +173,9 @@ pub fn run(args: &[String]) -> (String, i32) {
         // （套餐路由预期携带验证码墙信息：401=Bearer 修复未生效，3007=已过鉴权只差验证码）
         "twoapi-test" => {
             let port_override = flag(rest, "--port").and_then(|v| v.parse::<u16>().ok());
-            let out = tauri::async_runtime::block_on(async {
+            tauri::async_runtime::block_on(async {
                 if let Err(e) = crate::twoapi::start_for_test(&paths, port_override).await {
-                    return (err(&format!("2API 启动失败: {e}")), 1);
+                    return err(&format!("2API 启动失败: {e}"));
                 }
                 let test = crate::twoapi::test_service().await;
                 let mut result = serde_json::to_value(&test).unwrap_or(Value::Null);
@@ -212,9 +212,8 @@ pub fn run(args: &[String]) -> (String, i32) {
                 if let Some(obj) = result.as_object_mut() {
                     obj.insert("plan_route".into(), plan);
                 }
-                (ok(result), 0)
-            });
-            out
+                ok(result)
+            })
         }
         "claim-preview" => {
             let only = flag(rest, "--id");
