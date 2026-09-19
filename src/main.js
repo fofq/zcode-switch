@@ -197,14 +197,27 @@ function isAuthErr(q) {
 }
 
 const HEALTH_PREFIX = "grp.health.";
-/** 扩展排序维度的取值：关注模型额度（判定用 %）、礼物剩余量（token 数） */
+/** 扩展排序维度的取值：关注模型剩余量 / 礼物剩余量（token 数，从 items 聚合）
+ *  注意：计划级 p.remaining 经常为 null，真实额度都在 p.items[].remaining 上 */
 function sortKeyValue(a, sort) {
   if (sort !== "focus" && sort !== "gift") return null;
-  const h = healthMapOf().get(a.id) || {};
-  if (sort === "focus") return h.focusPct ?? -1;
+  const plans = acctQuota[a.id]?.data?.plans || [];
+  if (sort === "focus") {
+    const key = focusModel().trim().toLowerCase();
+    if (!key) return -1;
+    let sum = 0;
+    for (const p of plans) {
+      for (const it of p.items || []) {
+        if (it.name && modelKeyMatch(it.name.toLowerCase(), key)) sum += Number(it.remaining ?? 0);
+      }
+    }
+    return sum;
+  }
   let sum = 0;
-  for (const p of acctQuota[a.id]?.data?.plans || []) {
-    if (p.gift === true) sum += Number(p.remaining ?? 0);
+  for (const p of plans) {
+    if (p.gift !== true) continue;
+    if (p.remaining != null) sum += Number(p.remaining);
+    else for (const it of p.items || []) sum += Number(it.remaining ?? 0);
   }
   return sum;
 }
@@ -2214,7 +2227,7 @@ function renderSignature() {
   return JSON.stringify([
     state, autoSwitchNote, twoLastStatus,
     [...ui.expanded], [...ui.selected], [...ui.collapsedSections],
-    ui.search, ui.health, ui.sort, ui.density, ui.hideInfo, ui.qhOpen, ui.qhTab, renaming,
+    ui.search, ui.health, ui.sort, ui.sortDir, ui.density, ui.hideInfo, ui.qhOpen, ui.qhTab, renaming,
     appVer, autoSwitchRunning, autoClaimRunning, claimActive, busy,
   ]);
 }
