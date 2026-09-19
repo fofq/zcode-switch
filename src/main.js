@@ -3,7 +3,7 @@ import { listen } from "@tauri-apps/api/event";
 import { esc, toast, openPwModal, openConfirmModal, openProviderModal, installDelegation, dismissSplash } from "./ui.js";
 import { ic } from "./icons.js";
 import { init, t, has, lang, localeTag, stripErr, errCode } from "./i18n.js";
-import { HEALTH_ORDER, healthOf, filterAccounts, sortAccounts, bucketAccounts, summarize, modelKeyMatch } from "./list.js";
+import { HEALTH_ORDER, healthOf, filterAccounts, sortAccounts, bucketAccounts, summarize, modelKeyMatch, quotaBarParts } from "./list.js";
 
 const $app = document.getElementById("app");
 let state = null;
@@ -754,14 +754,15 @@ function quotaPanelHtml(tot) {
   let body = "";
   const x = tot.models.find((m) => m.name === activeTab);
   if (x) {
-    const pct = x.total > 0 ? Math.max(0, Math.min(100, Math.round((1 - x.remaining / x.total) * 100))) : 0;
+    // 面板百分比同样以“剩余”为基准（对齐官方），红段=已用、黄/绿段=剩余
+    const pct = x.total > 0 ? Math.max(0, Math.min(100, Math.round((x.remaining / x.total) * 100))) : 0;
     const rows = x.sources.map((src) => {
-      const w = src.total > 0 ? Math.max(0, Math.min(100, Math.round((1 - src.remaining / src.total) * 100))) : 0;
-      const bar = w <= 0
+      const w = src.total > 0 ? Math.max(0, Math.min(100, Math.round((src.remaining / src.total) * 100))) : 0;
+      const bar = w >= 100
         ? `<i style="width:100%;background:${BAR_GREEN}"></i>`
-        : w >= 100
+        : w <= 0
           ? `<i style="width:100%;background:${BAR_RED}"></i>`
-          : `<i style="width:${w}%;background:${BAR_RED}"></i><i style="width:${100 - w}%;background:${BAR_YELLOW}"></i>`;
+          : `<i style="width:${100 - w}%;background:${BAR_RED}"></i><i style="width:${w}%;background:${BAR_YELLOW}"></i>`;
       return `<div class="qhd-row">
         <span class="qhd-acct" title="${esc(src.account)}">${esc(src.account)}</span>
         <span class="qhd-num">${esc(fmtTokens(src.remaining))}/${esc(fmtTokens(src.total))}</span>
@@ -1945,19 +1946,16 @@ async function autoClaimTick() {
 
 // 额度状态色：没用过=绿、用尽=红、部分使用=红(已用)+黄(剩余) 双色
 const BAR_GREEN = "#62c370", BAR_RED = "#e0566a", BAR_YELLOW = "#e6c84a";
+const BAR_SEG_COLOR = { green: BAR_GREEN, red: BAR_RED, yellow: BAR_YELLOW };
 
+// 条内标签以“剩余”为基准（对齐官方 3.14 额度面板的 9.7% 剩余语义）：
+// 视觉不变——红段宽=已用、黄/绿段宽=剩余，标签从“已用%”翻转为“剩余%”
 function quotaBarHtml(pct) {
-  const used = pct == null ? null : Math.min(100, Math.max(0, pct));
-  // 分支与标签共用同一个舍入值：0.3% 已用会显示成 0%，但颜色不能再装作“完全没用过”
-  const w = used == null ? null : Math.round(used);
-  const txt = w == null ? "--" : w + "%";
-  let body = "";
-  if (w != null) {
-    if (w <= 0) body = `<span class="qb-seg" style="width:100%;background:${BAR_GREEN}"></span>`;
-    else if (w >= 100) body = `<span class="qb-seg" style="width:100%;background:${BAR_RED}"></span>`;
-    else body = `<span class="qb-seg" style="width:${w}%;background:${BAR_RED}"></span><span class="qb-seg" style="width:${100 - w}%;background:${BAR_YELLOW}"></span>`;
-  }
-  return `<div class="qbar">${body}<span class="qbar-pct in-fill">${txt}</span></div>`;
+  const p = quotaBarParts(pct);
+  const body = p.segs
+    .map((s) => `<span class="qb-seg" style="width:${s.width}%;background:${BAR_SEG_COLOR[s.kind]}"></span>`)
+    .join("");
+  return `<div class="qbar">${body}<span class="qbar-pct in-fill">${p.txt}</span></div>`;
 }
 
 function itemKind(it) {

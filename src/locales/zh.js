@@ -174,7 +174,7 @@ export const zh = {
   "list.qhPopTitle": "按模型汇总 · 来自 {n} 个已刷新账号",
   "list.qhColAcct": "账号",
   "list.qhColLeft": "剩余",
-  "list.qhColUsed": "已用",
+  "list.qhColUsed": "剩余%",
   "list.qhEmpty": "暂无可汇总的模型额度",
   "list.modelPct": "{model} 剩 {pct}%",
   "list.selectHint": "选中（可批量操作）",

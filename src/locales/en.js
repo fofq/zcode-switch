@@ -178,7 +178,7 @@ export const en = {
   "list.qhPopTitle": "Totals per model · from {n} refreshed accounts",
   "list.qhColAcct": "Account",
   "list.qhColLeft": "Left",
-  "list.qhColUsed": "Used",
+  "list.qhColUsed": "Left %",
   "list.qhEmpty": "No model quota to sum yet",
   "list.modelPct": "{model} {pct}% left",
   "list.selectHint": "Select for bulk actions",

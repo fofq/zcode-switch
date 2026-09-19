@@ -150,6 +150,27 @@ export function bestOtherModel(q, model) {
 }
 
 /**
+ * 额度条纯逻辑：官方（ZCode 3.14+）额度面板以“剩余”为基准（如 9.7% = 还剩 9.7%），
+ * 这里对齐同一语义。入参仍是后端 QuotaItem.percent_used（已用%），出参全部转为剩余：
+ * - rem: 精确剩余百分比；w: 取整后的剩余，颜色分支与条宽共用这一个舍入值（0% 标签不得黄绿并存）
+ * - txt: 条内标签；剩余 <10% 时保留一位小数（“还剩 0.4%”不能被舍入成 0% 误导成耗尽）
+ * - segs: 条形分段，kind: green(没用过)/red(已用)/yellow(剩余)
+ */
+export function quotaBarParts(usedPct) {
+  const n = Number(usedPct);
+  if (usedPct == null || !isFinite(n)) return { rem: null, w: null, txt: "--", segs: [] };
+  const used = Math.min(100, Math.max(0, n));
+  const rem = 100 - used;
+  const w = Math.round(rem);
+  const txt = (rem > 0 && rem < 10 ? (rem >= 0.05 ? rem.toFixed(1) : "0") : String(w)) + "%";
+  let segs;
+  if (w >= 100) segs = [{ width: 100, kind: "green" }];
+  else if (w <= 0) segs = [{ width: 100, kind: "red" }];
+  else segs = [{ width: 100 - w, kind: "red" }, { width: w, kind: "yellow" }];
+  return { rem, w, txt, segs };
+}
+
+/**
  * 账号健康度：以额度为主，额度查不到时回退到快照信号。
  * 传了 model 时优先用该模型的额度，modelMatched 表示是否命中。
  * opts.giftFirst: 优先判定礼物/赠送类套餐额度，礼物耗尽才回落常规套餐。
