@@ -1484,8 +1484,13 @@ const actions = {
       const r = await invoke("account_api_key", { id });
       if (!r?.apiKey) { toast(t("list.apiKeyNone"), "warn"); return; }
       // 铸造失败 = 拿到的是 JWT 兜底，拿去 paas/v4 必 401：不复制，把原因亮出来
-      if (r?.mintError) { toast(`${t("list.apiKeyMintFail")}\n${stripErr(r.mintError)}`, "err"); return; }
-      if (await copyText(r.apiKey)) toast(`${t("list.apiKeyCopied")}（${r.label || "?"}）`);
+      if (r?.mintError) {
+        let msg = `${t("list.apiKeyMintFail")}\n${stripErr(r.mintError)}`;
+        if (r.provider === "bigmodel") msg += `\n${t("list.apiKeyMintBigmodelHint")}`;
+        toast(msg, "err");
+        return;
+      }
+      if (await copyText(r.apiKey)) toast(`${t("list.apiKeyCopied")}（${r.label || "?"}）\n${t("list.apiKeyCopiedHint")}`);
       else toast(t("list.copyFail"), "err");
     } catch (e) { toast(stripErr(e), "err"); }
   },

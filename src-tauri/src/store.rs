@@ -1212,7 +1212,7 @@ fn local_api_key(acc: &Account, home: &std::path::Path) -> Option<ApiKeyInfo> {
         let provider = account_family(acc, home);
         let base = if provider == "zai" { oauth::ZAI_ANTHROPIC_BASE } else { oauth::BIGMODEL_ANTHROPIC_BASE };
         return Some(ApiKeyInfo {
-            label: "Coding Plan".into(),
+            label: "平台 Key".into(),
             api_key: key.to_string(),
             base_url: base.into(),
             provider,
@@ -1289,7 +1289,7 @@ pub fn account_api_key(paths: &Paths, id: &str) -> Result<Option<ApiKeyInfo>, St
                 let provider = account_family(&acc_eff, &paths.home);
                 let base = if provider == "zai" { oauth::ZAI_ANTHROPIC_BASE } else { oauth::BIGMODEL_ANTHROPIC_BASE };
                 return Ok(Some(ApiKeyInfo {
-                    label: "Coding Plan".into(),
+                    label: "平台 Key".into(),
                     api_key: key,
                     base_url: base.into(),
                     provider,
