@@ -150,13 +150,15 @@ export function bestOtherModel(q, model) {
 }
 
 /**
- * 额度条纯逻辑：官方（ZCode 3.14+）额度面板以“剩余”为基准（如 9.7% = 还剩 9.7%），
- * 这里对齐同一语义。入参仍是后端 QuotaItem.percent_used（已用%），出参全部转为剩余：
- * - rem: 精确剩余百分比；w: 取整后的剩余，颜色分支与条宽共用这一个舍入值（0% 标签不得黄绿并存）
+ * 额度条纯逻辑：官方（ZCode 3.14+）额度面板以“剩余”为基准（如 9.7% = 还剩 9.7%）。
+ * 视觉方向与配色：剩余段锚定左侧（绿），消耗后从右侧向左侧减退（黄=已用从右往左生长）；
+ * 剩余 ≤ low%（快用尽）时剩余段转红；完全用尽整条黄（已用色铺满）。
+ * 入参仍是后端 QuotaItem.percent_used（已用%），出参全部转为剩余：
+ * - rem: 精确剩余百分比；w: 取整后的剩余，颜色分支与条宽共用这一个舍入值（0% 标签不得撞色误导）
  * - txt: 条内标签；剩余 <10% 时保留一位小数（“还剩 0.4%”不能被舍入成 0% 误导成耗尽）
- * - segs: 条形分段，kind: green(没用过)/red(已用)/yellow(剩余)
+ * - segs: 条形分段（左→右），kind: green(剩余充足)/red(剩余紧张)/yellow(已用)
  */
-export function quotaBarParts(usedPct) {
+export function quotaBarParts(usedPct, low = LOW_THRESHOLD) {
   const n = Number(usedPct);
   if (usedPct == null || !isFinite(n)) return { rem: null, w: null, txt: "--", segs: [] };
   const used = Math.min(100, Math.max(0, n));
@@ -165,8 +167,8 @@ export function quotaBarParts(usedPct) {
   const txt = (rem > 0 && rem < 10 ? (rem >= 0.05 ? rem.toFixed(1) : "0") : String(w)) + "%";
   let segs;
   if (w >= 100) segs = [{ width: 100, kind: "green" }];
-  else if (w <= 0) segs = [{ width: 100, kind: "red" }];
-  else segs = [{ width: 100 - w, kind: "red" }, { width: w, kind: "yellow" }];
+  else if (w <= 0) segs = [{ width: 100, kind: "yellow" }];
+  else segs = [{ width: w, kind: rem <= low ? "red" : "green" }, { width: 100 - w, kind: "yellow" }];
   return { rem, w, txt, segs };
 }
 

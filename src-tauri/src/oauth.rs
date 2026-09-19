@@ -565,14 +565,25 @@ pub fn resolve_biz_api_key(base: &str, auth: &str, require_secret: bool) -> Resu
             .map_err(|e| format!("响应非 JSON: {e}（{}）", text.chars().take(120).collect::<String>()))
     };
     let get_json = |url: &str| -> Result<Value, String> {
-        finish(
-            agent
-                .get(url)
-                .set("Authorization", auth)
-                .set("User-Agent", &ua)
-                .set("Content-Type", "application/json")
-                .call(),
-        )
+        // api.z.ai 的 WAF 偶发空响应/TLS 重置（EOF at column 0），重试 3 次+退避
+        let mut last = String::new();
+        for attempt in 0..3 {
+            match finish(
+                agent
+                    .get(url)
+                    .set("Authorization", auth)
+                    .set("User-Agent", &ua)
+                    .set("Content-Type", "application/json")
+                    .call(),
+            ) {
+                Ok(v) => return Ok(v),
+                Err(e) => last = e,
+            }
+            if attempt + 1 < 3 {
+                std::thread::sleep(Duration::from_millis(700 * (attempt as u64 + 1)));
+            }
+        }
+        Err(last)
     };
     let cust = get_json(&format!("{base}/api/biz/customer/getCustomerInfo"))
         .map_err(|e| format!("getCustomerInfo: {e}"))?;

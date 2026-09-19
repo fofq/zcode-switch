@@ -757,17 +757,14 @@ function quotaPanelHtml(tot) {
     // 面板百分比同样以“剩余”为基准（对齐官方），红段=已用、黄/绿段=剩余
     const pct = x.total > 0 ? Math.max(0, Math.min(100, Math.round((x.remaining / x.total) * 100))) : 0;
     const rows = x.sources.map((src) => {
-      const w = src.total > 0 ? Math.max(0, Math.min(100, Math.round((src.remaining / src.total) * 100))) : 0;
-      const bar = w >= 100
-        ? `<i style="width:100%;background:${BAR_GREEN}"></i>`
-        : w <= 0
-          ? `<i style="width:100%;background:${BAR_RED}"></i>`
-          : `<i style="width:${100 - w}%;background:${BAR_RED}"></i><i style="width:${w}%;background:${BAR_YELLOW}"></i>`;
+      // 与行内额度条同一套语义：剩余绿（紧张红）锚左、已用黄从右往左生长
+      const parts = quotaBarParts(src.total > 0 ? (1 - src.remaining / src.total) * 100 : null);
+      const bar = parts.segs.map((s) => `<i style="width:${s.width}%;background:${BAR_SEG_COLOR[s.kind]}"></i>`).join("");
       return `<div class="qhd-row">
         <span class="qhd-acct" title="${esc(src.account)}">${esc(src.account)}</span>
         <span class="qhd-num">${esc(fmtTokens(src.remaining))}/${esc(fmtTokens(src.total))}</span>
         <span class="qhd-bar">${bar}</span>
-        <span class="qhd-pct">${w}%</span>
+        <span class="qhd-pct">${esc(parts.txt)}</span>
       </div>`;
     }).join("");
     body = `<div class="qhd-sec-head">
@@ -1947,7 +1944,7 @@ async function autoClaimTick() {
   }
 }
 
-// 额度状态色：没用过=绿、用尽=红、部分使用=红(已用)+黄(剩余) 双色
+// 额度状态色：剩余=绿（快用尽转红）、已用=黄、完全用尽=整条黄
 const BAR_GREEN = "#62c370", BAR_RED = "#e0566a", BAR_YELLOW = "#e6c84a";
 const BAR_SEG_COLOR = { green: BAR_GREEN, red: BAR_RED, yellow: BAR_YELLOW };
 
