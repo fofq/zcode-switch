@@ -237,6 +237,9 @@ export function filterAccounts(accounts, { search = "", health = "all" } = {}, h
  */
 export function sortAccounts(accounts, sort, healthMap, localeTag = "zh-CN", opts = {}) {
   const arr = [...(accounts || [])];
+  // dir：正序(1)/倒序(-1)，作用于主排序键（分层的置顶/无数据沉底规则不翻转）
+  const d = opts.dir === -1 ? -1 : 1;
+  const keyOf = opts.keyOf || (() => -1);
   const pctOf = (a) => {
     const p = healthMap?.get(a.id)?.remainingPct;
     return p == null ? -1 : p;
@@ -250,11 +253,14 @@ export function sortAccounts(accounts, sort, healthMap, localeTag = "zh-CN", opt
     String(a.name || "").localeCompare(String(b.name || ""), localeTag, { sensitivity: "base" });
   switch (sort) {
     case "name":
-      return arr.sort(byName);
+      return arr.sort((a, b) => d * byName(a, b));
     case "updated":
-      return arr.sort((a, b) => String(b.updated_at || "").localeCompare(String(a.updated_at || "")) || byName(a, b));
+      return arr.sort((a, b) => d * String(b.updated_at || "").localeCompare(String(a.updated_at || "")) || byName(a, b));
     case "created":
-      return arr.sort((a, b) => String(a.created_at || "").localeCompare(String(b.created_at || "")) || byName(a, b));
+      return arr.sort((a, b) => d * String(a.created_at || "").localeCompare(String(b.created_at || "")) || byName(a, b));
+    case "focus":
+    case "gift":
+      return arr.sort((a, b) => d * (keyOf(b) - keyOf(a)) || byName(a, b));
     case "quota":
     default: {
       // 分层排序：
@@ -273,7 +279,7 @@ export function sortAccounts(accounts, sort, healthMap, localeTag = "zh-CN", opt
         (a, b) =>
           tierOf(a) - tierOf(b)
           || noData(a) - noData(b)
-          || pctOf(b) - pctOf(a)
+          || d * (pctOf(b) - pctOf(a))
           || rankOf(a) - rankOf(b)
           || byName(a, b),
       );

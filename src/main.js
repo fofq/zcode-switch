@@ -63,7 +63,7 @@ function idLabel(id) {
 // ---------- 列表视图状态（搜索 / 筛选 / 排序 / 密度 / 选择） ----------
 
 const UI_PREFS_KEY = "zsw-list-prefs";
-const SORTS = ["quota", "name", "created", "updated"];
+const SORTS = ["quota", "focus", "gift", "name", "created", "updated"];
 
 function loadPrefs() {
   try {
@@ -77,6 +77,7 @@ const ui = {
   search: "",
   health: "all",
   sort: SORTS.includes(savedPrefs.sort) ? savedPrefs.sort : "quota",
+  sortDir: savedPrefs.sortDir === -1 ? -1 : 1,
   density: savedPrefs.density === "detail" ? "detail" : "compact",
   hideInfo: savedPrefs.hideInfo === true,
   qhOpen: false,
@@ -166,7 +167,7 @@ function autoSwitchTitle(s) {
 
 function savePrefs() {
   try {
-    localStorage.setItem(UI_PREFS_KEY, JSON.stringify({ sort: ui.sort, density: ui.density, hideInfo: ui.hideInfo }));
+    localStorage.setItem(UI_PREFS_KEY, JSON.stringify({ sort: ui.sort, sortDir: ui.sortDir, density: ui.density, hideInfo: ui.hideInfo }));
   } catch { /* 忽略 */ }
 }
 
@@ -196,6 +197,17 @@ function isAuthErr(q) {
 }
 
 const HEALTH_PREFIX = "grp.health.";
+/** 扩展排序维度的取值：关注模型额度（判定用 %）、礼物剩余量（token 数） */
+function sortKeyValue(a, sort) {
+  if (sort !== "focus" && sort !== "gift") return null;
+  const h = healthMapOf().get(a.id) || {};
+  if (sort === "focus") return h.focusPct ?? -1;
+  let sum = 0;
+  for (const p of acctQuota[a.id]?.data?.plans || []) {
+    if (p.gift === true) sum += Number(p.remaining ?? 0);
+  }
+  return sum;
+}
 const SORT_PREFIX = "list.sort.";
 function healthLabel(level) {
   return t(HEALTH_PREFIX + level);
@@ -623,7 +635,7 @@ function visibleAccounts() {
   const list = sortAccounts(
     filterAccounts(state?.accounts || [], { search: ui.search, health: ui.health }, hm),
     ui.sort, hm, localeTag(),
-    { threshold: Number(state?.auto_switch_threshold ?? 10) },
+    { threshold: Number(state?.auto_switch_threshold ?? 10), dir: ui.sortDir, keyOf: (a) => sortKeyValue(a, ui.sort) },
   );
   return { list, hm };
 }
@@ -806,6 +818,7 @@ function listHeadHtml(s, sum, visible) {
         <select class="mini-sel" change="actions.setSort(event)" aria-label="${esc(t("list.sortLabel"))}">
           ${SORTS.map((v) => `<option value="${v}"${ui.sort === v ? " selected" : ""}>${esc(t(SORT_PREFIX + v))}</option>`).join("")}
         </select>
+        <button class="icon-btn sm" title="${t("list.sortDirTitle")}" aria-label="${t("list.sortDirTitle")}" click="actions.setSortDir()">${ic(ui.sortDir === -1 ? "arrowUp" : "arrowDown", 13)}</button>
         <div class="view-seg" role="group" aria-label="${esc(t("list.densityLabel"))}">
           <button class="vs-opt${ui.density === "compact" ? " on" : ""}" aria-pressed="${ui.density === "compact"}" click="actions.setDensity('compact')">${t("list.density.compact")}</button>
           <button class="vs-opt${ui.density === "detail" ? " on" : ""}" aria-pressed="${ui.density === "detail"}" click="actions.setDensity('detail')">${t("list.density.detail")}</button>
@@ -960,6 +973,12 @@ const actions = {
   setQhTab(name) {
     ui.qhTab = name;
     refreshQuotaModal();
+  },
+
+  setSortDir() {
+    ui.sortDir = ui.sortDir === -1 ? 1 : -1;
+    savePrefs();
+    render();
   },
 
   async setGrouped(on) {
@@ -1916,12 +1935,14 @@ const BAR_GREEN = "#62c370", BAR_RED = "#e0566a", BAR_YELLOW = "#e6c84a";
 
 function quotaBarHtml(pct) {
   const used = pct == null ? null : Math.min(100, Math.max(0, pct));
-  const txt = used == null ? "--" : used.toFixed(0) + "%";
+  // 分支与标签共用同一个舍入值：0.3% 已用会显示成 0%，但颜色不能再装作“完全没用过”
+  const w = used == null ? null : Math.round(used);
+  const txt = w == null ? "--" : w + "%";
   let body = "";
-  if (used != null) {
-    if (used <= 0) body = `<span class="qb-seg" style="width:100%;background:${BAR_GREEN}"></span>`;
-    else if (used >= 100) body = `<span class="qb-seg" style="width:100%;background:${BAR_RED}"></span>`;
-    else body = `<span class="qb-seg" style="width:${used}%;background:${BAR_RED}"></span><span class="qb-seg" style="width:${100 - used}%;background:${BAR_YELLOW}"></span>`;
+  if (w != null) {
+    if (w <= 0) body = `<span class="qb-seg" style="width:100%;background:${BAR_GREEN}"></span>`;
+    else if (w >= 100) body = `<span class="qb-seg" style="width:100%;background:${BAR_RED}"></span>`;
+    else body = `<span class="qb-seg" style="width:${w}%;background:${BAR_RED}"></span><span class="qb-seg" style="width:${100 - w}%;background:${BAR_YELLOW}"></span>`;
   }
   return `<div class="qbar">${body}<span class="qbar-pct in-fill">${txt}</span></div>`;
 }
@@ -2722,7 +2743,7 @@ async function autoSwitchTick(manual = false) {
     .filter((a) => a.id !== active.id)
     .map((a) => ({ a, h: hm.get(a.id) }))
     .filter((x) => x.h && x.h.level !== "auth" && x.h.level !== "fail")
-    .filter((x) => x.h?.remainingPct != null && x.h.remainingPct > thr);
+    .filter((x) => x.h?.remainingPct != null && x.h.remainingPct >= thr);
   // 关注模型仍有额度的账号优先；流转账号（判定来自其它模型）只做兜底
   const focusCands = pool.filter((x) => x.h.modelMatched && !x.h.fallback);
   const flowCands = pool.filter((x) => x.h.fallback);
