@@ -852,20 +852,36 @@ pub fn switch_to(paths: &Paths, id: &str, force: bool, restart: bool, hot: bool)
         if !zcode_running() {
             let _ = write_live_arms_uid(paths, &uid);
         }
+        // 强制重启对当前账号同样生效：凭据本就在位，关闭→拉起即可（不切号、只重启）
+        let mut killed = false;
+        let mut launched = false;
+        if force && restart && zcode_running() {
+            if kill_zcode()? {
+                killed = true;
+            }
+            let (zpath, ok) = effective_zcode_path(paths);
+            if ok && launch_zcode(&zpath).is_ok() {
+                launched = true;
+            }
+        }
         return Ok(SwitchResult {
             switched: false,
             already_active: true,
             name: target.name,
             preserved_as: None,
-            killed: false,
-            launched: false,
+            killed,
+            launched,
             hot: false,
             config_stale: false,
         });
     }
 
     let running = zcode_running();
-    if hot && running {
+    // 热切换守卫：zcode 在跑但没有任何登录态（用户手动退出后客户端自动重启的空壳状态），
+    // 热写入凭据运行中的客户端观察不到，等于白写——直接走冷路径（关闭→写入→拉起）
+    let live_logged = live.as_ref().is_some_and(|v| is_logged_in(v));
+    let force_cold = hot && running && !live_logged;
+    if hot && running && live_logged {
         if let Err(e) = sync_live_back_to_source(paths, &accounts) {
             eprintln!("sync-back 失败(不阻断切换): {e}");
         }
@@ -898,7 +914,8 @@ pub fn switch_to(paths: &Paths, id: &str, force: bool, restart: bool, hot: bool)
 
     let mut killed = false;
     if running {
-        if !force {
+        // force_cold：热切换请求落到无登录态的客户端上，视同已确认的强制冷切换
+        if !force && !force_cold {
             return Err(tr("err.switch.running"));
         }
         if !kill_zcode()? {
