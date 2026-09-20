@@ -41,6 +41,11 @@ jobs:
       - name: Check auto-switch decision logic
         run: npm run check:autoswitch
 
+      # 特性分支也跑 Rust 单测（原先只有 ci.yml 在 PR/main 上跑，feat/** 开发时测不到）
+      - name: Rust unit tests
+        working-directory: src-tauri
+        run: cargo test --lib
+
       - name: Build (前端 + Rust + NSIS)
         run: npm run tauri build -- --bundles ${{ github.event.inputs.bundles || 'nsis' }}
 
