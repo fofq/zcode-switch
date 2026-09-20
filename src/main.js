@@ -2721,6 +2721,7 @@ const SWEEP_PERIOD = 5 * 60 * 1000;
 // 阶梯式刷新：当前使用中的账号用短周期，加速自动切换的响应；其余账号维持长周期
 const SWEEP_PERIOD_ACTIVE = 45 * 1000;
 const SWEEP_JITTER = 0.2;
+const SWEEP_BATCH = 3; // 每 tick 并发拉取上限（吞吐 0.375/s > 全库需求 0.17/s）
 const TICK_MS = 8000;
 let quotaDue = {};
 let ticking = false;
@@ -2863,24 +2864,39 @@ async function sweepTick() {
   enrollAccounts();
   expiryRefreshTick();
   const now = Date.now();
-  const due = (state?.accounts || []).find(
+  // 饥饿修复：扫描 8s 一发、每轮 1 个账号的吞吐（0.125/s）低于全库需求
+  // （51 号 × 45s 周期 ≈ 0.17/s），按列表顺序取会让排后的账号（含当前账号快车道）
+  // 永远轮不到——额度耗尽只能靠手动刷新发现。改为：当前账号优先，其余按到期时间
+  // 升序，每轮最多并发 SWEEP_BATCH 个拉取。
+  const due = (state?.accounts || []).filter(
     (a) => (quotaDue[a.id] ?? Infinity) <= now && !acctQuota[a.id]?.busy && !claimable[a.id]?.busy,
   );
-  if (!due) return;
+  if (!due.length) return;
+  due.sort((x, y) => (quotaDue[x.id] ?? 0) - (quotaDue[y.id] ?? 0));
+  const activeIdx = due.findIndex((a) => a.is_active);
+  const batch = [];
+  if (activeIdx >= 0) batch.push(due[activeIdx]);
+  for (const a of due) {
+    if (batch.length >= SWEEP_BATCH) break;
+    if (!batch.includes(a)) batch.push(a);
+  }
   ticking = true;
-  const dueAt = quotaDue[due.id];
+  const dueAtMap = new Map(batch.map((a) => [a.id, quotaDue[a.id]]));
   try {
-    await loadAcctQuota(due.id);
-    if (quotaDue[due.id] === dueAt) scheduleNext(due.id);
+    await Promise.all(batch.map((a) => loadAcctQuota(a.id)));
+    for (const a of batch) {
+      if (quotaDue[a.id] === dueAtMap.get(a.id)) scheduleNext(a.id);
+    }
     // 刷新后即时切换：当前账号的判定额度刚跌破阈值（状态跨越，非稳态）→ 立刻切，不等下个检查周期
-    if (due.id === state?.active_account_id && !autoSwitchRunning) {
-      const h = healthMapOf().get(due.id);
+    const cur = batch.find((a) => a.is_active);
+    if (cur && !autoSwitchRunning) {
+      const h = healthMapOf().get(cur.id);
       const thr = Number(state?.auto_switch_threshold ?? 15);
       const nowPct = h?.remainingPct ?? null;
-      const prev = prevJudgePct.get(due.id);
+      const prev = prevJudgePct.get(cur.id);
       const crossed = nowPct != null && nowPct <= thr && (prev == null || prev > thr)
         && h?.level !== "auth" && h?.level !== "fail";
-      prevJudgePct.set(due.id, nowPct);
+      prevJudgePct.set(cur.id, nowPct);
       if (crossed) autoSwitchTick(true); // manual 语义 = 跳过 5 分钟冷却
     }
     if (!uiLocked()) render();
