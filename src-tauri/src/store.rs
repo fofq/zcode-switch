@@ -148,7 +148,7 @@ impl Settings {
     pub fn grouped(&self) -> bool { self.grouped.unwrap_or(true) }
     pub fn oauth_browser(&self) -> bool { self.oauth_browser.unwrap_or(true) }
     pub fn auto_switch(&self) -> bool { self.auto_switch.unwrap_or(false) }
-    pub fn auto_switch_threshold(&self) -> u32 { self.auto_switch_threshold.unwrap_or(10).clamp(1, 90) }
+    pub fn auto_switch_threshold(&self) -> u32 { self.auto_switch_threshold.unwrap_or(15).clamp(1, 90) }
     pub fn auto_switch_model(&self) -> Option<String> {
         self.auto_switch_model
             .as_deref()

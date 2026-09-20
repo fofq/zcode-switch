@@ -3,7 +3,7 @@ import { listen } from "@tauri-apps/api/event";
 import { esc, toast, openPwModal, openConfirmModal, openProviderModal, installDelegation, dismissSplash } from "./ui.js";
 import { ic } from "./icons.js";
 import { init, t, has, lang, localeTag, stripErr, errCode } from "./i18n.js";
-import { HEALTH_ORDER, healthOf, filterAccounts, sortAccounts, bucketAccounts, summarize, modelKeyMatch, quotaBarParts } from "./list.js";
+import { HEALTH_ORDER, healthOf, filterAccounts, sortAccounts, bucketAccounts, summarize, modelKeyMatch, quotaBarParts, planExpired } from "./list.js";
 
 const $app = document.getElementById("app");
 let state = null;
@@ -156,7 +156,7 @@ let lastAutoSwitchAt = 0;
 let autoSwitchNote = "";
 
 function autoSwitchTitle(s) {
-  const bits = [t("as.label"), t("as.threshold", { pct: s?.auto_switch_threshold ?? 10 })];
+  const bits = [t("as.label"), t("as.threshold", { pct: s?.auto_switch_threshold ?? 15 })];
   const m = String(s?.auto_switch_model || "").trim();
   if (m) bits.push(t("as.model", { model: m }));
   if (autoSwitchRunning) bits.push(t("as.switching"));
@@ -215,7 +215,7 @@ function sortKeyValue(a, sort) {
   }
   let sum = 0;
   for (const p of plans) {
-    if (p.gift !== true) continue;
+    if (p.gift !== true || planExpired(p)) continue;
     if (p.remaining != null) sum += Number(p.remaining);
     else for (const it of p.items || []) sum += Number(it.remaining ?? 0);
   }
@@ -230,7 +230,7 @@ function healthMapOf() {
   const opts = {
     giftFirst: !!state?.auto_switch_gift_first,
     modelFallback: !!state?.auto_switch_model_fallback,
-    threshold: Number(state?.auto_switch_threshold ?? 10),
+    threshold: Number(state?.auto_switch_threshold ?? 15),
   };
   const map = new Map();
   for (const a of state?.accounts || []) map.set(a.id, healthOf(a, acctQuota[a.id], isAuthErr, model, opts));
@@ -323,7 +323,7 @@ function stAutoSwitchExtra() {
     <div class="st-row">
       <div class="st-lab">${t("s.autoSwitchThr")}</div>
       <div class="st-ctl">
-        <input class="auto-switch-thr" type="number" min="1" max="90" step="1" value="${state?.auto_switch_threshold ?? 10}" change="actions.stSetThreshold(event)">
+        <input class="auto-switch-thr" type="number" min="1" max="90" step="1" value="${state?.auto_switch_threshold ?? 15}" change="actions.stSetThreshold(event)">
         <span class="thr-pct">%</span>
       </div>
     </div>
@@ -648,7 +648,7 @@ function visibleAccounts() {
   const list = sortAccounts(
     filterAccounts(state?.accounts || [], { search: ui.search, health: ui.health }, hm),
     ui.sort, hm, localeTag(),
-    { threshold: Number(state?.auto_switch_threshold ?? 10), dir: ui.sortDir, keyOf: (a) => sortKeyValue(a, ui.sort) },
+    { threshold: Number(state?.auto_switch_threshold ?? 15), dir: ui.sortDir, keyOf: (a) => sortKeyValue(a, ui.sort) },
   );
   return { list, hm };
 }
@@ -670,14 +670,18 @@ function groupedListHtml(accounts, rowHtml, healthMap) {
   }).join("");
 }
 
+const GIFT_CHIPS = [["gift:weekend", "grp.health.giftWeekend"], ["gift:global", "grp.health.giftGlobal"]];
+
 function chipsHtml(sum) {
-  // gift 是正交筛选维度（计数来自 hasGift），永远排在最前
-  const levels = ["all", ...["gift", ...HEALTH_ORDER].filter((lv) => lv === ui.health || sum.counts[lv] > 0)];
+  // 礼物是正交筛选维度，按活动细分（Weekend/Global Build），永远排在最前
+  const giftLv = GIFT_CHIPS.map(([lv]) => lv);
+  const levels = ["all", ...[...giftLv, ...HEALTH_ORDER].filter((lv) => lv === ui.health || (sum.counts[lv] ?? 0) > 0)];
   return `<div class="chips" role="group" aria-label="${esc(t("list.filterLabel"))}">` +
     levels.map((lv) => {
       const on = ui.health === lv;
       const n = lv === "all" ? (state?.accounts || []).length : sum.counts[lv];
-      const label = lv === "all" ? t("list.filterAll") : healthLabel(lv);
+      const giftChip = GIFT_CHIPS.find(([k]) => k === lv);
+      const label = lv === "all" ? t("list.filterAll") : giftChip ? t(giftChip[1]) : healthLabel(lv);
       return `<button class="chip${lv === "all" ? "" : " " + lv}${on ? " on" : ""}" aria-pressed="${on}" click="actions.setHealth('${lv}')">${esc(label)}<span class="chip-n">${n}</span></button>`;
     }).join("") + `</div>`;
 }
@@ -1016,7 +1020,7 @@ const actions = {
   },
 
   setHealth(lv) {
-    ui.health = (lv === "gift" || HEALTH_ORDER.includes(lv)) ? lv : "all";
+    ui.health = (lv.startsWith("gift:") || HEALTH_ORDER.includes(lv)) ? lv : "all";
     render();
   },
 
@@ -1794,7 +1798,7 @@ const actions = {
       render();
       syncSettingsModal();
       if (next) {
-        toast(t("as.on"), "ok", t("as.onDetail", { pct: state?.auto_switch_threshold ?? 10 }));
+        toast(t("as.on"), "ok", t("as.onDetail", { pct: state?.auto_switch_threshold ?? 15 }));
         setTimeout(autoSwitchTick, 1200);
       } else {
         autoSwitchNote = "";
@@ -2138,12 +2142,13 @@ function hasQuotaDetail(id) {
 
 function planGroupHtml(p, omitTier = false) {
   const label = p.tier_code === "other" && !p.pid ? t("q.other") : (p.name || p.tier || "");
+  const expiredTag = planExpired(p) ? `<span class="plan-expired">${esc(t("list.planExpired"))}</span>` : "";
   const exp = expireInfo(p.expire);
   return `
   <div class="plan-grp">
     <div class="pg-head">
       ${p.tier && !omitTier ? tierChipHtml(p.tier, p.tier_code) : ""}
-      <span class="pg-name" title="${esc(label)}">${esc(label)}</span>
+      <span class="pg-name" title="${esc(label)}">${esc(label)}</span>${expiredTag}
       ${exp ? `<span class="pg-exp${exp.warn ? " warn-line" : ""}" title="${esc(t("q.validUntil", { date: exp.text }))}">${esc(t("q.validUntilShort", { date: exp.text }))}</span>` : ""}
     </div>
     ${slotRowsHtml(p.items)}
@@ -2721,13 +2726,15 @@ function scheduleNext(id, base = Date.now()) {
     // 活跃账号自适应频率：看关注模型的原始百分比（流转后判定高不代表关注模型没耗尽），
     // 越接近切换阈值刷新越勤——每日重置等额度恢复能第一时间发现并切回
     period = SWEEP_PERIOD_ACTIVE;
-    const thr = Number(state?.auto_switch_threshold ?? 10);
+    const thr = Number(state?.auto_switch_threshold ?? 15);
     const h = healthMapOf().get(id);
     const fp = h?.focusPct;
-    if (fp != null) {
-      if (fp <= thr) period = 8 * 1000;                         // 关注模型已耗尽：高频盯防（等重置/等待其它账号变化）
-      else if (fp <= thr * 2) period = 12 * 1000;               // 逼近阈值：加密
-      else period = 20 * 1000;                                  // 活跃账号整体提速：正在消耗的就是它，45s 太钝
+    if (h?.level === "dead") {
+      period = 30 * 1000;                                       // 判死（无套餐/全过期）：靠领取/到期定点刷新翻状态，不必高频盯
+    } else if (fp != null) {
+      if (fp <= thr) period = 6 * 1000;                         // 关注模型已耗尽：高频盯防（等重置/等待其它账号变化）
+      else if (fp <= thr * 2) period = 10 * 1000;               // 逼近阈值：加密
+      else period = 15 * 1000;                                  // 活跃账号整体提速：正在消耗的就是它
     }
   }
   quotaDue[id] = base + Math.round(period * jitter);
@@ -2752,7 +2759,7 @@ async function autoSwitchTick(manual = false) {
   const hm = healthMapOf();
   const cur = hm.get(active.id);
   if (!cur || cur.remainingPct == null) return;
-  const thr = Number(s.auto_switch_threshold ?? 10);
+  const thr = Number(s.auto_switch_threshold ?? 15);
 
   // 候选池：其它账号中判定额度 > 阈值 且 非鉴权失效/查询失败
   const pool = s.accounts
@@ -2791,7 +2798,7 @@ async function autoSwitchTick(manual = false) {
     return;
   }
   // 候选排序：额度高者优先；礼物/套餐临期的账号再插队，尽快把赠送额度用掉
-  const giftSoon = (a) => (acctQuota[a.id]?.data?.plans || []).some((p) => expireInfo(p.expire)?.warn);
+  const giftSoon = (a) => (acctQuota[a.id]?.data?.plans || []).some((p) => !planExpired(p) && expireInfo(p.expire)?.warn);
   const best = targetPool
     .map((x) => ({ ...x, gift: giftSoon(x.a) ? 1 : 0 }))
     .sort((x, y) => (y.gift - x.gift) || (y.h.remainingPct - x.h.remainingPct))[0];
@@ -2824,9 +2831,31 @@ async function autoSwitchTick(manual = false) {
   }
 }
 
+// 套餐有效期定点刷新：有效期刚跨过的账号立刻刷一次（跨过时刻的 10 分钟窗口内，按有效期时间戳去重）
+const expiryRefreshDone = new Map();
+const prevJudgePct = new Map();
+function expiryRefreshTick() {
+  const now = Date.now();
+  for (const a of state?.accounts || []) {
+    if (acctQuota[a.id]?.busy) continue;
+    for (const p of acctQuota[a.id]?.data?.plans || []) {
+      const txt = String(p.expire || "");
+      if (!txt) continue;
+      const hasTime = txt.length >= 16;
+      const ms = new Date(hasTime ? txt.replace(" ", "T") : txt + "T23:59:59").getTime();
+      if (!isFinite(ms) || ms > now || now - ms > 10 * 60000) continue;
+      if (expiryRefreshDone.get(a.id) === ms) continue;
+      expiryRefreshDone.set(a.id, ms);
+      quotaDue[a.id] = now;
+      break;
+    }
+  }
+}
+
 async function sweepTick() {
   if (ticking || quotaSweep.running) return;
   enrollAccounts();
+  expiryRefreshTick();
   const now = Date.now();
   const due = (state?.accounts || []).find(
     (a) => (quotaDue[a.id] ?? Infinity) <= now && !acctQuota[a.id]?.busy && !claimable[a.id]?.busy,
@@ -2837,6 +2866,17 @@ async function sweepTick() {
   try {
     await loadAcctQuota(due.id);
     if (quotaDue[due.id] === dueAt) scheduleNext(due.id);
+    // 刷新后即时切换：当前账号的判定额度刚跌破阈值（状态跨越，非稳态）→ 立刻切，不等下个检查周期
+    if (due.id === state?.active_account_id && !autoSwitchRunning) {
+      const h = healthMapOf().get(due.id);
+      const thr = Number(state?.auto_switch_threshold ?? 15);
+      const nowPct = h?.remainingPct ?? null;
+      const prev = prevJudgePct.get(due.id);
+      const crossed = nowPct != null && nowPct <= thr && (prev == null || prev > thr)
+        && h?.level !== "auth" && h?.level !== "fail";
+      prevJudgePct.set(due.id, nowPct);
+      if (crossed) autoSwitchTick(true); // manual 语义 = 跳过 5 分钟冷却
+    }
     if (!uiLocked()) render();
   } finally {
     ticking = false;

@@ -244,6 +244,9 @@ pub struct PlanSlot {
     /// 礼物/赠送类套餐（entitlements 全部为 one_time 一次性发放）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub gift: Option<bool>,
+    /// 套餐已过期（status != active，或 active 但 ends_at 已过服务器时间）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expired: Option<bool>,
     pub total: Option<f64>,
     pub used: Option<f64>,
     pub remaining: Option<f64>,
@@ -1240,13 +1243,13 @@ fn normalize_balance(balance_data: &Value) -> QuotaOverview {
         .get("plans")
         .and_then(|p| p.as_array())
         .map(|arr| {
+            // 全部套餐入槽（含过期）：过期桶挂回过期套餐，避免孤儿额度另立「其他额度」
+            // 也让 UI 能区分「真没数据」和「套餐过期」；官方客户端同样做客户端过期判定
+            let now_secs = balance
+                .get("server_time")
+                .and_then(|t| t.as_i64())
+                .unwrap_or_else(|| chrono::Utc::now().timestamp());
             arr.iter()
-                .filter(|pl| {
-                    pl.get("status")
-                        .and_then(|s| s.as_str())
-                        .map(|s| s.eq_ignore_ascii_case("active"))
-                        .unwrap_or(false)
-                })
                 .map(|pl| {
                     let pid = pl.get("plan_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
                     let pname = pl.get("name").and_then(|v| v.as_str()).map(str::to_string);
@@ -1260,6 +1263,14 @@ fn normalize_balance(balance_data: &Value) -> QuotaOverview {
                         }),
                         _ => pname.as_deref().map(|n| is_gift_plan_name(n)).unwrap_or(false),
                     };
+                    let status_active = pl
+                        .get("status")
+                        .and_then(|s| s.as_str())
+                        .map(|s| s.eq_ignore_ascii_case("active"))
+                        .unwrap_or(true);
+                    let ends_at = pl.get("ends_at").and_then(|v| v.as_i64()).unwrap_or(0);
+                    let server_expired = ends_at > 0 && ends_at <= now_secs;
+                    let expired = !status_active || server_expired;
                     PlanSlot {
                         pid: pid.clone(),
                         tier: Some(tier),
@@ -1267,6 +1278,7 @@ fn normalize_balance(balance_data: &Value) -> QuotaOverview {
                         name: Some(pname.filter(|s| !s.trim().is_empty()).unwrap_or(pid)),
                         expire: extract_expire(pl),
                         gift: Some(gift),
+                        expired: expired.then_some(true),
                         ..Default::default()
                     }
                 })

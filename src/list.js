@@ -62,7 +62,7 @@ export function modelRemainingPct(q, model) {
     if (isFinite(total) && total > 0 && isFinite(used)) pcts.push((used / total) * 100);
   };
   for (const it of d.items || []) consider(it);
-  for (const p of d.plans || []) for (const it of p.items || []) consider(it);
+  for (const p of livePlans(q)) for (const it of p.items || []) consider(it);
   if (!pcts.length) return null;
   const bestUsed = Math.min(...pcts);
   return Math.max(0, Math.min(100, 100 - bestUsed));
@@ -73,6 +73,16 @@ function itemKindOf(it) {
   if (it.name.includes("提示次数")) return "prompt_count";
   if (it.name.includes("使用时长")) return "duration";
   return "raw";
+}
+
+/** 套餐是否已过期（后端 expired 标记：status != active 或 ends_at 已过服务器时间） */
+export function planExpired(p) {
+  return p?.expired === true;
+}
+
+/** 账号在用的套餐：排除过期套餐（过期桶只是留档，额度不可用） */
+function livePlans(q) {
+  return (q?.data?.plans || []).filter((p) => !planExpired(p));
 }
 
 /** 套餐分类：优先用后端 gift 标记（entitlements 全部 one_time = 礼物/赠送），旧数据回退名字启发式 */
@@ -102,7 +112,7 @@ function modelPctInPlans(q, model, wantGift) {
     const used = Number(it.used);
     if (isFinite(total) && total > 0 && isFinite(used)) pcts.push((used / total) * 100);
   };
-  for (const p of d.plans || []) {
+  for (const p of livePlans(q)) {
     if (planIsGift(p) !== wantGift) continue;
     for (const it of p.items || []) consider(it);
   }
@@ -116,6 +126,18 @@ export function modelRemainingPctDetailed(q, model) {
     gift: modelPctInPlans(q, model, true),
     regular: modelPctInPlans(q, model, false),
   };
+}
+
+/**
+ * 礼物套餐细分（用户要求按活动名分组）：Weekend Build / Global Build，
+ * 其它活动名回退 generic "gift"。过期套餐不算。
+ */
+export function giftKindOfPlan(p) {
+  if (!planIsGift(p) || planExpired(p)) return null;
+  const n = String(p?.name || "").toLowerCase();
+  if (n.includes("weekend")) return "weekend";
+  if (n.includes("global")) return "global";
+  return "gift";
 }
 
 /** 流转用：关注模型之外、剩余额度最高的其它模型（仅统计额度池/模型条目） */
@@ -140,7 +162,7 @@ export function bestOtherModel(q, model) {
     if (!cur || used < cur.used) best.set(nameLower, { name: it.name, used });
   };
   for (const it of d.items || []) consider(it);
-  for (const p of d.plans || []) for (const it of p.items || []) consider(it);
+  for (const p of livePlans(q)) for (const it of p.items || []) consider(it);
   let out = null;
   for (const b of best.values()) {
     const pct = Math.max(0, Math.min(100, 100 - b.used));
@@ -206,21 +228,35 @@ export function healthOf(acct, quota, isAuthErr, model, opts = {}) {
     }
   }
   const pct = mp != null ? mp : quotaRemainingPct(quota);
-  // 有礼物额度的账号单独成组（展示用：提醒还有礼物可消耗）
-  const hasGift = (quota?.data?.plans || []).some((p) => p.gift === true && Number(p.remaining ?? 1) > 0);
+  // 有礼物额度的账号单独成组（展示用：提醒还有礼物可消耗）；过期套餐不算礼物额度
+  const giftKinds = [...new Set(
+    livePlans(quota)
+      .filter((p) => p.gift === true && Number(p.remaining ?? 1) > 0)
+      .map(giftKindOfPlan)
+      .filter(Boolean),
+  )];
+  const hasGift = giftKinds.length > 0;
   // 鉴权失效永远优先（token 过期等，旧数据不可信）
   if (quota?.err && isAuthErr && isAuthErr(quota)) {
-    return { level: "auth", remainingPct: pct, modelMatched: mp != null, modelName, fallback, hasGift, focusPct };
+    return { level: "auth", remainingPct: pct, modelMatched: mp != null, modelName, fallback, hasGift, giftKinds, focusPct };
+  }
+  // 确定性判死：服务器明确返回无套餐（balances/plans 全空且业务码成功），或套餐全部已过期。
+  // 这不是查询失败——刷新永远不会“恢复”，剩余按 0 处理让自动切换能触发切走。
+  const plans = quota?.data?.plans || [];
+  const definiteEmpty = quota?.data?.is_empty === true;
+  const allExpired = plans.length > 0 && plans.every(planExpired);
+  if (definiteEmpty || allExpired) {
+    return { level: "dead", remainingPct: 0, modelMatched: mp != null, modelName, fallback, hasGift: false, giftKinds: [], focusPct: 0 };
   }
   if (pct != null) {
     // 流转账号单独一档：关注模型已耗尽但其它模型仍可用，组名直接表达主状态
     const lv = fallback ? "flowed" : pct <= 0 ? "dead" : pct <= thr ? "low" : "ok";
-    return { level: lv, remainingPct: pct <= 0 ? 0 : pct, modelMatched: mp != null, modelName, fallback, hasGift, focusPct };
+    return { level: lv, remainingPct: pct <= 0 ? 0 : pct, modelMatched: mp != null, modelName, fallback, hasGift, giftKinds, focusPct };
   }
   // 没有任何额度数据时才用错误/回退信号（避免刷新失败把账号闪进失败分组）
-  if (quota?.err) return { level: "fail", remainingPct: null, modelMatched: false, modelName: null, fallback: false, hasGift, focusPct: null };
-  if (acct?.has_user_info === false) return { level: "auth", remainingPct: null, modelMatched: false, modelName: null, fallback: false, hasGift, focusPct: null };
-  return { level: "unknown", remainingPct: null, modelMatched: false, modelName: null, fallback: false, hasGift, focusPct: null };
+  if (quota?.err) return { level: "fail", remainingPct: null, modelMatched: false, modelName: null, fallback: false, hasGift, giftKinds, focusPct: null };
+  if (acct?.has_user_info === false) return { level: "auth", remainingPct: null, modelMatched: false, modelName: null, fallback: false, hasGift, giftKinds, focusPct: null };
+  return { level: "unknown", remainingPct: null, modelMatched: false, modelName: null, fallback: false, hasGift, giftKinds, focusPct: null };
 }
 
 /** 搜索匹配：名称 / 用户名 / 邮箱 / 分组 / 提供方 */
@@ -243,8 +279,8 @@ export function filterAccounts(accounts, { search = "", health = "all" } = {}, h
   return (accounts || []).filter((a) => {
     if (health !== "all") {
       const h = healthMap?.get(a.id);
-      if (health === "gift") {
-        if (!h?.hasGift) return false;
+      if (health.startsWith("gift:")) {
+        if (!h?.giftKinds?.includes(health.slice(5))) return false;
       } else if (!h || h.level !== health) {
         return false;
       }
@@ -336,7 +372,7 @@ export function bucketAccounts(accounts, { localeTag = "zh-CN", healthLabel = ()
  * 合计：各健康度计数 + 平均剩余额度百分比（仅统计已拿到额度的账号，单位无关）。
  */
 export function summarize(accounts, healthMap) {
-  const counts = { gift: 0, ok: 0, low: 0, flowed: 0, dead: 0, auth: 0, fail: 0, unknown: 0 };
+  const counts = { "gift:weekend": 0, "gift:global": 0, ok: 0, low: 0, flowed: 0, dead: 0, auth: 0, fail: 0, unknown: 0 };
   let pctSum = 0;
   let pctCount = 0;
   for (const a of accounts || []) {
@@ -344,8 +380,8 @@ export function summarize(accounts, healthMap) {
     const lv = h?.level || "unknown";
     if (counts[lv] == null) counts.unknown++;
     else counts[lv]++;
-    // 礼物是正交维度：按 hasGift 独立计数，不占健康等级
-    if (h?.hasGift) counts.gift++;
+    // 礼物是正交维度：按活动细分独立计数（同号两类都领则两边都进），不占健康等级
+    for (const k of h?.giftKinds || []) counts[`gift:${k}`] = (counts[`gift:${k}`] ?? 0) + 1;
     if (h?.remainingPct != null) {
       pctSum += h.remainingPct;
       pctCount++;

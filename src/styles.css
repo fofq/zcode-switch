@@ -1089,6 +1089,7 @@ select.two-input { cursor: pointer; }
 
 .plan-grp + .plan-grp { margin-top: 7px; padding-top: 6px; border-top: 1px dashed var(--hairline-soft); }
 .pg-head { display: flex; align-items: center; gap: 7px; margin-bottom: 3px; min-width: 0; }
+.plan-expired { font-family: var(--mono); font-size: 10px; color: #e0566a; border: 1px solid rgba(224,86,106,.45); border-radius: 4px; padding: 1px 5px; margin-left: 6px; }
 .pg-name {
   font-size: 12.5px;
   color: var(--ink-dim);
