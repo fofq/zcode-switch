@@ -455,9 +455,25 @@ fn query_with_token_via(token: &str, fetch: &FetchFn) -> Result<QuotaOverview, S
             ov.source = "zcode.z.ai/billing".into();
             return Ok(ov);
         }
-        Ok(_) => {}
+        Ok(resp) => {
+            // billing 频道自己答出的「无套餐」= 确定性无套餐，不是查询失败。
+            // 注意不能信 Monitor 频道的同款消息：open.bigmodel.cn 对 zai 家族 key
+            // 一律回「不存在coding plan」，那是频道错配不是账号状态
+            let msg = ["msg", "message", "error"]
+                .iter()
+                .find_map(|k| resp.get(k).and_then(|x| x.as_str()).map(String::from))
+                .unwrap_or_default();
+            if is_no_plan_message(&msg) {
+                return Ok(no_plan_overview());
+            }
+            // billing 的真实业务错误要盖过 Monitor 的频道错配消息（后者对 zai key 是垃圾）
+            if best_err.as_deref().map(|e| is_no_plan_message(e)).unwrap_or(false) {
+                let code = resp.get("code").and_then(|c| c.as_i64()).unwrap_or(0);
+                best_err = Some(crate::i18n::trf("err.quota.biz", &[("code", &code.to_string()), ("msg", &msg)]));
+            }
+        }
         Err(e) => {
-            if best_err.is_none() {
+            if best_err.is_none() || best_err.as_deref().map(|e2| is_no_plan_message(e2)).unwrap_or(false) {
                 best_err = Some(e);
             }
         }
@@ -686,11 +702,17 @@ fn query_channels_via(channels: &[Channel], fetch: &FetchFn) -> Result<QuotaOver
                             .find_map(|k| resp.get(k).and_then(|x| x.as_str()).map(String::from))
                             .unwrap_or_default();
                         let code = resp.get("code").and_then(|c| c.as_i64()).unwrap_or(0);
-                        let e = crate::i18n::trf("err.quota.biz", &[("code", &code.to_string()), ("msg", &msg)]);
                         if is_blocked(&resp) && hard_err.is_none() {
                             hard_err = Some(crate::i18n::coded("quota_blocked", "err.quota.blocked", &[]));
                         }
-                        if best_err.is_none() {
+                        // 礼物/订阅全部到期后，billing/balance 对 zai 账号返回
+                        // 业务码500「当前用户不存在coding plan」。这与 Monitor 频道同权：
+                        // 是确定性的「账号已无套餐」，必须归一成 no_plan_overview（is_empty 硬信号）；
+                        // 当成查询失败会让前端把死号留在 fail 桶无限重试、并拿旧数据当切换依据
+                        if is_no_plan_message(&msg) {
+                            saw_no_plan = true;
+                        } else if best_err.is_none() {
+                            let e = crate::i18n::trf("err.quota.biz", &[("code", &code.to_string()), ("msg", &msg)]);
                             best_err = Some(e);
                         }
                     }
@@ -1509,5 +1531,71 @@ fn normalize_balance(balance_data: &Value) -> QuotaOverview {
         refreshed_at: 0,
         source: String::new(),
         plans: slots,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 测试：「无套餐」业务消息的归一（礼物/订阅批量到期日的核心路径）
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod no_plan_tests {
+    use super::*;
+    use serde_json::json;
+
+    /// 礼物/订阅全部到期：billing 频道返回 业务码500「当前用户不存在coding plan」。
+    /// 必须归一成 Ok(is_empty)（前端据此判 dead 并触发切换），而不是 Err 让前端
+    /// 把死号留在 fail 桶里无限重试、拿旧数据当切换依据。
+    #[test]
+    fn billing_no_plan_is_empty_overview_not_error() {
+        let channels = vec![Channel::ZaiBilling("tok".into())];
+        let r = query_channels_via(&channels, &|_url, _tok| {
+            Ok(json!({"code": 500, "msg": "当前用户不存在coding plan", "success": false}))
+        });
+        let ov = r.expect("无套餐必须是 Ok，不是 Err");
+        assert!(ov.is_empty);
+        assert_eq!(ov.source, "no_plan");
+    }
+
+    /// 单 token 兜底路径同样要认 billing 频道的「无套餐」。
+    #[test]
+    fn billing_no_plan_via_single_token_path() {
+        let r = query_with_token_via("tok", &|url, _tok| {
+            if url == QUOTA_LIMIT_URL {
+                Err("network down".to_string())
+            } else {
+                Ok(json!({"code": 500, "msg": "当前用户不存在coding plan"}))
+            }
+        });
+        let ov = r.expect("billing 无套餐必须是 Ok");
+        assert!(ov.is_empty);
+    }
+
+    /// Monitor 频道对 zai 家族 key 一律回「不存在coding plan」——那是频道错配。
+    /// billing 随后的真实错误（如鉴权失效）必须保留，不得被吞成「无套餐」。
+    #[test]
+    fn monitor_no_plan_does_not_mask_billing_hard_error() {
+        let r = query_with_token_via("zai-jwt", &|url, _tok| {
+            if url == QUOTA_LIMIT_URL {
+                Ok(json!({"code": 500, "msg": "当前用户不存在coding plan"}))
+            } else {
+                Err(crate::i18n::coded("token_expired", "err.token.expired", &[]))
+            }
+        });
+        let err = r.expect_err("billing 的硬错误不得被吞");
+        assert_eq!(crate::i18n::code_of(&err), Some("token_expired"));
+    }
+
+    /// billing 有真实错误（非无套餐）时维持报错行为：不得被吞成「无套餐」。
+    #[test]
+    fn billing_business_error_still_surfaces() {
+        let r = query_with_token_via("tok", &|url, _tok| {
+            if url == QUOTA_LIMIT_URL {
+                Err("network down".to_string())
+            } else {
+                Ok(json!({"code": 500, "msg": "some other business failure"}))
+            }
+        });
+        let err = r.expect_err("非无套餐的业务错误仍应报错，不得归一成 is_empty");
+        assert!(!err.is_empty());
     }
 }

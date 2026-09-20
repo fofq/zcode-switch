@@ -25,9 +25,20 @@ export function quotaRemainingPct(q) {
     const n = Number(v);
     if (v != null && isFinite(n)) pcts.push(n);
   };
-  push(d.percent_used);
-  for (const p of d.plans || []) push(p.percent_used);
-  for (const it of d.items || []) push(it.percent_used);
+  // 过期套餐只是留档、额度不可用：只统计未过期套餐。
+  // d.items 是后端「全部套餐（含过期）平铺」，礼物批量到期后过期残留会把
+  // 不可用额度算成「还有剩余」（实测 75% 来自过期池），不能直接用。
+  if (Array.isArray(d.plans)) {
+    for (const p of livePlans(q)) {
+      push(p.percent_used);
+      for (const it of p.items || []) push(it.percent_used);
+    }
+    if (!pcts.length) push(d.percent_used);
+  } else {
+    // 旧数据：只有平铺 items / 总览数字
+    push(d.percent_used);
+    for (const it of d.items || []) push(it.percent_used);
+  }
   if (!pcts.length && d.total != null && d.used != null && d.total > 0) {
     push((d.used / d.total) * 100);
   }
@@ -64,8 +75,12 @@ export function modelRemainingPct(q, model) {
     const used = Number(it.used);
     if (isFinite(total) && total > 0 && isFinite(used)) pcts.push((used / total) * 100);
   };
-  for (const it of d.items || []) consider(it);
-  for (const p of livePlans(q)) for (const it of p.items || []) consider(it);
+  // 过期套餐池不可用，不参与判定（plans 缺失的旧数据才回退平铺 items）
+  if (Array.isArray(d.plans)) {
+    for (const p of livePlans(q)) for (const it of p.items || []) consider(it);
+  } else {
+    for (const it of d.items || []) consider(it);
+  }
   if (!pcts.length) return null;
   const bestUsed = Math.min(...pcts);
   return Math.max(0, Math.min(100, 100 - bestUsed));
@@ -164,8 +179,12 @@ export function bestOtherModel(q, model) {
     const cur = best.get(nameLower);
     if (!cur || used < cur.used) best.set(nameLower, { name: it.name, used });
   };
-  for (const it of d.items || []) consider(it);
-  for (const p of livePlans(q)) for (const it of p.items || []) consider(it);
+  // 流转目标只看未过期套餐：过期池不可用，不能当作「其它模型还有额度」的依据
+  if (Array.isArray(d.plans)) {
+    for (const p of livePlans(q)) for (const it of p.items || []) consider(it);
+  } else {
+    for (const it of d.items || []) consider(it);
+  }
   let out = null;
   for (const b of best.values()) {
     const pct = Math.max(0, Math.min(100, 100 - b.used));

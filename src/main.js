@@ -172,6 +172,9 @@ const SIGNALS_FRESH_MS = 180 * 1000;
 let quotaHist = {};
 let quotaSampleAt = {};
 let quotaForceAt = {};
+// 连续额度查询失败计数（成功清零）：无套餐 500 / 鉴权失效这类确定性故障下，
+// 样本永远刷不新，决策不能永远停在「先刷新」——连续失败按硬信号处理
+let quotaFailStreak = {};
 // 重活窗口里被要求「尽快重查」的账号（窗口结束后补一轮）
 const staleWant = new Set();
 // 最近切出过的账号（防 A→B→A 乒乓），10 分钟滚动
@@ -223,6 +226,15 @@ function signalsTrusted() {
   if (lastAutoSwitchAt && at <= lastAutoSwitchAt + 1000) return false;
   return true;
 }
+/** 「计划不可用」信号自己的新鲜度/归属门禁（plan_available 是独立字段）：
+ *  余额快照可信而 plan 信号是上一个账号残留的旧判定时，绝不能拿它触发紧急切换。 */
+function planSignalUsable() {
+  if (liveSignals?.plan_available !== false) return false;
+  const at = Number(liveSignals?.plan_at_ms) || 0;
+  if (!at || Date.now() - at > SIGNALS_FRESH_MS) return false;
+  if (lastAutoSwitchAt && at <= lastAutoSwitchAt + 1000) return false;
+  return true;
+}
 /** 客户端最近在用的模型（用于「未设置关注模型」时跟随真实消耗） */
 function modelSignal() {
   const at = Number(liveSignals?.model_at_ms) || 0;
@@ -262,11 +274,17 @@ function logStats() {
   }
   const st = poolStatsFromSignals(pools, model);
   if (!st) return null;
-  const rate = poolsRate(liveSignals.prev_pools, liveSignals.prev_at_ms, pools, at, model);
+  // 烧速的前后两个快照必须同属一次登录：prev 早于最近一次切换 = 跨账号差分
+  // （不同账号的同名 entitlement 拼一起会算出垃圾速率），宁可这轮不算
+  const prevAt = Number(liveSignals.prev_at_ms) || 0;
+  const rate = prevAt > lastAutoSwitchAt + 1000
+    ? poolsRate(liveSignals.prev_pools, prevAt, pools, at, model)
+    : null;
   // ETA 用「该模型全部池的剩余之和 / 合计速率」：与 poolsRate 同口径，池变动（补发/过期）不会把速率算歪
   let etaSec = null;
   if (rate && st.totalTokens != null && st.totalTokens > 0 && rate.rate > 0) etaSec = st.totalTokens / rate.rate;
-  return { ...st, rate, etaSec, at, planUnavailable: liveSignals.plan_available === false };
+  // plan 信号用自己的新鲜窗口：余额可信而 plan 是旧账号残留时不得触发
+  return { ...st, rate, etaSec, at, planUnavailable: planSignalUsable() };
 }
 /** 该账号 HTTP 口径的池统计（与旧行为一致：命中关注模型则只看该模型） */
 function apiStats(id, model = effectiveFocusModel()) {
@@ -357,6 +375,7 @@ function sortKeyValue(a, sort) {
     if (!key) return -1;
     let sum = 0;
     for (const p of plans) {
+      if (planExpired(p)) continue;
       for (const it of p.items || []) {
         if (it.name && modelKeyMatch(it.name.toLowerCase(), key)) sum += Number(it.remaining ?? 0);
       }
@@ -1045,13 +1064,22 @@ async function loadAcctQuota(id, opts = {}) {
     // 50 个空号就是 +125s，首次刷新会被拖到几分钟；心跳照发，前端按「待激活」短周期复查
     const data = await invoke("get_account_quota", { id, quick: !!opts.quick });
     acctQuota[id] = { data, err: null, code: null, busy: false };
+    quotaFailStreak[id] = 0;
     // 采样入队（算烧速/ETA 用）；失败时刻意不刷新样本时间，让“陈旧 → 先刷新”的门禁生效
     quotaSampleAt[id] = Date.now();
     const st = apiStats(id);
-    if (st) quotaHist[id] = pushSample(quotaHist[id], sampleFrom(st, Date.now()));
+    if (st) {
+      // 采样带上口径模型：口径变化（跟随模型切换）后旧序列不可比，直接重开——
+      // 跨模型差分会算出垃圾烧速（审计里 pct 98% 却 etaSec=0 的伪紧急切换即源于此）
+      const m = effectiveFocusModel() || "";
+      const hist = quotaHist[id];
+      const base = Array.isArray(hist) && hist.length && (hist[hist.length - 1].model || "") === m ? hist : [];
+      quotaHist[id] = pushSample(base, sampleFrom(st, Date.now(), m));
+    }
   } catch (e) {
     // 失败时也保留旧数据展示，错误信息进明细区；没旧数据才回落到错误态
     acctQuota[id] = { data: cur.data || null, err: stripErr(e), code: errCode(e), busy: false };
+    quotaFailStreak[id] = (quotaFailStreak[id] || 0) + 1;
     // 拉取失败（429/3012/网络）→ 下轮尽快重试，不卡在旧样本上
     quotaDue[id] = Date.now() + 6000;
   }
@@ -1399,6 +1427,8 @@ const actions = {
       if (r.launched) bits.push(t("m.bitLaunched"));
       if (r.config_stale) bits.push(t("m.bitConfigStale"));
       toast(t("m.toastSwitched", { name: r.name }), r.config_stale ? "warn" : "ok", bits.join(t("common.listSep")));
+      // 同 doSwitch：手动冷切也要作废切换前的日志信号
+      lastAutoSwitchAt = Date.now();
       ui.expanded.delete(id);
       await refresh();
       if (!uiLocked()) render();
@@ -1422,6 +1452,9 @@ const actions = {
         if (r.launched) bits.push(t("m.bitLaunched"));
         if (r.config_stale) bits.push(t("m.bitConfigStale"));
         toast(t("m.toastSwitched", { name: r.name }), r.config_stale ? "warn" : "ok", bits.join(t("common.listSep")));
+        // 手动切换同样要作废切换前的日志信号（旧账号余额不得拿来判新账号）
+        // 并进入短保护窗，否则最长 3 分钟内决策都拿着上一个账号的快照
+        lastAutoSwitchAt = Date.now();
       }
       ui.expanded.delete(id);
       await refresh(); render();
@@ -3005,13 +3038,18 @@ function pokeAccount(id) { if (id) quotaDue[id] = Date.now(); }
 function giftSoon(id) {
   return (acctQuota[id]?.data?.plans || []).some((p) => !planExpired(p) && expireInfo(p.expire)?.warn);
 }
-/** 「关注模型」与「全部池」两个口径的合并：返回用于判定的 pct、是否已流转 */
+/** 「关注模型」与「全部池」两个口径的合并：返回用于判定的 pct、聚合剩余 token、是否已流转。
+ *  tokens 与 pct 同口径：命中关注模型 → 该模型全部池剩余合计；未命中 → 全部池合计。
+ *  跨账号比较用它当绝对量纲（百分比在「最宽池大小不同」的账号之间不可比）。 */
 function pctPair(focus, all) {
   const fPct = focus?.matched ? focus.bestPct : null;
   const aPct = all?.bestPct ?? null;
   const flowed = !!(focus?.matched && (fPct ?? 0) <= 0 && (aPct ?? 0) > 0);
   const pct = fPct != null && fPct > 0 ? fPct : aPct;
-  return { pct, flowed };
+  const tokens = focus?.matched
+    ? (focus.totalTokens ?? null)
+    : (all?.totalTokens ?? focus?.totalTokens ?? null);
+  return { pct, flowed, tokens };
 }
 /** 某账号的判定口径（API） */
 function pctPairOf(id, model = effectiveFocusModel()) {
@@ -3074,8 +3112,10 @@ function noteForDecision(d) {
  * 1) 双触发：剩余% ≤ 阈值（兜底）+ 剩余时间(ETA) ≤ 安全余量（预测式，能提前几分钟行动）；
  * 2) 数据新鲜度参与判定：陈旧样本不当真值，改为“先刷新”；
  * 3) 不再被“全库刷新 / 领取中”整段拦停——那些只影响能不能取新样本，不影响用最近可信样本做决策；
- * 4) 切换前对陈旧候选做预校验；无达标候选时降级切“还有额度的最好账号”；
- * 5) 审计：事件原因/目标/耗时落环 + 后端日志，调参不再凭感觉。
+ * 4) 切换前对陈旧候选做预校验（本次刷新失败 = 不可用）；无达标候选时降级切“还有额度的最好账号”；
+ * 5) 审计：事件原因/目标/耗时落环 + 后端日志，调参不再凭感觉；
+ * 6) 硬故障：额度查询连续失败且样本陈旧（无套餐 500 / token 失效）按 hardDown 硬信号处理，
+ *    不再无限停在「先刷新」——那是礼物批量到期日「切不动/切进死号」的根源。
  */
 async function autoSwitchTick(manual = false) {
   const s = state;
@@ -3101,34 +3141,46 @@ async function autoSwitchTick(manual = false) {
   if (!useLog && lgStrict && ageMs > AS_DEFAULTS.activeStaleMs) useLog = true; // HTTP 已过期 → 仍用日志
   const lg = useLog ? lgStrict : null;
   const sampleSrc = lg ? "log" : "api";
+  const hm = healthMapOf();
   let cur;
   if (lg) {
     cur = {
       pct: lg.bestPct, etaSec: lg.etaSec, level: levelOf(lg.bestPct, thr),
+      tokens: lg.totalTokens ?? null,
       ageMs: Math.max(0, now - (lg.at || now)), stale: false,
       planUnavailable: !!lg.planUnavailable, source: sampleSrc,
     };
   } else {
+    // 硬信号二选一即视为「当前号确定不可用」：
+    // a) 额度查询连续失败（≥2 次）且样本陈旧——无套餐 500 / token 失效 / 持续风控，数据永远刷不新；
+    // b) 刷新成功但数据面判死（is_empty「业务成功但空」/ 套餐全部过期）——此时 pct 必然为空，
+    //    否则只会落进 wait noData 死寂，永远不切（这正是礼物批量到期后的形态）。
+    const dataDead = hm.get(active.id)?.level === "dead";
+    const hardDown = dataDead
+      || (ageMs > AS_DEFAULTS.activeStaleMs && (quotaFailStreak[active.id] || 0) >= 2);
     cur = {
       pct: ap.pct, etaSec: apiEta(active.id), level: levelOf(ap.pct, thr),
-      ageMs, stale: ageMs > AS_DEFAULTS.activeStaleMs, source: sampleSrc,
+      tokens: ap.tokens ?? null,
+      ageMs, stale: ageMs > AS_DEFAULTS.activeStaleMs, source: sampleSrc, hardDown,
     };
   }
   if (!lg && ap.flowed) cur.flowed = true;
 
   // 候选：其它账号（关注模型口径优先，流转账号只能做兜底）
   pruneRecentFrom();
-  const hm = healthMapOf();
   const cands = [];
   for (const a of s.accounts) {
     if (a.id === active.id) continue;
     const h = hm.get(a.id);
     if (h && (h.level === "auth" || h.level === "fail")) continue;
+    // 最近一次额度查询失败（业务码500无套餐/鉴权/限流）：旧数据不得作为切换依据，
+    // 否则会顶着过期前缓存的高百分比被选中/通过预校验；等下次成功拉到数据再回池
+    if (acctQuota[a.id]?.err) continue;
     const pair = pctPairOf(a.id, model);
     if (pair.pct == null) continue;
     const cs = quotaSampleAt[a.id] || 0;
     cands.push({
-      id: a.id, name: a.name, pct: pair.pct, flowed: pair.flowed,
+      id: a.id, name: a.name, pct: pair.pct, tokens: pair.tokens ?? null, flowed: pair.flowed,
       level: h?.level || "unknown", gift: giftSoon(a.id),
       fallback: pair.flowed, modelMatched: !!h?.modelMatched,
       ageMs: cs ? now - cs : Infinity,
@@ -3180,16 +3232,26 @@ async function doAutoSwitch(d, active, cur, lg) {
       if (c.ageMs > ageLimit) {
         if (heavy || preflights >= AS_DEFAULTS.maxPreflight) continue;
         preflights++;
-        await loadAcctQuota(c.id, { force: true });
+        await loadAcctQuota(c.id, { force: true, quick: true });
+        // 本次刷新仍失败（网络/风控/业务码500无套餐）→ 该候选视为不可用。
+        // 必须先查 err 再读数：失败路径会保留旧数据，直接读 pct 等于拿过期前的
+        // 高百分比给死号放行（礼物批量到期日就是这么切进死号的）
+        if (acctQuota[c.id]?.err) continue;
         const fresh = pctPairOf(c.id);
         // 刷不到（网络/风控/无数据）→ 该候选视为不可用，绝不拿旧数据当依据切过去
         c.pct = fresh.pct;
         c.flowed = fresh.flowed;
+        c.tokens = fresh.tokens ?? null;
         c.ageMs = 0;
         if (c.pct == null) continue;
       }
       const okPct = d.degrade ? c.pct > 0 : c.pct >= thr;
-      const better = cur.pct == null || c.pct > cur.pct;
+      // 与 evaluate 同口径：双方 token 可比按绝对余量比，否则按百分比；
+      // hardDown 时当前号的旧百分比/旧 token 一律作废（基准视为耗尽）
+      const curTokens = d.reason === "hardDown" ? null : (cur.tokens ?? null);
+      const comparable = curTokens != null && c.tokens != null && isFinite(c.tokens);
+      const better = cur.pct == null || d.reason === "hardDown"
+        || (comparable ? c.tokens > curTokens : c.pct > cur.pct);
       if (okPct && better) { target = c; break; }
     }
     if (!target) {
@@ -3218,14 +3280,17 @@ async function doAutoSwitch(d, active, cur, lg) {
       if (r?.hot) bits.push(t("m.bitHot"));
       if (r?.launched) bits.push(t("m.bitLaunched"));
       if (r?.preserved_as) bits.push(t("m.bitPreserved", { name: r.preserved_as }));
-      const pct = cur.pct == null ? "?" : Math.round(cur.pct);
+      // hardDown 下 cur.pct 是过期前的旧值，展示为「额度未知」而不是拿谎言凑数
+      const pctShown = d.reason === "hardDown" ? null : cur.pct;
+      const pct = pctShown == null ? "?" : Math.round(pctShown);
       const head = d.degrade
         ? t("as.toastDegrade", { from: active.name, to: r?.name || best.name, pct })
         : t("as.toast", { from: active.name, to: r?.name || best.name, pct });
       toast(head, "ok", bits.join(t("common.listSep")));
       asAuditPush("switch", {
         from: active.id, to: best.id, reason: d.reason, degrade: !!d.degrade,
-        pct: cur.pct == null ? null : Math.round(cur.pct * 10) / 10,
+        pct: pctShown == null ? null : Math.round(pctShown * 10) / 10,
+        curTokens: cur.tokens ?? null, toTokens: best.tokens ?? null,
         etaSec: d.etaSec == null ? null : Math.round(d.etaSec),
         src: lg ? "log" : "api", hot: !!r?.hot, preflight: preflights, ms: Date.now() - started,
       });

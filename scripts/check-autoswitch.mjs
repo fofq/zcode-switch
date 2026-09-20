@@ -259,6 +259,109 @@ eq(fmtEta(45), "45s", "fmtEta 秒");
 eq(fmtEta(600), "10min", "fmtEta 分");
 eq(fmtEta(null), null, "fmtEta 无值");
 
+// ---------- 硬故障与 ETA 兜底修正（业务码500无套餐/批量到期日场景） ----------
+
+// 8.14 硬故障（连续刷新失败）：旧数据的高百分比不得卡死「目标必须严格更好」
+const r814 = evaluate({
+  ...base,
+  cur: { pct: 100, etaSec: null, level: "ok", ageMs: 5 * 60_000, stale: true, hardDown: true },
+  candidates: [cand("B", 100)],
+});
+eq(r814.action, "switch", "硬故障下旧数据 100% 不卡死（比较基准视为耗尽）");
+eq(r814.reason, "hardDown", "原因=hardDown");
+eq(r814.emergency, true, "硬故障视为紧急（豁免冷却）");
+
+// 8.15 硬故障 + 无任何样本（首次查询就失败）→ 切换而不是永远停在「先刷新」
+const r815 = evaluate({
+  ...base,
+  cur: { pct: null, etaSec: null, level: "unknown", ageMs: 5 * 60_000, stale: true, hardDown: true },
+  candidates: [cand("B", 30)],
+});
+eq(r815.action, "switch", "硬故障无数据 → 直接切，不进 refresh 循环");
+eq(r815.reason, "hardDown", "原因=hardDown");
+
+// 8.15b 无硬故障时，陈旧无数据仍然只要求刷新（不放开）
+const r815b = evaluate({
+  ...base,
+  cur: { pct: null, etaSec: null, level: "unknown", ageMs: 5 * 60_000, stale: true },
+  candidates: [cand("B", 30)],
+});
+eq(r815b.action, "refresh", "无硬故障的陈旧无数据仍先刷新");
+
+// 8.16 ETA 兜底修正：最紧的池已到 0%（耗尽/过期的礼物池）≠ 整个账号马上耗尽，
+// 不得产生 ETA=0 的伪紧急（审计里 pct 98.1% 却 etaSec=0 的切换即此类）
+const h4 = [
+  sampleFrom({ bestPct: 98, worstPct: 0.4, totalTokens: null, worstTokens: null, bestTokens: null }, t0),
+  sampleFrom({ bestPct: 98.1, worstPct: 0, totalTokens: null, worstTokens: null, bestTokens: null }, t0 + 60_000),
+];
+eq(etaOf(h4), null, "worstPct 已到 0 → 不产生 ETA=0 的伪紧急");
+
+// 8.17 sampleFrom 记录口径模型（口径变化时由调用方重开采样序列，防跨模型垃圾烧速）
+eq(sampleFrom({ bestPct: 1 }, t0, "glm-5.3-flash").model, "glm-5.3-flash", "sampleFrom 记录模型");
+eq(sampleFrom({ bestPct: 1 }, t0).model, null, "sampleFrom 缺省模型为 null");
+
+// ---------- 过期池泄漏与 token 口径跨账号比较（三套餐同模型场景） ----------
+
+// 9. 过期套餐池不得泄入统计：d.items 含过期槽位条目，livePlans 才是可用额度
+const qExp = { data: {
+  items: [
+    { name: "GLM-5.3-Flash", total: 200000, used: 50000, remaining: 150000 },        // 已过期 Weekend 残留（75%）
+    { name: "GLM-5.3-Flash", total: 100000000, used: 97000000, remaining: 3000000 }, // Global 只剩 3%
+  ],
+  plans: [
+    { gift: true, name: "ZCode Weekend Build", expired: true, items: [ { name: "GLM-5.3-Flash", total: 200000, used: 50000, remaining: 150000 } ] },
+    { gift: true, name: "ZCode Global Build", items: [ { name: "GLM-5.3-Flash", total: 100000000, used: 97000000, remaining: 3000000 } ] },
+  ],
+}};
+const sExp = poolStats(qExp, "GLM-5.3-Flash");
+ok(Math.abs(sExp.bestPct - 3) < 0.01, `过期池 75% 不得成为 bestPct（取 live 池 3%，实际 ${sExp.bestPct}）`);
+eq(sExp.totalTokens, 3000000, "聚合 token 只算 live 池（去重 + 排除过期）");
+
+// 9b. 全部套餐都过期 → 池统计为 null（不再拿过期残留当可用额度）
+const qAllExp = { data: {
+  items: [ { name: "GLM-5.3-Flash", total: 200000, used: 50000, remaining: 150000 } ],
+  plans: [ { gift: true, name: "ZCode Weekend Build", expired: true, items: [ { name: "GLM-5.3-Flash", total: 200000, used: 50000, remaining: 150000 } ] } ],
+}};
+eq(poolStats(qAllExp, "GLM-5.3-Flash"), null, "全过期账号无可统计池（防死号进候选）");
+
+// 9c. 旧数据没有 plans 数组 → 回退平铺 items（旧行为兼容）
+const qLegacy = { data: { items: [ { name: "GLM-5.3-Flash", total: 1000, used: 100, remaining: 900 } ] } };
+eq(poolStats(qLegacy, "GLM-5.3-Flash").bestPct, 90, "无 plans 的旧数据回退 d.items");
+
+// 10. 跨账号按绝对余量（token）比较：百分比是不同大小池之间的伪量纲
+const r101 = evaluate({ ...base,
+  cur: { pct: 12, tokens: 12_000_000, etaSec: 2400, level: "low", ageMs: 1000 },
+  candidates: [cand("B", 90, { tokens: 4_500_000 })],
+});
+eq(r101.action, "wait", "弃 1200 万换 450 万 → 阻止（token 口径）");
+eq(r101.reason, "noImprove", "原因=noImprove");
+
+const r102 = evaluate({ ...base,
+  cur: { pct: 12, tokens: 12_000_000, etaSec: 2400, level: "low", ageMs: 1000 },
+  candidates: [cand("B", 90, { tokens: 20_000_000 })],
+});
+eq(r102.action, "switch", "候选绝对余量更大 → 切");
+
+// 10b. token 不可知 → 回退百分比口径（旧行为不突变）
+const r103 = evaluate({ ...base,
+  cur: { pct: 12, etaSec: null, level: "low", ageMs: 1000 },
+  candidates: [cand("B", 90)],
+});
+eq(r103.action, "switch", "无 token 时回退百分比比较");
+
+// 10c. hardDown：旧 token 与旧百分比一并作废
+const r104 = evaluate({ ...base,
+  cur: { pct: 100, tokens: 99_999_999, etaSec: null, level: "ok", ageMs: 5 * 60_000, stale: true, hardDown: true },
+  candidates: [cand("B", 20, { tokens: 1_000_000 })],
+});
+eq(r104.action, "switch", "hardDown 忽略旧 token/百分比，切向可用候选");
+
+// 10d. rankTargets：同优先级下 token 降序（大余量优先）；有缺失整体回退 pct
+const rt10 = rankTargets([cand("B", 90, { tokens: 4_000_000 }), cand("C", 50, { tokens: 40_000_000 })], { threshold: 15 });
+eq(rt10.ranked[0].id, "C", "token 口径下 50%×4000万 优先于 90%×400万");
+const rt10b = rankTargets([cand("B", 90), cand("C", 50)], { threshold: 15 });
+eq(rt10b.ranked[0].id, "B", "无 token 时按 pct 排序（全序一致）");
+
 if (failed) {
   console.error(`\n✗ 自动切换决策自检失败：${failed} 项（通过 ${passed}）`);
   process.exit(1);

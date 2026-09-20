@@ -118,8 +118,14 @@ export function poolStats(q, model) {
       all.push(it);
     }
   };
-  collect(d.items);
-  for (const p of livePlans(q)) collect(p.items);
+  // 只收未过期套餐的池：d.items 是后端「全部套餐（含过期）平铺」，直接收会
+  // 1) 与 livePlans 重复计数（token 聚合 ×2）2) 把过期礼物残留灌成可用额度
+  // （实测 bestPct 75% 来自过期池）。旧数据没有 plans 数组时才回退平铺 items。
+  if (Array.isArray(d.plans)) {
+    for (const p of livePlans(q)) collect(p.items);
+  } else {
+    collect(d.items);
+  }
   // 极端情况：没有 items，只有计划级数字
   if (!all.length) {
     for (const p of livePlans(q)) {
@@ -159,11 +165,13 @@ export function poolStatsFromSignals(pools, model) {
 }
 
 /** 采样点：用于算消耗速率（烧速）。
- * totalTokens = 该模型全部匹配池的剩余之和（与 poolsRate 同口径，跨池变动更稳） */
-export function sampleFrom(stats, at) {
+ * totalTokens = 该模型全部匹配池的剩余之和（与 poolsRate 同口径，跨池变动更稳）；
+ * model = 采样时的口径模型——口径变化（跟随模型切换）后旧序列不可比，调用方应重开采样 */
+export function sampleFrom(stats, at, model = null) {
   if (!stats) return null;
   return {
     at,
+    model: model == null ? null : String(model),
     bestPct: stats.bestPct,
     worstPct: stats.worstPct,
     bestTokens: stats.bestTokens ?? null,
@@ -249,7 +257,10 @@ export function etaSeconds(remaining, rate) {
   return remaining / rate;
 }
 
-/** 由采样历史得到当前账号的 ETA（token 优先，退化到百分比） */
+/** 由采样历史得到当前账号的 ETA（token 优先，退化到百分比）。
+ * 注意：百分比基准下 worstPct ≤ 0 表示「最紧的池已经耗尽/过期」（比如用完的礼物池），
+ * 不是「马上要耗尽」——返回 null 交给零值/百分比触发去判定，
+ * 否则一个常驻 0% 的池会让账号永远 etaSec=0、陷入伪紧急切换（审计实证过 pct 98% 却 eta 0）。 */
 export function etaOf(hist) {
   if (!Array.isArray(hist) || !hist.length) return null;
   const last = hist[hist.length - 1];
@@ -258,7 +269,7 @@ export function etaOf(hist) {
     const eta = etaSeconds(last.totalTokens, r);
     if (eta != null) return { sec: eta, basis: "tokens", rate: r, remaining: last.totalTokens };
   }
-  if (last.worstPct != null && isFinite(last.worstPct)) {
+  if (last.worstPct != null && isFinite(last.worstPct) && last.worstPct > 0) {
     const r = burnRate(hist, "worstPct");
     const eta = etaSeconds(last.worstPct, r);
     if (eta != null) return { sec: eta, basis: "pct", rate: r, remaining: last.worstPct };
@@ -268,8 +279,11 @@ export function etaOf(hist) {
 
 /**
  * 候选排序：非流转优先（关注模型还有额度的账号先选）→ 礼物/临期插队 → 剩余降序。
+ * 同优先级内：全员都有同口径聚合 token（tokens）时按绝对余量降序——百分比在
+ * 「最宽池大小不同」的账号之间是伪量纲（90%×450万 不如 50%×4000万）；
+ * 有缺失就整体回退百分比，保证比较器全序一致。
  * avoid：最近切出过的账号（防 A→B→A 乒乓）；若排除后为空则忽略它。
- * @param {Array} cands [{id,name,pct,gift,flowed,fallback,modelMatched,level,ageMs}]
+ * @param {Array} cands [{id,name,pct,tokens,gift,flowed,fallback,modelMatched,level,ageMs}]
  */
 export function rankTargets(cands, opts = AS_DEFAULTS) {
   const thr = Number(opts.threshold ?? AS_DEFAULTS.threshold);
@@ -281,11 +295,13 @@ export function rankTargets(cands, opts = AS_DEFAULTS) {
   const ok = alive.filter((c) => c.pct >= thr);
   const order = ok.length ? ok : alive;
   const flowed = (c) => (c.flowed || c.fallback ? 1 : 0);
+  const byTokens = order.length > 1 && order.every((c) => c.tokens != null && isFinite(c.tokens));
+  const sizeKey = (c) => (byTokens ? c.tokens : c.pct);
   const sorted = order
     .slice()
     .sort(
       (a, b) =>
-        flowed(a) - flowed(b) || (b.gift ? 1 : 0) - (a.gift ? 1 : 0) || b.pct - a.pct,
+        flowed(a) - flowed(b) || (b.gift ? 1 : 0) - (a.gift ? 1 : 0) || sizeKey(b) - sizeKey(a),
     );
   const fresh = sorted.filter((c) => !avoid.has(c.id));
   const ranked = fresh.length ? fresh : sorted;
@@ -295,6 +311,10 @@ export function rankTargets(cands, opts = AS_DEFAULTS) {
 /**
  * 纯决策：要不要切、切哪一类目标、什么原因。
  * 网络相关的「切换前预校验」由调用方按 ranked 顺序做（本函数不做 IO）。
+ *
+ * cur.hardDown：调用方判定「额度查询连续失败且样本已陈旧」的硬故障
+ * （无套餐 500 / 鉴权失效 / 持续风控——数据永远刷不新）。此时旧样本是谎言，
+ * 比较基准视为已耗尽：否则「目标必须严格更好」会被旧数据的高百分比永远卡死。
  *
  * @returns {{action:"none"|"wait"|"refresh"|"switch", reason:string, emergency?:boolean,
  *            degrade?:boolean, target?:object, ranked?:object[], etaSec?:number|null}}
@@ -309,13 +329,16 @@ export function evaluate(input) {
   // 刚切完的保护窗：任何路径都不允许立刻再切
   if (!manual && now - lastSwitchAt < opts.hardGraceMs) return { action: "wait", reason: "hardGrace" };
 
-  const pct = cur?.pct == null || !isFinite(cur.pct) ? null : cur.pct;
+  const hardDown = !!cur?.hardDown;
   const planDown = !!cur?.planUnavailable;
+  const pctRaw = cur?.pct == null || !isFinite(cur.pct) ? null : cur.pct;
+  const pct = hardDown ? -1 : pctRaw;
   const etaSec = cur?.etaSec != null && isFinite(cur.etaSec) ? cur.etaSec : null;
 
   // 数据新鲜度：陈旧样本不当真值，先要求刷新
-  // （唯一例外：「计划不可用」是客户端自己的硬信号，不需要百分比也能判定）
-  if (pct == null && !planDown) {
+  // （例外：「计划不可用」是客户端自己的硬信号、hardDown 是连续刷新失败的硬信号，
+  //   都不需要百分比也能判定）
+  if (pctRaw == null && !planDown && !hardDown) {
     return cur?.stale ? { action: "refresh", reason: "stale" } : { action: "wait", reason: "noData" };
   }
 
@@ -323,13 +346,13 @@ export function evaluate(input) {
   const zero = pct != null && pct <= 0;
   const etaHit = etaSec != null && etaSec <= opts.marginSec;
   const pctHit = pct != null && pct <= thr;
-  const trigger = planDown || zero || pctHit || etaHit || auth;
+  const trigger = hardDown || planDown || zero || pctHit || etaHit || auth;
   if (!trigger) {
     // 陈旧但还判定为安全 → 依然要求刷新一次（避免用旧数当"安全"证据）
-    if (cur?.stale && pct != null) return { action: "refresh", reason: "staleSafe", etaSec };
+    if (cur?.stale && pctRaw != null) return { action: "refresh", reason: "staleSafe", etaSec };
     return { action: "none", reason: "ok", etaSec };
   }
-  const reason = planDown ? "planDown" : auth ? "auth" : zero ? "zero" : etaHit ? "eta" : "pct";
+  const reason = hardDown ? "hardDown" : planDown ? "planDown" : auth ? "auth" : zero ? "zero" : etaHit ? "eta" : "pct";
   // 紧急 = 预测式 / 硬信号：不受冷却限制（否则刚切过去就烧完的号要干等）
   const emergency = reason !== "pct";
   if (!manual && !emergency && now - lastSwitchAt < opts.cooldownMs) {
@@ -341,13 +364,23 @@ export function evaluate(input) {
 
   const best = ranked[0];
   const gain = pct == null ? Infinity : best.pct - pct;
-  // 目标必须严格更好，绝不把好号换掉；降级路径（无达标候选）要求相对改善更明显
+  // 目标必须严格更好，绝不把好号换掉。
+  // 双方都有同口径聚合 token 时按绝对余量比——百分比在「最宽池大小不同」的
+  // 账号之间是伪量纲（实测会「弃 1200 万换 450 万」）；不可比才回退百分比口径。
+  // hardDown 时旧 token 一并作废（curTokens=null → 走百分比基准 -1）。
+  const curTokens = !hardDown && cur?.tokens != null && isFinite(cur.tokens) ? cur.tokens : null;
+  const bestTokens = best?.tokens != null && isFinite(best.tokens) ? best.tokens : null;
+  const byTokens = curTokens != null && bestTokens != null;
   if (!manual) {
-    if (best.pct <= pct) return { action: "wait", reason: "noImprove", ranked, etaSec };
-    if (degraded) {
-      if (gain < Math.max(3, pct * 0.5)) return { action: "wait", reason: "noImprove", ranked, etaSec };
-    } else if (!emergency && gain < Number(opts.minImprove ?? 0)) {
+    if (byTokens ? bestTokens <= curTokens : best.pct <= pct) {
       return { action: "wait", reason: "noImprove", ranked, etaSec };
+    }
+    if (!byTokens) {
+      if (degraded) {
+        if (gain < Math.max(3, pct * 0.5)) return { action: "wait", reason: "noImprove", ranked, etaSec };
+      } else if (!emergency && gain < Number(opts.minImprove ?? 0)) {
+        return { action: "wait", reason: "noImprove", ranked, etaSec };
+      }
     }
   }
   // 降级切换（没有达标候选）不受冷却豁免：最多每 cooldownMs 降级一次，避免在低位账号之间横跳
