@@ -537,12 +537,25 @@ pub fn pick_org_project(customer: &Value) -> Option<(String, String)> {
     Some((org_id.clone(), pid))
 }
 
+/// api_keys 响应取条目：列表是 {code,data:[...]}，单条也可能是 {code,data:{...}} 包装，
+/// 早期只认 data 数组，导致「已有同名 key」漏识别、每次都重新创建且解析取不到值。
 fn keys_array(v: &Value) -> Vec<&Value> {
     match v {
         Value::Array(a) => a.iter().collect(),
-        Value::Object(o) => o.get("data").and_then(|d| d.as_array()).map(|a| a.iter().collect()).unwrap_or_default(),
+        Value::Object(o) => match o.get("data") {
+            Some(Value::Array(a)) => a.iter().collect(),
+            Some(d) if d.is_object() => vec![d],
+            _ => vec![],
+        },
         _ => vec![],
     }
+}
+
+/// 创建 api_key 的响应是 {code, data:{apiKey,...}}（实测日志：data 里 apiKey/createTime/name 齐全），
+/// 而解析里直接取顶层 apiKey → 永远「响应缺少 apiKey 字段」。这里先把内层条目拿出来。
+fn unwrap_key_entry(v: Value) -> Value {
+    let inner = v.get("data").filter(|d| d.is_object()).cloned();
+    inner.unwrap_or(v)
 }
 
 /// 铸/取平台 API Key（官方 console 的 zcode-api-key：登录 zcode 时官方也会自动创建同名 key）。
@@ -600,7 +613,7 @@ pub fn resolve_biz_api_key(base: &str, auth: &str, require_secret: bool) -> Resu
         .find(|k| k.get("name").and_then(|n| n.as_str()) == Some(API_KEY_NAME))
         .map(|k| k.clone());
     if found.is_none() {
-        found = Some(
+        found = Some(unwrap_key_entry(
             finish(
                 agent
                     .post(&keys_url)
@@ -610,7 +623,7 @@ pub fn resolve_biz_api_key(base: &str, auth: &str, require_secret: bool) -> Resu
                     .send_json(json!({ "name": API_KEY_NAME })),
             )
             .map_err(|e| format!("api_keys 创建: {e}"))?,
-        );
+        ));
     }
     let key = found
         .as_ref()
