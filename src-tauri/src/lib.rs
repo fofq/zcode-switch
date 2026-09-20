@@ -8,6 +8,7 @@ mod oauth;
 mod quota;
 mod store;
 mod zcrypto;
+mod zsignals;
 
 use serde_json::{json, Value};
 use std::sync::Mutex;
@@ -207,6 +208,22 @@ async fn switch_to(app: AppHandle, id: String, force: bool, restart: bool, hot: 
 #[tauri::command]
 async fn get_live_quota() -> Result<quota::QuotaOverview, String> {
     store::live_quota(&Paths::detect())
+}
+
+/// ZCode 客户端本地日志信号（余额快照 / 计划可用性 / 当前请求模型）。
+/// 前端用它把额度判定从「HTTP 轮询」升级为「事件驱动 + 秒级」。
+#[tauri::command]
+async fn live_signals() -> Result<serde_json::Value, String> {
+    serde_json::to_value(zsignals::snapshot()).map_err(|e| e.to_string())
+}
+
+/// 自动切换审计：事件/决策/结果落盘（app 日志目录 oauth.log，自动轮转）
+#[tauri::command]
+async fn auto_switch_log(event: String, detail: String) -> Result<(), String> {
+    let ev: String = event.chars().take(24).collect();
+    let dt: String = detail.chars().take(400).collect();
+    flowlog::log("auto-sw", &ev, &dt);
+    Ok(())
 }
 
 #[tauri::command]
@@ -1328,6 +1345,8 @@ pub fn run() {
             launch_zcode,
             open_external,
             reveal_main,
+            live_signals,
+            auto_switch_log,
         ])
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
@@ -1348,6 +1367,10 @@ pub fn run() {
             if let Ok(data_dir) = app.path().app_local_data_dir() {
                 flowlog::init(&data_dir);
             }
+            // 跟随 ZCode 客户端自己的日志：额度余量 / 计划可用性 / 当前请求模型（只读，零额外网络请求）
+            let sig_paths = Paths::detect();
+            zsignals::set_app_handle(app.handle().clone());
+            zsignals::start(&sig_paths.home);
             // 设置里开了 2API 就随 app 启动本地服务
             if store::load_settings(&Paths::detect()).two_api_on() {
                 let paths = Paths::detect();

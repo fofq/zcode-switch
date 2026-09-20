@@ -3,7 +3,8 @@ import { listen } from "@tauri-apps/api/event";
 import { esc, toast, openPwModal, openConfirmModal, openProviderModal, installDelegation, dismissSplash } from "./ui.js";
 import { ic } from "./icons.js";
 import { init, t, has, lang, localeTag, stripErr, errCode } from "./i18n.js";
-import { HEALTH_ORDER, healthOf, filterAccounts, sortAccounts, bucketAccounts, summarize, modelKeyMatch, quotaBarParts, planExpired } from "./list.js";
+import { HEALTH_ORDER, healthOf, filterAccounts, sortAccounts, bucketAccounts, summarize, modelKeyMatch, quotaBarParts, planExpired, PENDING_WINDOW_MS } from "./list.js";
+import { AS_DEFAULTS, poolStats, poolStatsFromSignals, poolsRate, sampleFrom, pushSample, etaOf, evaluate, fmtEta } from "./autoswitch.js";
 
 const $app = document.getElementById("app");
 let state = null;
@@ -150,15 +151,162 @@ function refreshAllBadge() {
 
 // 低额度自动切换
 const AUTO_SWITCH_CHECK_MS = 60 * 1000;
-const AUTO_SWITCH_COOLDOWN_MS = 5 * 60 * 1000;
+// 冷却只用于「非紧急」切换（百分比越线）：2 分钟。预测式(ETA)/硬信号触发不受冷却限制，
+// 改为用 hardGrace（刚切完的保护窗）+ 「目标必须严格更好」防横跳
+const AUTO_SWITCH_COOLDOWN_MS = 2 * 60 * 1000;
 let autoSwitchRunning = false;
+// 决策/执行重入锁：预校验会 await 网络，期间事件/定时器/loadAcctQuota 都会再次进入决策，
+// 不上锁会出现「两个并发切换」。autoSwitchRunning 只表达「正在切换」给 UI 看。
+let switchLock = false;
 let lastAutoSwitchAt = 0;
 let autoSwitchNote = "";
+let lastHotWarnAt = 0;
+
+// ---- 客户端日志信号（zsignals）：秒级、零额外请求 ----
+// liveSignals 只在「当前登录账号」上可信（日志是客户端自己的），候选号一律用 HTTP 数据
+let liveSignals = null;
+// 快照新鲜窗口：实测客户端在活跃时约每 15s 记一条余额（p50=15.4s），忙时也可能 1-2 分钟才一条；
+// 超过窗口就丢给 HTTP 轮询（另一条路径），不会用陈旧快照做判断
+const SIGNALS_FRESH_MS = 180 * 1000;
+// 每个账号最近一排 HTTP 样本（算烧速）+ 最近一次成功采样时间（算新鲜度）
+let quotaHist = {};
+let quotaSampleAt = {};
+let quotaForceAt = {};
+// 最近切出过的账号（防 A→B→A 乒乓），10 分钟滚动
+let recentFrom = new Map();
+// 自动切换审计环（事件时间/原因/目标/耗时），同时落盘到后端日志
+const AS_AUDIT_MAX = 60;
+let asAudit = [];
+
+function asAuditPush(kind, data) {
+  const e = { at: Date.now(), kind, ...data };
+  asAudit.push(e);
+  if (asAudit.length > AS_AUDIT_MAX) asAudit.splice(0, asAudit.length - AS_AUDIT_MAX);
+  try { console.info("[as-audit]", kind, JSON.stringify(data)); } catch { /* 忽略 */ }
+  invoke("auto_switch_log", { event: kind, detail: JSON.stringify(data) }).catch(() => {});
+  return e;
+}
+function asAuditLast() {
+  return asAudit.length ? asAudit[asAudit.length - 1] : null;
+}
+/** 设置弹窗里的诊断行：数据源 / 跟随模型 / 剩余时间 / 最近一次决策 */
+function autoSwitchDiagLine() {
+  const bits = [];
+  bits.push(signalsTrusted() ? t("st.sigLog", { age: Math.max(1, Math.round(poolsAgeMs() / 1000)) }) : t("st.sigApi"));
+  if (!focusModel()) {
+    const m = modelSignal();
+    if (m) bits.push(t("st.sigFollow", { model: m }));
+  }
+  const eta = logStats()?.etaSec ?? apiEta(activeAccount()?.id);
+  if (eta != null && eta <= 24 * 3600) bits.push(t("as.eta", { eta: fmtEta(eta) }));
+  const last = asAuditLast();
+  if (last) bits.push(t("st.sigLast", { kind: last.kind, sec: Math.max(0, Math.round((Date.now() - last.at) / 1000)) }));
+  return bits.join(" · ");
+}
+/** 余额快照的数据年龄（用日志里的时间戳，而不是收到时间：客户端闲时日志会停） */
+function poolsAgeMs() {
+  const at = Number(liveSignals?.pools_at_ms) || 0;
+  return at ? Math.max(0, Date.now() - at) : Infinity;
+}
+function signalsFresh(ms = SIGNALS_FRESH_MS) {
+  return !!liveSignals?.available && poolsAgeMs() < ms;
+}
+/** 只信任「属于当前登录账号」的余额快照：
+ * 1) 快照要够新鲜（客户端闲时日志会停，超窗口就交给 HTTP 轮询）；
+ * 2) 切换之后产生的快照才可信（旧账号的余额不能拿来判新账号）。 */
+function signalsTrusted() {
+  if (!signalsFresh()) return false;
+  const at = Number(liveSignals?.pools_at_ms) || 0;
+  if (!at) return false;
+  if (lastAutoSwitchAt && at <= lastAutoSwitchAt + 1000) return false;
+  return true;
+}
+/** 客户端最近在用的模型（用于「未设置关注模型」时跟随真实消耗） */
+function modelSignal() {
+  const at = Number(liveSignals?.model_at_ms) || 0;
+  if (at && Date.now() - at < 30 * 60 * 1000 && liveSignals?.model) return String(liveSignals.model);
+  return null;
+}
+/** 关注模型：未设置时跟随客户端实际在用模型（日志给的 modelId） */
+function effectiveFocusModel() {
+  const m = focusModel();
+  if (m) return m;
+  return signalsTrusted() ? (modelSignal() || "") : "";
+}
+function activeAccount() {
+  return (state?.accounts || []).find((a) => a.is_active) || null;
+}
+/**
+ * 当前账号的「日志口径」判定：
+ * bestPct 沿用乐观语义（该模型最宽松的池，避免过早切）；
+ * etaSec 用「该模型所有池剩余之和 / 合计速率」——尺度无关，不看百分比深浅。
+ */
+function logStats() {
+  if (!signalsTrusted()) return null;
+  const model = effectiveFocusModel();
+  const pools = Array.isArray(liveSignals.pools) ? liveSignals.pools : [];
+  const at = Number(liveSignals.pools_at_ms) || Date.now();
+  if (!pools.length) {
+    // 客户端明确返回「一个额度池都没有」= 无套餐/全过期。
+    // 新号宽限窗口内不误判（套餐还没发放，官方客户端靠启动心跳触发发放）。
+    const a = activeAccount();
+    const created = Date.parse(String(a?.created_at || "").replace(" ", "T"));
+    if (Number.isFinite(created) && Date.now() - created < PENDING_WINDOW_MS) return null;
+    return {
+      empty: true, count: 0, bestPct: 0, worstPct: 0, bestTokens: 0, worstTokens: 0, totalTokens: 0,
+      worstName: null, matched: false, model: model || null, scope: "all",
+      rate: null, etaSec: 0, at, planUnavailable: true,
+    };
+  }
+  const st = poolStatsFromSignals(pools, model);
+  if (!st) return null;
+  const rate = poolsRate(liveSignals.prev_pools, liveSignals.prev_at_ms, pools, at, model);
+  // ETA 用「该模型全部池的剩余之和 / 合计速率」：与 poolsRate 同口径，池变动（补发/过期）不会把速率算歪
+  let etaSec = null;
+  if (rate && st.totalTokens != null && st.totalTokens > 0 && rate.rate > 0) etaSec = st.totalTokens / rate.rate;
+  return { ...st, rate, etaSec, at, planUnavailable: liveSignals.plan_available === false };
+}
+/** 该账号 HTTP 口径的池统计（与旧行为一致：命中关注模型则只看该模型） */
+function apiStats(id, model = effectiveFocusModel()) {
+  return poolStats(acctQuota[id], model);
+}
+/** HTTP 口径的 ETA（本地样本序列算烧速；日志不可用时才有意义） */
+function apiEta(id) {
+  const e = etaOf(quotaHist[id]);
+  return e ? e.sec : null;
+}
+/** 活跃账号当前的刷新周期（毫秒）：用于推导安全余量 */
+let activeSweepMs = AS_DEFAULTS.marginSec * 1000;
+function marginSec() {
+  return Math.max(AS_DEFAULTS.marginSec, Math.round((activeSweepMs * 2) / 1000) + 30);
+}
+function pruneRecentFrom() {
+  const cut = Date.now() - 10 * 60 * 1000;
+  for (const [id, ts] of recentFrom) if (ts < cut) recentFrom.delete(id);
+}
+function levelOf(pct, thr) {
+  if (pct == null) return "unknown";
+  if (pct <= 0) return "dead";
+  return pct <= thr ? "low" : "ok";
+}
+function noteChanged(next) {
+  if (next === autoSwitchNote) return;
+  autoSwitchNote = next;
+  if (!uiLocked()) render();
+}
 
 function autoSwitchTitle(s) {
   const bits = [t("as.label"), t("as.threshold", { pct: s?.auto_switch_threshold ?? 15 })];
   const m = String(s?.auto_switch_model || "").trim();
   if (m) bits.push(t("as.model", { model: m }));
+  else {
+    const fm = modelSignal();
+    if (fm && signalsTrusted()) bits.push(t("as.modelFollow", { model: fm }));
+  }
+  const st = logStats();
+  const eta = st?.etaSec ?? apiEta(activeAccount()?.id);
+  if (eta != null && eta <= 3600) bits.push(t("as.eta", { eta: fmtEta(eta) }));
+  bits.push(signalsTrusted() ? t("as.srcLog", { age: Math.max(1, Math.round(poolsAgeMs() / 1000)) }) : t("as.srcApi"));
   if (autoSwitchRunning) bits.push(t("as.switching"));
   else if (autoSwitchNote) bits.push(autoSwitchNote);
   if (s?.zcode_running && !s?.hot_switch) bits.push(t("as.needHot"));
@@ -343,6 +491,7 @@ function stAutoSwitchExtra() {
       <button class="toggle${state?.auto_switch_model_fallback ? " on" : ""}" role="switch" aria-checked="${!!state?.auto_switch_model_fallback}" aria-label="${esc(t("st.modelFallback"))}" click="actions.stToggle('modelFallback')"><span class="knob"></span></button>
     </div>
     <div class="st-note">${models.length ? t("st.modelDesc", { n: models.length }) : t("st.modelNone")}</div>
+    <div class="st-note st-sig">${esc(autoSwitchDiagLine())}</div>
   </div>`;
 }
 
@@ -869,19 +1018,26 @@ async function guard(fn) {
   }
 }
 
-async function loadAcctQuota(id) {
+async function loadAcctQuota(id, opts = {}) {
   const cur = acctQuota[id] || {};
   // busy 超时保护：一次请求异常卡住后，超过 20s 允许重新拉取，避免手动刷新永远静默失效
-  if (cur.busy && Date.now() - (cur.busyAt || 0) < 20000) return;
+  // force=true（自动切换前的预校验）时不因 busy 跳过，否则预校验会变成空操作
+  if (!opts.force && cur.busy && Date.now() - (cur.busyAt || 0) < 20000) return;
   // 保留旧数据只标记 busy：健康度/分组在刷新期间不变，避免条目闪回“待查询额度”
   acctQuota[id] = { ...cur, busy: true, busyAt: Date.now() };
   if (!uiLocked()) render();
   try {
     const data = await invoke("get_account_quota", { id });
     acctQuota[id] = { data, err: null, code: null, busy: false };
+    // 采样入队（算烧速/ETA 用）；失败时刻意不刷新样本时间，让“陈旧 → 先刷新”的门禁生效
+    quotaSampleAt[id] = Date.now();
+    const st = apiStats(id);
+    if (st) quotaHist[id] = pushSample(quotaHist[id], sampleFrom(st, Date.now()));
   } catch (e) {
     // 失败时也保留旧数据展示，错误信息进明细区；没旧数据才回落到错误态
     acctQuota[id] = { data: cur.data || null, err: stripErr(e), code: errCode(e), busy: false };
+    // 拉取失败（429/3012/网络）→ 下轮尽快重试，不卡在旧样本上
+    quotaDue[id] = Date.now() + 6000;
   }
   if (!uiLocked()) render();
   // 任意账号的额度数据更新 → 立即跑一次切换判定（目标账号拿到额度/当前账号耗尽都能秒级反应）
@@ -1123,6 +1279,9 @@ const actions = {
     }
     const ids = (state?.accounts || []).map((a) => a.id);
     if (!ids.length) return;
+    // 当前使用中的账号优先刷新：全库刷新一个周期很久，而决定“要不要切”的正是活跃账号
+    const act = (state?.accounts || []).find((a) => a.is_active);
+    const order = act ? [act.id, ...ids.filter((i) => i !== act.id)] : ids;
     const withElig = !quotaOnly && canRefreshEligibility();
     if (withElig) lastEligibilityAt = Date.now();
     quotaSweep = { running: true, phase: withElig ? "elig" : "quota", eligibility: withElig, done: 0, total: ids.length, cancel: false };
@@ -1133,7 +1292,7 @@ const actions = {
         await actions.refreshClaim();
         quotaSweep.phase = "quota";
       }
-      for (const id of ids) {
+      for (const id of order) {
         if (quotaSweep.cancel) { cancelled = true; break; }
         await loadAcctQuota(id);
         quotaSweep.done++;
@@ -2755,9 +2914,31 @@ listen("state-changed", () => {
   refresh().then(() => { if (!uiLocked()) render(); }).catch(() => {});
 });
 
+// ===== 客户端日志信号（zsignals）：事件驱动 + 5s 兜底轮询 =====
+// 后端 1s 一次跟随客户端日志，解析到新余额/计划状态/请求边界就推事件；没推到也能兜底拉起决策。
+let signalsPoolsAt = 0;
+let signalsModelAt = 0;
+function applySignals(sig) {
+  if (!sig || typeof sig !== "object") return false;
+  liveSignals = sig;
+  const at = Number(sig.pools_at_ms) || 0;
+  const mAt = Number(sig.model_at_ms) || 0;
+  if (at === signalsPoolsAt && mAt === signalsModelAt) return false;
+  signalsPoolsAt = at;
+  signalsModelAt = mAt;
+  return true;
+}
+async function pullSignals() {
+  try {
+    const changed = applySignals(await invoke("live_signals"));
+    if (changed && state?.auto_switch) autoSwitchTick(false);
+  } catch { /* 后端没有该命令（旧版）时静默回落到 HTTP 轮询 */ }
+}
+listen("zsignals", () => { pullSignals(); });
+
 const SWEEP_PERIOD = 5 * 60 * 1000;
-// 阶梯式刷新：当前使用中的账号用短周期，加速自动切换的响应；其余账号维持长周期
-const SWEEP_PERIOD_ACTIVE = 45 * 1000;
+// 活跃账号的周期由 scheduleNext 按「剩余时间(ETA) / 阈值」自适应（5s–15s，不加抖动）；
+// 其余账号维持长周期长尾刷新
 const SWEEP_JITTER = 0.2;
 const SWEEP_BATCH = 3; // 每 tick 并发拉取上限（吞吐 0.375/s > 全库需求 0.17/s）
 const TICK_MS = 8000;
@@ -2765,24 +2946,29 @@ let quotaDue = {};
 let ticking = false;
 
 function scheduleNext(id, base = Date.now()) {
-  const jitter = 1 + (Math.random() * 2 - 1) * SWEEP_JITTER;
-  let period = SWEEP_PERIOD;
-  if (state?.accounts?.some((a) => a.id === id && a.is_active)) {
-    // 活跃账号自适应频率：看关注模型的原始百分比（流转后判定高不代表关注模型没耗尽），
-    // 越接近切换阈值刷新越勤——每日重置等额度恢复能第一时间发现并切回
-    period = SWEEP_PERIOD_ACTIVE;
+  const isActive = state?.accounts?.some((a) => a.id === id && a.is_active);
+  if (isActive) {
     const thr = Number(state?.auto_switch_threshold ?? 15);
     const h = healthMapOf().get(id);
-    const fp = h?.focusPct;
-    if (h?.level === "dead") {
-      period = 30 * 1000;                                       // 判死（无套餐/全过期）：靠领取/到期定点刷新翻状态，不必高频盯
-    } else if (fp != null) {
-      if (fp <= thr) period = 6 * 1000;                         // 关注模型已耗尽：高频盯防（等重置/等待其它账号变化）
-      else if (fp <= thr * 2) period = 10 * 1000;               // 逼近阈值：加密
-      else period = 15 * 1000;                                  // 活跃账号整体提速：正在消耗的就是它
-    }
+    const pct = pctPairOf(id).pct ?? h?.remainingPct ?? null;
+    // 优先用「剩余时间(ETA)」自适应：快烧完就高频盯，而不是只看百分比。
+    // 有客户端日志信号时，它比 HTTP 新鲜，HTTP 只需慢频兜底。
+    const lg = logStats();
+    const eta = lg?.etaSec ?? apiEta(id);
+    let period;
+    if (h?.level === "dead" && !lg) period = 30 * 1000;             // 判死：靠领取/到期定点刷新翻状态
+    else if (lg) period = eta != null && eta <= 300 ? 5 * 1000 : 15 * 1000;
+    else if (eta != null && eta <= 180) period = 6 * 1000;          // 预测式：3 分钟内烧完
+    else if (eta != null && eta <= 600) period = 10 * 1000;
+    else if (pct != null && pct <= thr) period = 6 * 1000;
+    else if (pct != null && pct <= thr * 2) period = 10 * 1000;
+    else period = 15 * 1000;
+    activeSweepMs = period;
+    quotaDue[id] = base + period;   // 活跃账号不加抖动：响应要可预期
+    return;
   }
-  quotaDue[id] = base + Math.round(period * jitter);
+  const jitter = 1 + (Math.random() * 2 - 1) * SWEEP_JITTER;
+  quotaDue[id] = base + Math.round(SWEEP_PERIOD * jitter);
 }
 function enrollAccounts() {
   const live = new Set((state?.accounts || []).map((a) => a.id));
@@ -2791,94 +2977,225 @@ function enrollAccounts() {
 }
 function pokeAccount(id) { if (id) quotaDue[id] = Date.now(); }
 
-/** 低额度自动切换：当前账号剩余额度低于阈值时，切到剩余最多的账号 */
+/** 套餐/礼物临期插队：尽快把快过期的额度用掉 */
+function giftSoon(id) {
+  return (acctQuota[id]?.data?.plans || []).some((p) => !planExpired(p) && expireInfo(p.expire)?.warn);
+}
+/** 「关注模型」与「全部池」两个口径的合并：返回用于判定的 pct、是否已流转 */
+function pctPair(focus, all) {
+  const fPct = focus?.matched ? focus.bestPct : null;
+  const aPct = all?.bestPct ?? null;
+  const flowed = !!(focus?.matched && (fPct ?? 0) <= 0 && (aPct ?? 0) > 0);
+  const pct = fPct != null && fPct > 0 ? fPct : aPct;
+  return { pct, flowed };
+}
+/** 某账号的判定口径（API） */
+function pctPairOf(id, model = effectiveFocusModel()) {
+  const q = acctQuota[id];
+  return pctPair(poolStats(q, model), poolStats(q, ""));
+}
+/** 数据过期 → 让 sweep 下一 tick 立刻重拉（节流，避免风控） */
+function forceRefresh(id) {
+  const now = Date.now();
+  if (now - (quotaForceAt[id] || 0) < 10 * 1000) return;
+  quotaForceAt[id] = now;
+  quotaDue[id] = now;
+  asAuditPush("refresh", { id, reason: "stale" });
+}
+function noteForDecision(d) {
+  const eta = d.etaSec != null ? fmtEta(d.etaSec) : null;
+  let note = "";
+  switch (d.reason) {
+    case "stale": note = t("as.noteStale"); break;
+    case "staleSafe": note = t("as.noteStaleSafe"); break;
+    case "noData": note = t("as.noteNoData"); break;
+    case "cooldown": note = t("as.noteCooldown"); break;
+    case "noCand": note = t("as.noteNoCand"); break;
+    case "noImprove": note = t("as.noteNoImprove"); break;
+    default: note = "";
+  }
+  if (eta && d.etaSec <= 1800) {
+    const e = t("as.eta", { eta });
+    note = note ? `${note} · ${e}` : e;
+  }
+  noteChanged(note);
+}
+
+/**
+ * 低额度自动切换。
+ *
+ * 相比旧实现的关键差异：
+ * 1) 双触发：剩余% ≤ 阈值（兜底）+ 剩余时间(ETA) ≤ 安全余量（预测式，能提前几分钟行动）；
+ * 2) 数据新鲜度参与判定：陈旧样本不当真值，改为“先刷新”；
+ * 3) 不再被“全库刷新 / 领取中”整段拦停——那些只影响能不能取新样本，不影响用最近可信样本做决策；
+ * 4) 切换前对陈旧候选做预校验；无达标候选时降级切“还有额度的最好账号”；
+ * 5) 审计：事件原因/目标/耗时落环 + 后端日志，调参不再凭感觉。
+ */
 async function autoSwitchTick(manual = false) {
-  autoSwitchNote = "";
   const s = state;
-  if (!s?.auto_switch || autoSwitchRunning || busy) return;
+  if (!s?.auto_switch || switchLock || autoSwitchRunning || busy) return;
   if (!(s.accounts || []).length) return;
-  if (quotaSweep.running || refreshClaim.running || claimAllRunning || autoClaimRunning || claimActive) return;
-  // 手动刷新是显式触发，跳过冷却；定时巡检仍受冷却约束，避免来回切换
-  const active = s.accounts.find((a) => a.is_active);
+  const active = activeAccount();
   if (!active) return;
-  const hm = healthMapOf();
-  const cur = hm.get(active.id);
-  if (!cur || cur.remainingPct == null) return;
   const thr = Number(s.auto_switch_threshold ?? 15);
+  const model = effectiveFocusModel();
+  const now = Date.now();
 
-  // 候选池：其它账号中判定额度 > 阈值 且 非鉴权失效/查询失败
-  const pool = s.accounts
-    .filter((a) => a.id !== active.id)
-    .map((a) => ({ a, h: hm.get(a.id) }))
-    .filter((x) => x.h && x.h.level !== "auth" && x.h.level !== "fail")
-    .filter((x) => x.h?.remainingPct != null && x.h.remainingPct >= thr);
-  // 关注模型仍有额度的账号优先；流转账号（判定来自其它模型）只做兜底
-  const focusCands = pool.filter((x) => x.h.modelMatched && !x.h.fallback);
-  const flowCands = pool.filter((x) => x.h.fallback);
+  // 当前账号：优先客户端日志（秒级），但与 HTTP 样本比「谁更新用谁」
+  // —— 日志虽然普遍更早（活跃时 p50 15s），但忙时也可能 1-2 分钟才一条，那时 HTTP 快车道反而更新
+  const apFocus = poolStats(acctQuota[active.id], model);
+  const apAll = poolStats(acctQuota[active.id], "");
+  const ap = pctPair(apFocus, apAll);
+  const sampleAt = quotaSampleAt[active.id] || 0;
+  const ageMs = sampleAt ? now - sampleAt : Infinity;
+  const lgStrict = logStats();                       // 已按新鲜窗口过滤
+  const lgAgeMs = poolsAgeMs();
+  let useLog = !!lgStrict;
+  if (useLog && ageMs < lgAgeMs - 30 * 1000) useLog = false;         // HTTP 明显更新 → 用 HTTP
+  if (!useLog && lgStrict && ageMs > AS_DEFAULTS.activeStaleMs) useLog = true; // HTTP 已过期 → 仍用日志
+  const lg = useLog ? lgStrict : null;
+  const sampleSrc = lg ? "log" : "api";
+  let cur;
+  if (lg) {
+    cur = {
+      pct: lg.bestPct, etaSec: lg.etaSec, level: levelOf(lg.bestPct, thr),
+      ageMs: Math.max(0, now - (lg.at || now)), stale: false,
+      planUnavailable: !!lg.planUnavailable, source: sampleSrc,
+    };
+  } else {
+    cur = {
+      pct: ap.pct, etaSec: apiEta(active.id), level: levelOf(ap.pct, thr),
+      ageMs, stale: ageMs > AS_DEFAULTS.activeStaleMs, source: sampleSrc,
+    };
+  }
+  if (!lg && ap.flowed) cur.flowed = true;
 
-  // 触发判定：
-  // - 当前账号非流转：判定额度 ≤ 阈值 → 触发
-  // - 当前账号已流转（关注模型在所有套餐耗尽，判定来自其它模型）：
-  //     其它账号还有关注模型额度 → 立即触发（Flash 优先，不能赖在 5.3 上）
-  //     否则当前账号的流转判定额度 ≤ 阈值（5.3 也快没了）→ 触发
-  const focusCandExists = focusCands.length > 0;
-  const shouldSwitch = cur.fallback
-    ? (focusCandExists || cur.remainingPct <= thr)
-    : cur.remainingPct <= thr;
-  if (!shouldSwitch) {
-    // 让“为什么不切”对用户可见：关注模型全场耗尽时已流转其它模型，暂无更优目标
-    if (cur.fallback) autoSwitchNote = t("as.noteFlowed", { model: cur.modelName || "", pct: Math.round(cur.remainingPct) });
+  // 候选：其它账号（关注模型口径优先，流转账号只能做兜底）
+  pruneRecentFrom();
+  const hm = healthMapOf();
+  const cands = [];
+  for (const a of s.accounts) {
+    if (a.id === active.id) continue;
+    const h = hm.get(a.id);
+    if (h && (h.level === "auth" || h.level === "fail")) continue;
+    const pair = pctPairOf(a.id, model);
+    if (pair.pct == null) continue;
+    const cs = quotaSampleAt[a.id] || 0;
+    cands.push({
+      id: a.id, name: a.name, pct: pair.pct, flowed: pair.flowed,
+      level: h?.level || "unknown", gift: giftSoon(a.id),
+      fallback: pair.flowed, modelMatched: !!h?.modelMatched,
+      ageMs: cs ? now - cs : Infinity,
+    });
+  }
+  // 当前账号“已流转”（关注模型全场耗尽、只是靠其它模型顶着）时，只要还有账号留着关注模型额度，
+  // 就把它当成已经耗尽来处理（立即切，不等百分比）——否则会在 5.3 上一直赖着
+  const hasFocusCand = cands.some((c) => !c.flowed && c.pct >= thr);
+  if (cur.flowed && hasFocusCand) cur = { ...cur, pct: 0, level: "dead" };
+
+  const d = evaluate({
+    now, active, cur, candidates: cands, lastSwitchAt: lastAutoSwitchAt, manual,
+    opts: {
+      ...AS_DEFAULTS,
+      threshold: thr,
+      marginSec: marginSec(),
+      cooldownMs: AUTO_SWITCH_COOLDOWN_MS,
+      avoid: [...recentFrom.keys()],
+    },
+  });
+
+  if (d.action === "none") {
+    // 让“为什么不切”可见：关注模型全场耗尽、只是靠其它模型顶着，且没有更优目标
+    if (cur.flowed && !hasFocusCand && cur.pct != null) {
+      noteChanged(t("as.noteFlowed", { model: modelSignal() || model || "", pct: Math.round(cur.pct) }));
+    } else {
+      noteChanged("");
+    }
     return;
   }
+  if (d.action === "refresh") { noteForDecision(d); forceRefresh(active.id); return; }
+  if (d.action === "wait") { noteForDecision(d); return; }
+  await doAutoSwitch(d, active, cur, lg);
+}
 
-  // 冷却豁免：紧急情况（当前账号关注模型已耗尽且有关注模型候选）不受 5 分钟冷却限制，
-  // 否则刚切过去的号 Flash 烧完后要干等 5 分钟
-  const emergency = cur.fallback && focusCandExists;
-  if (!manual && !emergency && Date.now() - lastAutoSwitchAt < AUTO_SWITCH_COOLDOWN_MS) return;
-
-  // 目标池：关注模型候选优先；关注模型全面耗尽时才轮到流转候选
-  const targetPool = focusCandExists ? focusCands : flowCands;
-  if (!targetPool.length) {
-    autoSwitchNote = t("as.noteNoCand");
-    return;
-  }
-  // 候选排序：额度高者优先；礼物/套餐临期的账号再插队，尽快把赠送额度用掉
-  const giftSoon = (a) => (acctQuota[a.id]?.data?.plans || []).some((p) => !planExpired(p) && expireInfo(p.expire)?.warn);
-  const best = targetPool
-    .map((x) => ({ ...x, gift: giftSoon(x.a) ? 1 : 0 }))
-    .sort((x, y) => (y.gift - x.gift) || (y.h.remainingPct - x.h.remainingPct))[0];
-  if (!best) return;
-  // ZCode 运行中且未开热切换：不自动强杀客户端，只在提示里说明
-  if (s.zcode_running && !s.hot_switch) {
-    autoSwitchNote = t("as.needHot");
-    if (!isTyping()) render();
-    return;
-  }
-  autoSwitchRunning = true;
-  if (!isTyping()) render();
+/** 执行切换：先对陈旧候选做预校验，再热切，最后记审计 */
+async function doAutoSwitch(d, active, cur, lg) {
+  const s = state;
+  const thr = Number(s.auto_switch_threshold ?? 15);
+  const started = Date.now();
+  switchLock = true;                 // 从预校验开始上锁（见 switchLock 定义）
   try {
-    const r = await invoke("switch_to", { id: best.a.id, force: false, restart: s.launch_after_switch });
-    lastAutoSwitchAt = Date.now();
-    ui.expanded.delete(best.a.id);
-    const bits = [];
-    if (r?.hot) bits.push(t("m.bitHot"));
-    if (r?.launched) bits.push(t("m.bitLaunched"));
-    if (r?.preserved_as) bits.push(t("m.bitPreserved", { name: r.preserved_as }));
-    toast(t("as.toast", { from: active.name, to: r?.name || best.a.name, pct: Math.round(cur.remainingPct) }), "ok", bits.join(t("common.listSep")));
-    await refresh();
-    pokeAccount(best.a.id);
-  } catch (e) {
-    lastAutoSwitchAt = Date.now();
-    toast(t("as.fail", { err: stripErr(e) }), "warn");
+    let target = null;
+    let preflights = 0;
+    for (const c of d.ranked || []) {
+      if (c.ageMs > AS_DEFAULTS.targetFreshMs && preflights < AS_DEFAULTS.maxPreflight) {
+        preflights++;
+        await loadAcctQuota(c.id, { force: true });
+        const fresh = pctPairOf(c.id);
+        // 刷不到（网络/风控/无数据）→ 该候选视为不可用，绝不拿旧数据当依据切过去
+        c.pct = fresh.pct;
+        c.flowed = fresh.flowed;
+        c.ageMs = 0;
+        if (c.pct == null) continue;
+      }
+      const okPct = d.degrade ? c.pct > 0 : c.pct >= thr;
+      const better = cur.pct == null || c.pct > cur.pct;
+      if (okPct && better) { target = c; break; }
+    }
+    if (!target) {
+      asAuditPush("preflight-fail", { from: active.id, tried: preflights, want: d.ranked?.length || 0 });
+      noteChanged(t("as.noteCandStale"));
+      return;
+    }
+    if (s.zcode_running && !s.hot_switch) {
+      noteChanged(t("as.needHot"));
+      if (Date.now() - lastHotWarnAt > 10 * 60 * 1000) {
+        lastHotWarnAt = Date.now();
+        toast(t("as.needHotToast"), "warn", t("as.needHotDesc"));
+        asAuditPush("blocked-need-hot", { from: active.id, to: target.id });
+      }
+      return;
+    }
+    const best = target;
+    autoSwitchRunning = true;
+    if (!isTyping()) render();
+    try {
+      const r = await invoke("switch_to", { id: best.id, force: false, restart: s.launch_after_switch });
+      lastAutoSwitchAt = Date.now();
+      recentFrom.set(active.id, Date.now());
+      ui.expanded.delete(best.id);
+      const bits = [];
+      if (r?.hot) bits.push(t("m.bitHot"));
+      if (r?.launched) bits.push(t("m.bitLaunched"));
+      if (r?.preserved_as) bits.push(t("m.bitPreserved", { name: r.preserved_as }));
+      const pct = cur.pct == null ? "?" : Math.round(cur.pct);
+      const head = d.degrade
+        ? t("as.toastDegrade", { from: active.name, to: r?.name || best.name, pct })
+        : t("as.toast", { from: active.name, to: r?.name || best.name, pct });
+      toast(head, "ok", bits.join(t("common.listSep")));
+      asAuditPush("switch", {
+        from: active.id, to: best.id, reason: d.reason, degrade: !!d.degrade,
+        pct: cur.pct == null ? null : Math.round(cur.pct * 10) / 10,
+        etaSec: d.etaSec == null ? null : Math.round(d.etaSec),
+        src: lg ? "log" : "api", hot: !!r?.hot, preflight: preflights, ms: Date.now() - started,
+      });
+      await refresh();
+      pokeAccount(best.id);
+    } catch (e) {
+      // 失败也计一次冷却：只当“抑制器”（否则 ETA 触发会每轮重试），不阻塞后续成功路径
+      lastAutoSwitchAt = Date.now();
+      toast(t("as.fail", { err: stripErr(e) }), "warn");
+      asAuditPush("switch-fail", { from: active.id, to: best.id, err: stripErr(e), ms: Date.now() - started });
+    }
   } finally {
     autoSwitchRunning = false;
+    switchLock = false;
     if (!uiLocked()) render();
   }
 }
 
 // 套餐有效期定点刷新：有效期刚跨过的账号立刻刷一次（跨过时刻的 10 分钟窗口内，按有效期时间戳去重）
 const expiryRefreshDone = new Map();
-const prevJudgePct = new Map();
 function expiryRefreshTick() {
   const now = Date.now();
   for (const a of state?.accounts || []) {
@@ -2925,18 +3242,8 @@ async function sweepTick() {
     for (const a of batch) {
       if (quotaDue[a.id] === dueAtMap.get(a.id)) scheduleNext(a.id);
     }
-    // 刷新后即时切换：当前账号的判定额度刚跌破阈值（状态跨越，非稳态）→ 立刻切，不等下个检查周期
-    const cur = batch.find((a) => a.is_active);
-    if (cur && !autoSwitchRunning) {
-      const h = healthMapOf().get(cur.id);
-      const thr = Number(state?.auto_switch_threshold ?? 15);
-      const nowPct = h?.remainingPct ?? null;
-      const prev = prevJudgePct.get(cur.id);
-      const crossed = nowPct != null && nowPct <= thr && (prev == null || prev > thr)
-        && h?.level !== "auth" && h?.level !== "fail";
-      prevJudgePct.set(cur.id, nowPct);
-      if (crossed) autoSwitchTick(true); // manual 语义 = 跳过 5 分钟冷却
-    }
+    // 刷新后即时切换：loadAcctQuota 每次成功拉到数据都会自己跑一次判定（见其内部），
+    // 这里不再需要额外的「跨阈值」旁路（旧实现用 manual 绕过冷却，容易造成贴边横跳）。
     if (!uiLocked()) render();
   } finally {
     ticking = false;
@@ -2958,11 +3265,15 @@ async function sweepTick() {
       Promise.all([
         invoke("get_state"),
         invoke("two_api_status").catch(() => null),
-      ]).then(([s, st]) => {
+        invoke("live_signals").catch(() => null),
+      ]).then(([s, st, sig]) => {
         state = s;
         if (s?.language) init(s.language);
         enrollAccounts();
         if (st?.usage) twoUsageMap = new Map(Object.entries(st.usage));
+        // 兜底：即使事件丢了，也能用 5s 轮询发现新余额并立即判定（纯本地状态读取，不耗风控）
+        const sigChanged = applySignals(sig);
+        if (sigChanged && s?.auto_switch) autoSwitchTick(false);
         if (!uiLocked()) render();
       }).catch(() => {});
     }, 5000);

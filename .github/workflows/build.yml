@@ -38,6 +38,9 @@ jobs:
       - name: Check i18n keys
         run: npm run check:i18n
 
+      - name: Check auto-switch decision logic
+        run: npm run check:autoswitch
+
       - name: Build (前端 + Rust + NSIS)
         run: npm run tauri build -- --bundles ${{ github.event.inputs.bundles || 'nsis' }}
 

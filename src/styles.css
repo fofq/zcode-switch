@@ -1760,6 +1760,16 @@ select.two-input { cursor: pointer; }
 .st-ctl.wide > .st-input { flex: 1; min-width: 0; }
 .st-sub { margin: 2px 0 6px 3px; padding-left: 12px; border-left: 2px solid var(--hairline); }
 .st-note { padding: 2px 0 4px; font-size: 12.5px; line-height: 1.6; color: var(--ink-mute); }
+/* 自动切换的信号源/剩余时间诊断行：与说明文字区分开，一眼能看出数据从哪来 */
+.st-note.st-sig {
+  padding: 6px 8px;
+  border: 1px solid var(--hairline);
+  border-radius: 6px;
+  background: var(--bg-2);
+  font-family: var(--mono);
+  font-size: 11.5px;
+  word-break: break-word;
+}
 .st-input {
   font-family: var(--mono);
   font-size: 13px;
