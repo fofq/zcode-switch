@@ -1041,6 +1041,7 @@ fn normalize_quota_limit(limit_resp: &Value, sub_resp: Option<&Value>) -> QuotaO
             name: product_name,
             expire: plan_expire.clone(),
             gift: None,
+            expired: None,
             total,
             used,
             remaining,
