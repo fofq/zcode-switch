@@ -172,6 +172,8 @@ const SIGNALS_FRESH_MS = 180 * 1000;
 let quotaHist = {};
 let quotaSampleAt = {};
 let quotaForceAt = {};
+// 重活窗口里被要求「尽快重查」的账号（窗口结束后补一轮）
+const staleWant = new Set();
 // 最近切出过的账号（防 A→B→A 乒乓），10 分钟滚动
 let recentFrom = new Map();
 // 自动切换审计环（事件时间/原因/目标/耗时），同时落盘到后端日志
@@ -381,7 +383,19 @@ function healthMapOf() {
     threshold: Number(state?.auto_switch_threshold ?? 15),
   };
   const map = new Map();
-  for (const a of state?.accounts || []) map.set(a.id, healthOf(a, acctQuota[a.id], isAuthErr, model, opts));
+  // 活跃账号的接口数据可能已经一分钟没刷（日志模式下 API 放慢了），但日志是秒级的：
+  // 列表/分组也跟着日志走，否则会出现「面板显示 40%、实际已 3%」的误导
+  const lg = logStats();
+  for (const a of state?.accounts || []) {
+    let h = healthOf(a, acctQuota[a.id], isAuthErr, model, opts);
+    if (lg && a.is_active && lg.bestPct != null && h.level !== "auth" && h.level !== "fail") {
+      const pct = lg.bestPct;
+      if (h.remainingPct == null || Math.abs(h.remainingPct - pct) > 0.5) {
+        h = { ...h, remainingPct: pct, level: levelOf(pct, opts.threshold), modelMatched: true, modelName: lg.worstName || h.modelName, fromLog: true };
+      }
+    }
+    map.set(a.id, h);
+  }
   return map;
 }
 function focusModel() {
@@ -1027,7 +1041,9 @@ async function loadAcctQuota(id, opts = {}) {
   acctQuota[id] = { ...cur, busy: true, busyAt: Date.now() };
   if (!uiLocked()) render();
   try {
-    const data = await invoke("get_account_quota", { id });
+    // quick（批量刷新/扫库）：后端不因“成功但空”而 sleep 2.5s 重查——
+    // 50 个空号就是 +125s，首次刷新会被拖到几分钟；心跳照发，前端按「待激活」短周期复查
+    const data = await invoke("get_account_quota", { id, quick: !!opts.quick });
     acctQuota[id] = { data, err: null, code: null, busy: false };
     // 采样入队（算烧速/ETA 用）；失败时刻意不刷新样本时间，让“陈旧 → 先刷新”的门禁生效
     quotaSampleAt[id] = Date.now();
@@ -1294,7 +1310,7 @@ const actions = {
       }
       for (const id of order) {
         if (quotaSweep.cancel) { cancelled = true; break; }
-        await loadAcctQuota(id);
+        await loadAcctQuota(id, { quick: true });
         quotaSweep.done++;
         if (!isTyping()) render();
         await new Promise((r) => setTimeout(r, 200));
@@ -1307,6 +1323,9 @@ const actions = {
       if (cancelled) toast(t("list.toastSweepCancelled", { n: done }));
       else toast(elig ? t("list.toastRefreshAllBoth", { n: done }) : t("list.toastSweepDone", { n: done }));
       render();
+      // 刷新期间被要求重查的账号（拿不到数据/太旧）：窗口一结束补一轮，不再卡在「陈旧」没人管
+      drainStaleWant();
+      if (!cancelled) sweepTick();
       if (state?.auto_switch) autoSwitchTick(true);
     }
   },
@@ -2946,18 +2965,18 @@ let quotaDue = {};
 let ticking = false;
 
 function scheduleNext(id, base = Date.now()) {
+  const h = healthMapOf().get(id);
   const isActive = state?.accounts?.some((a) => a.id === id && a.is_active);
   if (isActive) {
     const thr = Number(state?.auto_switch_threshold ?? 15);
-    const h = healthMapOf().get(id);
     const pct = pctPairOf(id).pct ?? h?.remainingPct ?? null;
-    // 优先用「剩余时间(ETA)」自适应：快烧完就高频盯，而不是只看百分比。
-    // 有客户端日志信号时，它比 HTTP 新鲜，HTTP 只需慢频兜底。
     const lg = logStats();
     const eta = lg?.etaSec ?? apiEta(id);
     let period;
-    if (h?.level === "dead" && !lg) period = 30 * 1000;             // 判死：靠领取/到期定点刷新翻状态
-    else if (lg) period = eta != null && eta <= 300 ? 5 * 1000 : 15 * 1000;
+    // 有日志信号时 API 只做兵底：日志已经是秒级，再高频打接口只会把接口挤慢、招风控
+    // （实测：客户端自己的 billing 调用从 81ms 涨到 642ms，机器已处于被限流状态）
+    if (lg) period = eta != null && eta <= 300 ? 30 * 1000 : 60 * 1000;
+    else if (h?.level === "dead") period = 30 * 1000;             // 判死：靠领取/到期定点刷新翻状态
     else if (eta != null && eta <= 180) period = 6 * 1000;          // 预测式：3 分钟内烧完
     else if (eta != null && eta <= 600) period = 10 * 1000;
     else if (pct != null && pct <= thr) period = 6 * 1000;
@@ -2965,6 +2984,11 @@ function scheduleNext(id, base = Date.now()) {
     else period = 15 * 1000;
     activeSweepMs = period;
     quotaDue[id] = base + period;   // 活跃账号不加抖动：响应要可预期
+    return;
+  }
+  // 待激活（成功但空）：心跳补发后服务端可能马上就发套餐，90s 复查一次即可
+  if (h?.level === "pending") {
+    quotaDue[id] = base + 90 * 1000;
     return;
   }
   const jitter = 1 + (Math.random() * 2 - 1) * SWEEP_JITTER;
@@ -2999,8 +3023,30 @@ function forceRefresh(id) {
   const now = Date.now();
   if (now - (quotaForceAt[id] || 0) < 10 * 1000) return;
   quotaForceAt[id] = now;
+  // 重活窗口（全库刷新/领取）里 sweepTick 是停用的，poke 出去没人执行；先记账，窗口结束补一轮
+  if (heavyWindow()) {
+    staleWant.add(id);
+    return;
+  }
   quotaDue[id] = now;
   asAuditPush("refresh", { id, reason: "stale" });
+}
+/** 全库刷新 / 领取 / 资格刷新正在进行：这些窗口里额度接口本来就很挤 */
+function heavyWindow() {
+  return !!(quotaSweep.running || refreshClaim.running || claimAllRunning || autoClaimRunning || claimActive);
+}
+/** 把重活窗口里记下的「待补刷」账号排进去（限量，避免窗口一结束就一次冲 50 个） */
+function drainStaleWant(max = 3) {
+  if (!staleWant.size) return 0;
+  let n = 0;
+  for (const id of [...staleWant]) {
+    if (n >= max) break;
+    staleWant.delete(id);
+    quotaDue[id] = Date.now();
+    n++;
+  }
+  if (n) asAuditPush("refresh-queued", { n, left: staleWant.size });
+  return n;
 }
 function noteForDecision(d) {
   const eta = d.etaSec != null ? fmtEta(d.etaSec) : null;
@@ -3123,12 +3169,16 @@ async function doAutoSwitch(d, active, cur, lg) {
   const s = state;
   const thr = Number(s.auto_switch_threshold ?? 15);
   const started = Date.now();
+  const heavy = heavyWindow();
+  // 重活窗口（全库刷新/领取）里不额外发预校验请求；同样不拿超过 5 分钟的旧数据冒险
+  const ageLimit = heavy ? 5 * 60 * 1000 : AS_DEFAULTS.targetFreshMs;
   switchLock = true;                 // 从预校验开始上锁（见 switchLock 定义）
   try {
     let target = null;
     let preflights = 0;
     for (const c of d.ranked || []) {
-      if (c.ageMs > AS_DEFAULTS.targetFreshMs && preflights < AS_DEFAULTS.maxPreflight) {
+      if (c.ageMs > ageLimit) {
+        if (heavy || preflights >= AS_DEFAULTS.maxPreflight) continue;
         preflights++;
         await loadAcctQuota(c.id, { force: true });
         const fresh = pctPairOf(c.id);
@@ -3218,6 +3268,7 @@ async function sweepTick() {
   if (ticking || quotaSweep.running) return;
   enrollAccounts();
   expiryRefreshTick();
+  drainStaleWant();
   const now = Date.now();
   // 饥饿修复：扫描 8s 一发、每轮 1 个账号的吞吐（0.125/s）低于全库需求
   // （51 号 × 45s 周期 ≈ 0.17/s），按列表顺序取会让排后的账号（含当前账号快车道）
@@ -3238,7 +3289,7 @@ async function sweepTick() {
   ticking = true;
   const dueAtMap = new Map(batch.map((a) => [a.id, quotaDue[a.id]]));
   try {
-    await Promise.all(batch.map((a) => loadAcctQuota(a.id)));
+    await Promise.all(batch.map((a) => loadAcctQuota(a.id, { quick: true })));
     for (const a of batch) {
       if (quotaDue[a.id] === dueAtMap.get(a.id)) scheduleNext(a.id);
     }

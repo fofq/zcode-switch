@@ -226,30 +226,40 @@ async fn auto_switch_log(event: String, detail: String) -> Result<(), String> {
     Ok(())
 }
 
+/// 「业务成功但空」的跳号补一次登录等价心跳（官方客户端每次启动都发 app_launch/app_daily_active，
+/// 服务端据此发放套餐）。心跳本身是脱离线程且带 180s 跳号限流的，不阻塞查询。
+fn activation_heartbeat(paths: &Paths, id: &str) {
+    if let Ok(acc) = store::load_account(paths, id) {
+        if let Some(mid) = acc.virtual_device_mid.clone().filter(|m| !m.trim().is_empty()) {
+            claim::spawn_activation_report(&paths.home, &acc.credentials, &mid);
+        }
+    }
+}
+
 #[tauri::command]
-async fn get_account_quota(id: String) -> Result<quota::QuotaOverview, String> {
+async fn get_account_quota(id: String, quick: Option<bool>) -> Result<quota::QuotaOverview, String> {
     let paths = Paths::detect();
     let id2 = id.clone();
     let mut ov = tauri::async_runtime::spawn_blocking(move || store::account_quota(&paths, &id2))
         .await
         .map_err(|e| format!("内部任务失败: {e}"))??;
     if ov.source == "snapshot_empty" {
-        // 快照「业务成功但空」= 套餐还没发放：先补一次登录等价的激活心跳（官方客户端每次启动
-        // 都会发 app_launch/app_daily_active，服务端据此发放套餐），稍等再查一次。
-        // 仍是空就把空数据还给前端——前端按「待激活」展示并用短周期复查。
+        // 快照「业务成功但空」= 套餐还没发放：先补一次登录等价的激活心跳，稍等再查一次。
+        // quick=true（全库刷新 / 扫库）：只发心跳、不等不重查——否则每个空号 +2.5s，
+        // 50 个空号就是 +125s，首次刷新会被拖到几分钟；前端按「待激活」用短周期复查。
+        let quick = quick.unwrap_or(false);
         let paths = Paths::detect();
         let id2 = id.clone();
         let retry = tauri::async_runtime::spawn_blocking(move || {
-            if let Ok(acc) = store::load_account(&paths, &id2) {
-                if let Some(mid) = acc.virtual_device_mid.clone().filter(|m| !m.trim().is_empty()) {
-                    claim::spawn_activation_report(&paths.home, &acc.credentials, &mid);
-                }
+            activation_heartbeat(&paths, &id2);
+            if quick {
+                return None;
             }
             std::thread::sleep(std::time::Duration::from_millis(2500));
-            store::account_quota(&paths, &id2)
+            store::account_quota(&paths, &id2).ok()
         })
         .await;
-        if let Ok(Ok(fresh)) = retry {
+        if let Ok(Some(fresh)) = retry {
             ov = fresh;
         }
     }
