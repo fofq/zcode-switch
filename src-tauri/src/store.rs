@@ -1739,6 +1739,12 @@ pub fn import_values(paths: &Paths, files: &[(String, Value)]) -> Result<ImportR
 }
 
 pub fn get_state(paths: &Paths) -> Result<AppState, String> {
+    // ZCode 运行中会原地轮换 JWT（旧版号静默失效，billing/balance 返回「成功但空」），
+    // 前端每 5s 拉一次 state——顺手把 live 新票回写到匹配账号的快照，
+    // 否则切走之后快照里一直是旧票，额度查询永远拿到空（46/48 号案例）。
+    if let Ok(accounts) = list_accounts(paths) {
+        let _ = sync_live_back_to_source(paths, &accounts);
+    }
     let accounts = list_accounts(paths)?;
     let live = read_live(paths)?;
     let live_hash = live.as_ref().map(canonical_hash);

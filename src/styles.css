@@ -464,6 +464,21 @@ select.two-input { cursor: pointer; }
 .two-models-row { display: flex; align-items: center; gap: 8px; }
 .two-models-row .two-input { flex: 1; }
 .two-models-row .btn-ghost { flex: none; }
+.row-seq {
+  position: absolute;
+  top: 4px;
+  left: 6px;
+  z-index: 1;
+  font-family: var(--mono);
+  font-size: 10px;
+  line-height: 14px;
+  padding: 0 4px;
+  color: #6b7280;
+  background: rgba(255,255,255,.05);
+  border-radius: 4px;
+  pointer-events: none;
+}
+.row-seq + .row-usage { left: 34px; }
 .row-usage {
   position: absolute;
   top: 4px;

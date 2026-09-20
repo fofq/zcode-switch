@@ -213,6 +213,7 @@ export const zh = {
   "list.apiKeyMintBigmodelHint": "bigmodel 账号的上游常拦截铸造；免费模型可用 z.ai 账号的 key 跨网关调用",
   "list.apiKeyJwtTag": "[Start Plan JWT·仅配 zcode-plan 端点]",
   "list.planExpired": "已过期",
+  "list.seqTitle": "序号（按当前排序展示顺序）",
   "list.apiKeysCopied": "已复制 {n} 个账号的 API Key",
   "list.locateActive": "定位当前使用的账号",
   "list.locateMissing": "当前账号不在列表中（可能被筛选隐藏）",

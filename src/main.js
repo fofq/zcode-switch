@@ -656,8 +656,13 @@ function visibleAccounts() {
 /** 分组视图：自定义分组优先，未分组按"额度健康度"分桶 */
 function groupedListHtml(accounts, rowHtml, healthMap) {
   const buckets = bucketAccounts(accounts, { localeTag: localeTag(), healthLabel }, healthMap);
+  let seq = 0; // 序号跨分组连续，跟随当前排序/筛选的展示顺序
   return buckets.map((b) => {
     const collapsed = ui.collapsedSections.has(b.key);
+    const items = collapsed ? b.items : b.items.map((a) => ({ a, n: ++seq }));
+    const body = collapsed
+      ? ""
+      : `<div class="grp-body">${items.map(({ a, n }) => rowHtml(a, n)).join("")}</div>`;
     return `
     <section class="grp-sec${collapsed ? " collapsed" : ""}" data-sec="${esc(b.key)}">
       <button class="grp-head" click="actions.toggleSection(event)" aria-expanded="${collapsed ? "false" : "true"}">
@@ -665,7 +670,7 @@ function groupedListHtml(accounts, rowHtml, healthMap) {
         <span class="grp-title">${esc(b.label)}</span>
         <span class="grp-num">${t("grp.count", { count: b.items.length })}</span>
       </button>
-      ${collapsed ? "" : `<div class="grp-body">${b.items.map(rowHtml).join("")}</div>`}
+      ${body}
     </section>`;
   }).join("");
 }
@@ -2461,7 +2466,7 @@ function render(force = false) {
   const { list: visible, hm: healthMap } = visibleAccounts();
   const sum = summarize(s.accounts, healthMap);
 
-  const rowHtml = (a) => {
+  const rowHtml = (a, seq) => {
     const h = healthMap.get(a.id) || { level: "unknown", remainingPct: null };
     const isActive = a.is_active;
     if (renaming === a.id) {      return `
@@ -2510,14 +2515,15 @@ function render(force = false) {
     const displayName = (baseName && baseName.trim())
       || (ident ? (ui.hideInfo && looksSecret(ident) ? t("list.hidden") : ident) : "")
       || t("list.unnamed");
-    // 2API 累计请求数（左上角小计数，0 不显示）
+    // 2API 累计请求数（左上角小计数，0 不显示）；默认序号紧挨其前
     const usage = twoUsageMap.get(a.id) || 0;
     const usageBadge = usage
       ? `<span class="row-usage" data-usage title="${esc(t("list.usageTitle"))}">${usage > 999 ? (usage / 1000).toFixed(1) + "k" : usage}</span>`
       : "";
+    const seqBadge = seq != null ? `<span class="row-seq" title="${esc(t("list.seqTitle"))}">${seq}</span>` : "";
     return `
     <div class="row${isActive ? " active" : ""}${checked ? " picked" : ""}${slim ? " slim" : ""}" data-id="${a.id}">
-      ${usageBadge}
+      ${seqBadge}${usageBadge}
       <div class="row-top">
         <span class="rchk" role="checkbox" aria-checked="${checked}" title="${esc(t("list.selectHint"))}" click="actions.toggleSelect('${a.id}')">${ic("check", 11)}</span>
         ${healthDotHtml(h)}
@@ -2559,7 +2565,7 @@ function render(force = false) {
          </div>`
       : s.grouped
         ? groupedListHtml(visible, rowHtml, healthMap)
-        : visible.map(rowHtml).join("");
+        : visible.map((a, i) => rowHtml(a, i + 1)).join("");
 
   const claimableCount = s.accounts.filter((a) => (claimable[a.id]?.plans || []).length > 0).length;
 

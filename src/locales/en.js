@@ -217,6 +217,7 @@ export const en = {
   "list.apiKeyMintBigmodelHint": "bigmodel upstream often blocks minting; free models work with a z.ai account key across gateways",
   "list.apiKeyJwtTag": "[Start Plan JWT · zcode-plan endpoint only]",
   "list.planExpired": "Expired",
+  "list.seqTitle": "Index (follows current sort order)",
   "list.apiKeysCopied": "Copied API keys of {n} accounts",
   "list.locateActive": "Locate the active account",
   "list.locateMissing": "Active account is not in the list (filtered out?)",
