@@ -208,7 +208,7 @@ export const zh = {
   "list.expShort": "{date} 到期",
   "list.unnamed": "未命名账号",
   "list.apiKeyCopied": "API Key 已复制",
-  "list.apiKeyCopiedHint": "免费模型可直连官方 paas/v4；5.3 等套餐/赠送额度不走此 key，请用 2API",
+  "list.apiKeyCopiedHint": "免费模型可直连官方 paas/v4；5.3 等套餐/赠送额度不走此 key，由 2API 用登录态自动消费（两条路分开）",
   "list.apiKeyNone": "该账号没有可用的 API Key",
   "list.apiKeyMintFail": "未能获取平台 API Key（复制已取消）",
   "list.apiKeyMintBigmodelHint": "bigmodel 账号的上游常拦截铸造；免费模型可用 z.ai 账号的 key 跨网关调用",
@@ -224,7 +224,7 @@ export const zh = {
 
   "two.title": "2API 本地服务",
   "two.on": "启用 2API 本地服务",
-  "two.onDesc": "在本机暴露 Anthropic / OpenAI 兼容接口，把账号额度给 Claude Code、codex、opencode、pi 等编程工具使用",
+  "two.onDesc": "在本机暴露 Anthropic / OpenAI 兼容接口给编程工具使用。免费模型走全账号平台 Key 池；套餐模型（glm-5.3 系）走当前账号登录态 JWT（与复制的平台 Key 分开），遇风控会自动弹验证码窗口无感验证",
   "two.statusOn": "运行中",
   "two.statusOff": "已停止",
   "two.requests": "请求 {n}",

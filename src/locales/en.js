@@ -212,7 +212,7 @@ export const en = {
   "list.expShort": "expires {date}",
   "list.unnamed": "Unnamed account",
   "list.apiKeyCopied": "API key copied",
-  "list.apiKeyCopiedHint": "Free flash models work directly on the official API; 5.3 plan/gift quota needs 2API",
+  "list.apiKeyCopiedHint": "Free flash models work directly on the official API; 5.3 plan/gift quota is consumed by 2API via your login session (paths stay separate)",
   "list.apiKeyNone": "No usable API key for this account",
   "list.apiKeyMintFail": "Failed to obtain the platform API key (copy cancelled)",
   "list.apiKeyMintBigmodelHint": "bigmodel upstream often blocks minting; free models work with a z.ai account key across gateways",
@@ -228,7 +228,7 @@ export const en = {
 
   "two.title": "2API local service",
   "two.on": "Enable 2API local service",
-  "two.onDesc": "Expose Anthropic / OpenAI compatible endpoints on localhost so coding tools like Claude Code, codex, opencode and pi can use your account quota",
+  "two.onDesc": "Expose Anthropic / OpenAI compatible endpoints on localhost for coding tools. Free models use the pooled platform keys of all accounts; plan models (glm-5.3 family) use the current account's login JWT (separate from copied keys) and may pop an auto-solving captcha window",
   "two.statusOn": "Running",
   "two.statusOff": "Stopped",
   "two.requests": "Requests {n}",

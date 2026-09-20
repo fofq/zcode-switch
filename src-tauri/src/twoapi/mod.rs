@@ -1,9 +1,11 @@
 //! 2API：本地 Anthropic/OpenAI 兼容服务，把账号额度暴露给其它编程工具。
-//! 路由策略（按模型分流）：
-//! - 套餐模型（glm-5.3 / glm-5.3-flash 等）→ 账号 coding endpoint（anthropic 格式）透传，走账号套餐额度；
-//! - 官方长期免费模型（4.5-flash / 4.7-flash / 4.6v-flash）→ 标准 OpenAI 兼容端点 paas/v4，
-//!   Bearer 鉴权 + 全账号 key 池智能轮询（免费不耗额度但有速率限制，轮询摊平）。
-//! Anthropic 入站请求免费模型时做 请求/响应/SSE 双向翻译。
+//! 两条路刻意分开（不混用凭据）：
+//! - 免费模型（4.5-flash / 4.6v-flash / 4.7-flash）→ 全账号平台 key 池轮询；
+//!   OpenAI 入站打 paas/v4、Anthropic 入站打 coding endpoint，纯透传（免费不耗额度，有速率限制靠轮询摊平）。
+//! - 套餐模型（glm-5.3 系）→ 当前/锁定账号的登录态 JWT（Bearer）打 zcode-plan 端点透传。
+//!   实测套餐额度只挂在 zcode-plan 体系下，平台 key 在 api.z.ai 花不了它（1113 无资源包），
+//!   故套餐路由一律 JWT；该端点有阿里云验证码墙（3007），见下方验证码桥接。
+//! OpenAI 入站的套餐请求做 请求/响应/SSE 三层翻译（openai_map）。
 
 pub mod openai_map;
 pub mod resolve;
@@ -140,16 +142,6 @@ fn is_captcha_challenge(text: &str) -> bool {
             .and_then(|m| m.as_str())
             .map(|m| m.contains("captcha"))
             .unwrap_or(false)
-}
-
-/// 套餐路由的鉴权头：start-plan JWT → Bearer（官方 3.14 同款，x-api-key 会 401）；
-/// 平台 key → x-api-key（api.z.ai coding/paas 端点实测两种都收，维持原样）
-fn auth_style_for(info: &ApiKeyInfo, anthropic_version: &str) -> AuthStyle {
-    if info.kind == "jwt" {
-        AuthStyle::Bearer(info.api_key.clone())
-    } else {
-        AuthStyle::Anthropic { key: info.api_key.clone(), version: anthropic_version.to_string() }
-    }
 }
 
 pub struct SharedState {
@@ -497,9 +489,9 @@ async fn messages_count_tokens(State(st): State<Arc<SharedState>>, headers: Head
     relay_anthropic(&st, &headers, &body, "/v1/messages/count_tokens").await
 }
 
-/// Anthropic 格式套餐路由：解析账号 → 鉴权头按 key 类型选择 → 透传。
-/// start-plan JWT 上游（zcode.z.ai）有 3007 验证码墙：错误响应体会被缓冲检查，
-/// 命中时走验证码桥接（窗口解出参数 → 带头重试一次）。
+/// Anthropic 格式套餐路由：解析账号 JWT → Bearer 透传 zcode-plan 端点。
+/// 该端点有 3007 验证码墙：错误响应体会被缓冲检查，命中时走验证码桥接
+/// （窗口解出参数 → 带头重试一次）。
 async fn relay_anthropic(st: &Arc<SharedState>, headers: &HeaderMap, body: &[u8], path: &str) -> Response {
     let info = match resolve::resolve(st).await {
         Ok(x) => x,
@@ -513,21 +505,13 @@ async fn relay_anthropic(st: &Arc<SharedState>, headers: &HeaderMap, body: &[u8]
         .and_then(|v| v.to_str().ok())
         .unwrap_or(DEFAULT_ANTHROPIC_VERSION)
         .to_string();
-    relay_plan(
-        st,
-        info,
-        &version,
-        body,
-        path,
-        PumpMode::Raw,
-    )
-    .await
+    relay_plan(info, &version, body, path, PumpMode::Raw).await
 }
 
 /// 套餐路由统一入口（anthropic 入站 Raw / OpenAI 入站翻译模式共用）：
+/// 一律账号登录态 JWT（Bearer）→ zcode-plan 端点；
 /// 首次请求 → 错误缓冲检查 3007 → 验证码桥接重试一次 → 200 响应原样流式。
 async fn relay_plan(
-    _st: &Arc<SharedState>,
     info: ApiKeyInfo,
     anthropic_version: &str,
     body: &[u8],
@@ -535,10 +519,18 @@ async fn relay_plan(
     mode: PumpMode,
 ) -> Response {
     let url = format!("{}{}", info.base_url.trim_end_matches('/'), path);
-    let auth = auth_style_for(&info, anthropic_version);
-    // 验证码墙只在 zcode-plan 端点（start-plan JWT）；平台 key 的 coding 端点没有
-    let captcha_wall = info.kind == "jwt" && info.base_url.contains("zcode.z.ai");
-    match plan_request_once(url.clone(), auth.clone(), Vec::new(), body.to_vec(), mode.clone()).await {
+    // 验证码墙挂在 zcode-plan 端点（start-plan JWT 路线）
+    let captcha_wall = info.base_url.contains("zcode.z.ai");
+    match plan_request_once(
+        url.clone(),
+        info.api_key.clone(),
+        anthropic_version.to_string(),
+        Vec::new(),
+        body.to_vec(),
+        mode.clone(),
+    )
+    .await
+    {
         Ok(resp) => resp,
         Err((status, text)) => {
             if !(captcha_wall && status == 400 && is_captcha_challenge(&text)) {
@@ -553,7 +545,16 @@ async fn relay_plan(
             if let Some(r) = region.filter(|r| !r.trim().is_empty()) {
                 extra.push(("X-Aliyun-Captcha-Verify-Region".to_string(), r));
             }
-            match plan_request_once(url, auth, extra, body.to_vec(), mode.clone()).await {
+            match plan_request_once(
+                url,
+                info.api_key.clone(),
+                anthropic_version.to_string(),
+                extra,
+                body.to_vec(),
+                mode.clone(),
+            )
+            .await
+            {
                 Ok(resp) => resp,
                 Err((status2, text2)) => buffered_error_response(status2, &text2, &mode),
             }
@@ -561,11 +562,13 @@ async fn relay_plan(
     }
 }
 
-/// 单次套餐请求：200（及所有流式响应）走现有泵；非 2xx 缓冲完整响应体交上层处置
+/// 单次套餐请求：Bearer JWT + anthropic-version（官方客户端同款头）；
+/// 200（及所有流式响应）走现有泵；非 2xx 缓冲完整响应体交上层处置
 /// （错误体都很小；无法 buffered 的极端大响应按 502 处理）。
 async fn plan_request_once(
     url: String,
-    auth: AuthStyle,
+    jwt: String,
+    version: String,
     extra_headers: Vec<(String, String)>,
     body: Vec<u8>,
     mode: PumpMode,
@@ -576,13 +579,11 @@ async fn plan_request_once(
         let send_meta = |r: Result<(u16, String), (u16, String)>| {
             let _ = meta_tx.send(r);
         };
-        let rb = upstream_agent().post(&url).set("content-type", "application/json");
-        let rb = match &auth {
-            AuthStyle::Anthropic { key, version } => rb
-                .set("x-api-key", key)
-                .set("anthropic-version", version),
-            AuthStyle::Bearer(k) => rb.set("Authorization", &format!("Bearer {k}")),
-        };
+        let rb = upstream_agent()
+            .post(&url)
+            .set("content-type", "application/json")
+            .set("Authorization", &format!("Bearer {jwt}"))
+            .set("anthropic-version", &version);
         let rb = extra_headers.iter().fold(rb, |acc, (k, v)| acc.set(k, v));
         // 与 pump_request 相同：body 按 UTF-8 字符串发送（上游均为 JSON）
         let body_str = String::from_utf8_lossy(&body);
@@ -647,7 +648,7 @@ async fn chat_completions(State(st): State<Arc<SharedState>>, body: axum::body::
         return free_call(&st, b.to_string().into_bytes(), free_url_paas, free_auth_paas, PumpMode::Raw).await;
     }
 
-    // 套餐模型 → anthropic coding endpoint（账号套餐额度）
+    // 套餐模型 → 账号登录态 JWT 走 zcode-plan 端点（套餐额度唯一可消费路径）
     let translated = match openai_map::translate_request(&v) {
         Ok(r) => r,
         Err(e) => return err_json(StatusCode::BAD_REQUEST, &e),
@@ -660,7 +661,7 @@ async fn chat_completions(State(st): State<Arc<SharedState>>, body: axum::body::
         }
     };
     let mode = if stream { PumpMode::OpenAiStream(model) } else { PumpMode::OpenAiJson(model) };
-    relay_plan(&st, info, DEFAULT_ANTHROPIC_VERSION, translated.to_string().as_bytes(), "/v1/messages", mode).await
+    relay_plan(info, DEFAULT_ANTHROPIC_VERSION, translated.to_string().as_bytes(), "/v1/messages", mode).await
 }
 
 #[derive(Clone)]

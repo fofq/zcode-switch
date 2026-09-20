@@ -1,5 +1,7 @@
-//! 2API 的账号→(apiKey, baseURL) 解析。跟随当前账号时，切号后自然命中新 id 的缓存键。
-//! 所有涉及账号解密/网络的调用都放进 spawn_blocking，避免占死异步运行时导致界面卡死。
+//! 2API 套餐路由的账号→登录态 JWT 解析。跟随当前账号时，切号后自然命中新 id 的缓存键。
+//! 套餐额度只挂在 zcode-plan 体系（JWT），所以这里**只认 JWT**——平台 key 属于
+//! 「复制 key / 免费模型 key 池」路径，两条路刻意不混（见 store::account_jwt_key）。
+//! 所有涉及账号解密的调用都放进 spawn_blocking，避免占死异步运行时导致界面卡死。
 
 use std::time::{Duration, Instant};
 
@@ -7,11 +9,12 @@ use crate::store::{self, ApiKeyInfo, Paths};
 
 use super::SharedState;
 
-const TTL: Duration = Duration::from_secs(600);
+/// JWT 会随 zcode 客户端运行轮换，不能像平台 key 那样长缓存；
+/// 60 秒内复用同一把，最多在轮换后旧令牌上多打一分钟（zcode-plan 对旧令牌有宽限）。
+const TTL: Duration = Duration::from_secs(60);
 const ACTIVE_TTL: Duration = Duration::from_secs(3);
 
-/// 解析当前应该使用的 ApiKeyInfo：锁定账号优先，否则跟随激活账号；带 10 分钟缓存。
-/// kind 决定上游鉴权头：jwt（start-plan）→ Bearer；平台 key → x-api-key。
+/// 解析当前应该使用的账号 JWT：锁定账号优先，否则跟随激活账号。
 pub async fn resolve(st: &SharedState) -> Result<ApiKeyInfo, String> {
     let pinned = st.account.lock().unwrap().clone();
     let id = match pinned {
@@ -49,11 +52,11 @@ pub async fn resolve(st: &SharedState) -> Result<ApiKeyInfo, String> {
     }
     let id_for_task = id.clone();
     let info: ApiKeyInfo = tauri::async_runtime::spawn_blocking(move || {
-        store::account_api_key(&Paths::detect(), &id_for_task)
+        store::account_jwt_key(&Paths::detect(), &id_for_task)
     })
     .await
     .map_err(|e| format!("内部任务失败: {e}"))??
-    .ok_or("该账号没有可用的 API Key，请先在账号详情里确认已同步配置")?;
+    .ok_or("该账号没有 zcode 登录态 JWT：套餐模型（glm-5.3 系）只能用登录态在 zcode-plan 端点消费，请先在官方客户端登录此账号")?;
     st.cache.lock().unwrap().insert(id, (Instant::now(), info.clone()));
     Ok(info)
 }

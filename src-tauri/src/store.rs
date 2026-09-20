@@ -1190,7 +1190,9 @@ pub struct ApiKeyInfo {
     pub base_url: String,
     /// 账号所属家族：zai / bigmodel
     pub provider: String,
-    /// key 类型：plan（套餐平台 key，可用于 paas/v4 与 coding endpoint）/ jwt（start-plan JWT）
+    /// key 类型：plan（平台 key——复制 key / 免费模型 key 池用）/
+    /// jwt（zcode 登录态——2API 套餐路由专用，套餐额度只在此体系下可消费）。
+    /// 两条路刻意分开，不混用：见 account_jwt_key 与 free_key_pool。
     pub kind: String,
     /// 现场铸造失败的原因（有值 = 当前 key 是 JWT 兜底，不是真正的平台 key）
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1241,6 +1243,32 @@ fn local_api_key(acc: &Account, home: &std::path::Path) -> Option<ApiKeyInfo> {
         }
     }
     None
+}
+
+/// 2API 套餐路由专用：只解析本账号的 zcode 登录态 JWT。
+/// 实测套餐额度（start-plan/Global Build 的 glm-5.3 系）只挂在 zcode-plan 体系下，
+/// 平台 key 在 api.z.ai 任何端点都花不了它（1113 无资源包）；所以套餐路由刻意
+/// **不碰平台 key、不做网络铸造**——那属于「复制 key / 免费模型 key 池」路径，两条路不混。
+/// 激活账号经 effective_snapshot 优先取 live 凭据，拿到的总是轮换后的新 JWT。
+/// 返回 None = 账号没有登录态 JWT（从未在官方客户端登录过）。
+pub fn account_jwt_key(paths: &Paths, id: &str) -> Result<Option<ApiKeyInfo>, String> {
+    let acc = load_account(paths, id)?;
+    let (creds, _) = effective_snapshot(paths, &acc);
+    let jwt = cred_plain(&creds, "zcodejwttoken", &paths.home)
+        .map(|s| s.trim().to_string())
+        .filter(|s| s.len() > 20);
+    let Some(jwt) = jwt else { return Ok(None) };
+    let provider = cred_plain(&creds, "oauth:active_provider", &paths.home)
+        .filter(|p| p == "bigmodel" || p == "zai")
+        .unwrap_or_else(|| "zai".into());
+    Ok(Some(ApiKeyInfo {
+        label: "Start Plan JWT".into(),
+        api_key: jwt,
+        base_url: oauth::START_PLAN_ANTHROPIC_BASE.into(),
+        provider,
+        kind: "jwt".into(),
+        mint_error: None,
+    }))
 }
 
 /// 用本账号的 access_token 去官方 biz 接口取/铸一把属于它自己的平台 API Key，并存进账号快照。

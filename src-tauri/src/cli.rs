@@ -170,7 +170,8 @@ pub fn run(args: &[String]) -> (String, i32) {
             }
         }
         // 无界面验证 2API：强起服务（忽略开关）→ 免费模型 E2E → 套餐路由 /v1/messages 实测
-        // （套餐路由预期携带验证码墙信息：401=Bearer 修复未生效，3007=已过鉴权只差验证码）
+        // （套餐路由走账号 JWT @ zcode-plan：3007=已过鉴权只差验证码，401=JWT 失效，
+        //   200=直通；无界面环境验证码窗口拉不起来，3007 即预期终点）
         "twoapi-test" => {
             let port_override = flag(rest, "--port").and_then(|v| v.parse::<u16>().ok());
             tauri::async_runtime::block_on(async {
