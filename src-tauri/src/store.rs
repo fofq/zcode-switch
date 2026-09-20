@@ -1139,7 +1139,10 @@ pub fn live_quota(paths: &Paths) -> Result<quota::QuotaOverview, String> {
 pub fn account_quota(paths: &Paths, id: &str) -> Result<quota::QuotaOverview, String> {
     let acc = load_account(paths, id)?;
     let (creds, config) = effective_snapshot(paths, &acc);
-    quota::quota_for_snapshot(&paths.home, &creds, config.as_ref())
+    // 额度请求必须带“这个账号自己的”设备身份：服务端按 (user, device_mid) 侧记激活/发放，
+    // 用 live 的 mid 会在切换后错位（且 live telemetry 是共享文件，曾经还被进程级缓存住）。
+    let mid = acc.virtual_device_mid.clone().filter(|m| !m.trim().is_empty());
+    quota::quota_for_snapshot(&paths.home, &creds, config.as_ref(), mid.as_deref())
 }
 
 /// 账号若是当前激活账号（live 与其身份一致），优先用 live 凭据/配置——

@@ -5,10 +5,13 @@
 // gift 不再是健康等级：它与 ok/low 是两个正交维度（有礼物 & 额度状态）。
 // 有礼物额度 = 正交筛选 chip（summarize.counts.gift / filterAccounts 特判）+ 行内徽标，
 // 否则 Weekend Build 全量发放后 gift 桶会吞掉额度充足组。
-export const HEALTH_ORDER = ["ok", "low", "flowed", "dead", "auth", "fail", "unknown"];
+export const HEALTH_ORDER = ["ok", "low", "flowed", "dead", "pending", "auth", "fail", "unknown"];
 
 /** 剩余额度低于该百分比视为"紧张" */
 export const LOW_THRESHOLD = 20;
+
+/** 新号"成功但空"的宽限窗口：窗口内按「待激活」处理，不判死 */
+export const PENDING_WINDOW_MS = 30 * 60 * 1000;
 
 /**
  * 从 QuotaOverview 计算"剩余额度百分比"（0-100，100 = 完全没用）。
@@ -242,8 +245,18 @@ export function healthOf(acct, quota, isAuthErr, model, opts = {}) {
   }
   // 确定性判死：服务器明确返回无套餐（balances/plans 全空且业务码成功），或套餐全部已过期。
   // 这不是查询失败——刷新永远不会“恢复”，剩余按 0 处理让自动切换能触发切走。
+  // 例外：刚入库的新号（created_at 在宽限窗口内）拿到「成功但空」时，多半是服务端
+  // 还没发放/激活套餐（官方客户端靠启动心跳触发），先按「待激活」单独成组，
+  // 既不误报 0% 耗尽，也不会被自动切换当成"没额度的号"。
   const plans = quota?.data?.plans || [];
   const definiteEmpty = quota?.data?.is_empty === true;
+  if (definiteEmpty && quota?.data?.source === "snapshot_empty") {
+    const created = Date.parse(String(acct?.created_at || "").replace(" ", "T"));
+    const fresh = Number.isFinite(created) && Date.now() - created < Number(opts.pendingWindow ?? PENDING_WINDOW_MS);
+    if (fresh) {
+      return { level: "pending", remainingPct: null, modelMatched: false, modelName: null, fallback: false, hasGift, giftKinds, focusPct: null };
+    }
+  }
   const allExpired = plans.length > 0 && plans.every(planExpired);
   if (definiteEmpty || allExpired) {
     return { level: "dead", remainingPct: 0, modelMatched: mp != null, modelName, fallback, hasGift: false, giftKinds: [], focusPct: 0 };
@@ -372,7 +385,7 @@ export function bucketAccounts(accounts, { localeTag = "zh-CN", healthLabel = ()
  * 合计：各健康度计数 + 平均剩余额度百分比（仅统计已拿到额度的账号，单位无关）。
  */
 export function summarize(accounts, healthMap) {
-  const counts = { "gift:weekend": 0, "gift:global": 0, ok: 0, low: 0, flowed: 0, dead: 0, auth: 0, fail: 0, unknown: 0 };
+  const counts = { "gift:weekend": 0, "gift:global": 0, ok: 0, low: 0, flowed: 0, dead: 0, pending: 0, auth: 0, fail: 0, unknown: 0 };
   let pctSum = 0;
   let pctCount = 0;
   for (const a of accounts || []) {

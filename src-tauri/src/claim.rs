@@ -3,8 +3,10 @@ use crate::quota;
 use crate::zcrypto;
 use serde::Serialize;
 use serde_json::Value;
+use std::collections::HashMap;
 use std::path::Path;
-use std::time::Duration;
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 pub const BILLING_PREVIEW_URL: &str = "https://zcode.z.ai/api/v1/zcode-plan/billing/preview";
 pub const BILLING_CLAIM_URL: &str = "https://zcode.z.ai/api/v1/zcode-plan/billing/claim";
@@ -212,6 +214,66 @@ pub fn report_activation_events(user_id: &str, device_mid: &str) -> Result<(), S
         }
     }
     Ok(())
+}
+
+/// 激活上报节流表（key = user_id|device_mid）
+static ACTIVATION_SEEN: OnceLock<Mutex<HashMap<String, Instant>>> = OnceLock::new();
+
+fn activation_seen() -> &'static Mutex<HashMap<String, Instant>> {
+    ACTIVATION_SEEN.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// 同一 (user, mid) 的节流，避免刷新风暴反复上发激活
+fn activation_slot_free(key: &str, min_gap: Duration) -> bool {
+    let mut g = match activation_seen().lock() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    let now = Instant::now();
+    match g.get(key) {
+        Some(&t) if now.duration_since(t) < min_gap => false,
+        _ => {
+            g.insert(key.to_string(), now);
+            true
+        }
+    }
+}
+
+/// 上报失败时释放节流名额：下一次刷新（额度还是空）可以马上重试，不必等满窗口
+fn activation_forget(key: &str) {
+    match activation_seen().lock() {
+        Ok(mut g) => {
+            g.remove(key);
+        }
+        Err(poisoned) => {
+            poisoned.into_inner().remove(key);
+        }
+    }
+}
+
+/// 后台补一次“登录等价”的激活心跳（app_launch / app_daily_active）。
+/// 官方客户端每次启动（含切号后的冷启动）都会上报；服务端据此发放/激活免费与活动套餐。
+/// 只经 OAuth 入库、从未在 ZCode 里“完全登录”过的新号缺的正是这一步——
+/// 否则 billing/balance 会一直回「业务成功但空」，额度永远刷不出来。
+pub fn spawn_activation_report(home: &Path, creds: &Value, device_mid: &str) {
+    let mid = device_mid.trim().to_string();
+    if mid.is_empty() {
+        return;
+    }
+    let Some(uid) = telemetry_user_id(home, creds) else {
+        return;
+    };
+    let key = format!("{uid}|{mid}");
+    if !activation_slot_free(&key, Duration::from_secs(180)) {
+        return;
+    }
+    std::thread::spawn(move || match report_activation_events(&uid, &mid) {
+        Ok(()) => crate::flowlog::log("activate", "ok", &format!("user={uid}")),
+        Err(e) => {
+            activation_forget(&key);
+            crate::flowlog::log("activate", "fail", &e);
+        }
+    });
 }
 
 pub fn preview_plans(

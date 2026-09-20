@@ -23,7 +23,7 @@ const DYNAMIC = [
   "q.win.daily", "q.win.weekly", "q.win.monthly", "q.win.cycle",
   "prov.bigmodel", "prov.zai",
   "grp.health.ok", "grp.health.low", "grp.health.dead",
-  "grp.health.auth", "grp.health.fail", "grp.health.unknown",
+  "grp.health.auth", "grp.health.fail", "grp.health.unknown", "grp.health.pending",
   "list.sort.quota", "list.sort.name", "list.sort.created", "list.sort.updated",
 ];
 

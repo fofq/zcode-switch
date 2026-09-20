@@ -1488,6 +1488,13 @@ const actions = {
     });
   },
 
+  /** 悬浮按钮：回到列表顶部 */
+  scrollListTop() {
+    const list = $app.querySelector(".list");
+    if (!list) return;
+    list.scrollTo({ top: 0, behavior: "smooth" });
+  },
+
   async copyApiKey(id) {
     try {
       const r = await invoke("account_api_key", { id });
@@ -2220,9 +2227,27 @@ function restoreScroll(cap) {
   }
 }
 
+// 「回到顶部」悬浮按钮：只在列表滚下去之后出现（列表内部滚动，不在窗口上）
+function syncTopFab() {
+  const btn = $app.querySelector("[data-fab-top]");
+  if (!btn) return;
+  const list = $app.querySelector(".list");
+  const top = list ? list.scrollTop : 0;
+  btn.classList.toggle("show", top > 200);
+}
+
 let lastRenderSig = "";
 let lastQuotaSig = "";
 let lastProgressSig = "";
+let lastBucketSig = "";
+/** 分组/排序布局签名（可见账号 → 所在分组 + 展示顺序）。
+ *  就地补丁只更新额度 DOM，不会把行挪到正确的分组里、也不会重排；
+ *  一旦归属或顺序变了就必须整表重建，否则刷新完额度变了、行还留在旧分组/旧位置，
+ *  要等到下一次结构变化才归位。 */
+function renderBucketSig() {
+  const { list, hm } = visibleAccounts();
+  return list.map((a) => `${a.id}:${hm.get(a.id)?.level || "unknown"}`).join(",");
+}
 function renderQuotaSig() {
   // 额度数据用轻量摘要（busy/错误/refreshed_at），避免每次渲染全量序列化大对象
   const qsig = Object.keys(acctQuota).map((k) => {
@@ -2421,13 +2446,20 @@ function render(force = false) {
       // 结构没变、只有额度/进度/用量数据在动：不整表重建，就地补丁对应 DOM
       const qs = renderQuotaSig();
       const ps = renderProgressSig();
+      const bs = renderBucketSig();
+      const regroup = bs !== lastBucketSig;
       if (qs !== lastQuotaSig || ps !== lastProgressSig) {
         lastQuotaSig = qs;
         lastProgressSig = ps;
-        patchQuotaDom();
-        patchProgressDom();
+        if (!regroup) {
+          patchQuotaDom();
+          patchProgressDom();
+          return;
+        }
+        // 分组归属变了：下面整表重建（顺带也会把额度 DOM 一起铺上）
+      } else if (!regroup) {
+        return;
       }
-      return;
     }
     // 批量操作（全量刷新/领取）期间合并重渲染，最多 500ms 一次，避免连续重建掉帧
     if (quotaSweep?.running || refreshClaim?.running || claimAllRunning || autoClaimRunning) {
@@ -2442,6 +2474,7 @@ function render(force = false) {
     lastRenderSig = sig;
     lastQuotaSig = renderQuotaSig();
     lastProgressSig = renderProgressSig();
+    lastBucketSig = renderBucketSig();
   }
   const scrollCap = captureScroll();
   if (!state) {
@@ -2626,9 +2659,13 @@ function render(force = false) {
     ${listHeadHtml(s, sum, visible)}
 
     <main class="list">${listHtml}</main>
-    ${active ? `<button class="fab-locate" title="${t("list.locateActive")}" aria-label="${t("list.locateActive")}" click="actions.locateActive()">${ic("target", 20)}</button>` : ""}
+    ${(s.accounts.length || active) ? `<div class="fabs">
+      ${s.accounts.length ? `<button class="fab fab-top" data-fab-top title="${t("list.backToTop")}" aria-label="${t("list.backToTop")}" click="actions.scrollListTop()">${ic("arrowUp", 17)}</button>` : ""}
+      ${active ? `<button class="fab fab-locate" title="${t("list.locateActive")}" aria-label="${t("list.locateActive")}" click="actions.locateActive()">${ic("target", 17)}</button>` : ""}
+    </div>` : ""}
   `;
   restoreScroll(scrollCap);
+  syncTopFab();
   const pos = window.__searchPos;
   window.__searchPos = null;
   if (pos != null) {
@@ -2651,6 +2688,7 @@ installDelegation();
 // 任意滚动（含 .list 内部滚动容器，scroll 事件不冒泡所以用捕获）期间推迟重渲染
 document.addEventListener("scroll", () => {
   scrollDeferUntil = Date.now() + 400;
+  syncTopFab();
   scheduleDeferredRender();
 }, { capture: true, passive: true });
 

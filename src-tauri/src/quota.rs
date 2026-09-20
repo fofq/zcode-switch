@@ -36,22 +36,21 @@ const ZCODE_ORIGIN: &str = "https://zcode.z.ai";
 pub(crate) const ZCODE_LANG: &str = "zh-CN";
 const ZCODE_CHANNEL: &str = "stable";
 
+/// live 设备的 deviceMid（telemetry-state.json）。
+/// 这里不能做进程级缓存：切号会改写该文件（store::write_live_device_mid），
+/// 缓存住的话热切换后仍会拿着上一个账号的 mid 去打接口，直到应用重启——
+/// 而额度接口漏下发 X-Device-Mid 会直接 400（code 3001）。
 pub(crate) fn device_mid() -> Option<String> {
-    static CACHE: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
-    CACHE
-        .get_or_init(|| {
-            let home = crate::store::pick_home(
-                std::env::var("ZCODE_SWITCH_HOME").ok().map(std::path::PathBuf::from),
-                std::env::var("USERPROFILE").ok().map(std::path::PathBuf::from),
-                std::env::var("HOME").ok().map(std::path::PathBuf::from),
-            );
-            let p = home.join(".zcode").join("v2").join("telemetry-state.json");
-            std::fs::read_to_string(p)
-                .ok()
-                .and_then(|s| serde_json::from_str::<Value>(&s).ok())
-                .and_then(|v| v.get("deviceMid").and_then(|m| m.as_str()).map(String::from))
-        })
-        .clone()
+    let home = crate::store::pick_home(
+        std::env::var("ZCODE_SWITCH_HOME").ok().map(std::path::PathBuf::from),
+        std::env::var("USERPROFILE").ok().map(std::path::PathBuf::from),
+        std::env::var("HOME").ok().map(std::path::PathBuf::from),
+    );
+    let p = home.join(".zcode").join("v2").join("telemetry-state.json");
+    std::fs::read_to_string(p)
+        .ok()
+        .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+        .and_then(|v| v.get("deviceMid").and_then(|m| m.as_str()).map(String::from))
 }
 
 #[cfg(windows)]
@@ -340,17 +339,23 @@ pub fn candidate_tokens(creds: &Value, config: Option<&Value>, secret: &str) -> 
     tokens
 }
 
-fn http_get_json(url: &str, token: &str, retry_429: bool) -> Result<Value, String> {
+/// 额度请求头：显式传了 mid（账号自己的设备身份）就用它，否则回落到 live 的 mid。
+/// 服务端按 (user, device_mid) 记录激活/发放，所以激活上报与额度查询必须用同一个 mid。
+fn billing_headers(url: &str, token: &str, mid: Option<&str>) -> Vec<(String, String)> {
+    if url.contains("zcode.z.ai") {
+        zai_billing_headers_with_mid(token, mid.map(|m| m.to_string()).or_else(device_mid))
+    } else {
+        bigmodel_headers(token)
+    }
+}
+
+fn http_get_json(url: &str, token: &str, mid: Option<&str>, retry_429: bool) -> Result<Value, String> {
     let retry_delays = [500u64, 1500, 4000];
     let agent = ureq::AgentBuilder::new()
         .timeout_connect(Duration::from_secs(10))
         .timeout(Duration::from_secs(20))
         .build();
-    let headers = if url.contains("zcode.z.ai") {
-        zai_billing_headers(token)
-    } else {
-        bigmodel_headers(token)
-    };
+    let headers = billing_headers(url, token, mid);
     let mut last_err: Option<String> = None;
     let mut backoff: std::slice::Iter<'_, u64> = if retry_429 { retry_delays.iter() } else { [].iter() };
     loop {
@@ -461,8 +466,8 @@ fn query_with_token_via(token: &str, fetch: &FetchFn) -> Result<QuotaOverview, S
     Err(best_err.unwrap_or_else(|| crate::i18n::tr("err.quota.fail")))
 }
 
-fn query_with_token(token: &str) -> Result<QuotaOverview, String> {
-    query_with_token_via(token, &|url, tok| http_get_json(url, tok, true))
+fn query_with_token(token: &str, mid: Option<&str>) -> Result<QuotaOverview, String> {
+    query_with_token_via(token, &|url, tok| http_get_json(url, tok, mid, true))
 }
 
 fn business_ok(v: &Value) -> bool {
@@ -471,7 +476,7 @@ fn business_ok(v: &Value) -> bool {
     (code.is_none() || code == Some(200) || code == Some(0)) && success != Some(false)
 }
 
-pub fn query_quota(tokens: &[String]) -> Result<QuotaOverview, String> {
+pub fn query_quota(tokens: &[String], mid: Option<&str>) -> Result<QuotaOverview, String> {
     if tokens.is_empty() {
         return Err(crate::i18n::coded("quota_no_token", "err.quota.no_token", &[]));
     }
@@ -479,7 +484,7 @@ pub fn query_quota(tokens: &[String]) -> Result<QuotaOverview, String> {
     let mut first_business: Option<String> = None;
     let mut auth_fail = 0usize;
     for t in tokens {
-        match query_with_token(t) {
+        match query_with_token(t, mid) {
             Ok(ov) => return Ok(ov),
             Err(e) => {
                 if e.contains("401") {
@@ -493,7 +498,7 @@ pub fn query_quota(tokens: &[String]) -> Result<QuotaOverview, String> {
     }
     if auth_fail > 0 && auth_fail == tokens.len() {
         sleep(Duration::from_millis(1500));
-        if let Ok(ov) = query_with_token(&tokens[0]) {
+        if let Ok(ov) = query_with_token(&tokens[0], mid) {
             return Ok(ov);
         }
         return Err(crate::i18n::coded("token_expired", "err.token.expired", &[]));
@@ -770,24 +775,52 @@ fn merge_parts(parts: Vec<QuotaOverview>) -> QuotaOverview {
     }
 }
 
-fn query_channels(channels: &[Channel]) -> Result<QuotaOverview, String> {
-    query_channels_via(channels, &|url, tok| http_get_json(url, tok, true))
+fn query_channels(channels: &[Channel], mid: Option<&str>) -> Result<QuotaOverview, String> {
+    query_channels_via(channels, &|url, tok| http_get_json(url, tok, mid, true))
 }
 
 pub fn quota_for_live(home: &Path, creds: &Value, config: Option<&Value>) -> Result<QuotaOverview, String> {
+    quota_for(home, creds, config, None, false)
+}
+
+/// 快照账号：mid 传账号自己的 virtual_device_mid（切号时也正是它被写进 live telemetry）。
+pub fn quota_for_snapshot(
+    home: &Path,
+    creds: &Value,
+    config: Option<&Value>,
+    mid: Option<&str>,
+) -> Result<QuotaOverview, String> {
+    quota_for(home, creds, config, mid, true)
+}
+
+fn quota_for(
+    home: &Path,
+    creds: &Value,
+    config: Option<&Value>,
+    mid: Option<&str>,
+    snapshot: bool,
+) -> Result<QuotaOverview, String> {
     let secret = zcrypto::default_secret(home);
     let channels = pick_channels(creds, config, &secret);
     if !channels.is_empty() {
-        if let Ok(ov) = query_channels(&channels) {
-            return Ok(ov);
+        if let Ok(ov) = query_channels(&channels, mid) {
+            return Ok(mark_snapshot_empty(ov, snapshot));
         }
     }
     let tokens = candidate_tokens(creds, config, &secret);
-    query_quota(&tokens)
+    query_quota(&tokens, mid).map(|ov| mark_snapshot_empty(ov, snapshot))
 }
 
-pub fn quota_for_snapshot(home: &Path, creds: &Value, config: Option<&Value>) -> Result<QuotaOverview, String> {
-    quota_for_live(home, creds, config)
+/// 快照账号“业务成功但空”：服务端没有任何套餐/额度数据。
+/// 新号刚登录时很常见——套餐是服务端在收到激活心跳（app_launch/app_daily_active，
+/// 官方客户端每次启动都会发）之后才发放的，之前 billing/balance 一直返回 code 0 + 空。
+/// 标出来让前端显示「待激活」，而不是把账号直接判成 0% 耗尽。
+fn mark_snapshot_empty(mut ov: QuotaOverview, snapshot: bool) -> QuotaOverview {
+    if snapshot && ov.plan_tier.is_none() && ov.plans.is_empty() && ov.items.is_empty() {
+        ov.source = "snapshot_empty".into();
+        ov.is_empty = true;
+    }
+    ov
 }
 
 fn unit_label(unit: Option<i64>, number: Option<i64>) -> (String, String) {

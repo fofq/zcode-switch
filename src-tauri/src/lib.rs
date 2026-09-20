@@ -211,7 +211,32 @@ async fn get_live_quota() -> Result<quota::QuotaOverview, String> {
 
 #[tauri::command]
 async fn get_account_quota(id: String) -> Result<quota::QuotaOverview, String> {
-    store::account_quota(&Paths::detect(), &id)
+    let paths = Paths::detect();
+    let id2 = id.clone();
+    let mut ov = tauri::async_runtime::spawn_blocking(move || store::account_quota(&paths, &id2))
+        .await
+        .map_err(|e| format!("内部任务失败: {e}"))??;
+    if ov.source == "snapshot_empty" {
+        // 快照「业务成功但空」= 套餐还没发放：先补一次登录等价的激活心跳（官方客户端每次启动
+        // 都会发 app_launch/app_daily_active，服务端据此发放套餐），稍等再查一次。
+        // 仍是空就把空数据还给前端——前端按「待激活」展示并用短周期复查。
+        let paths = Paths::detect();
+        let id2 = id.clone();
+        let retry = tauri::async_runtime::spawn_blocking(move || {
+            if let Ok(acc) = store::load_account(&paths, &id2) {
+                if let Some(mid) = acc.virtual_device_mid.clone().filter(|m| !m.trim().is_empty()) {
+                    claim::spawn_activation_report(&paths.home, &acc.credentials, &mid);
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2500));
+            store::account_quota(&paths, &id2)
+        })
+        .await;
+        if let Ok(Ok(fresh)) = retry {
+            ov = fresh;
+        }
+    }
+    Ok(ov)
 }
 
 #[tauri::command]
@@ -797,6 +822,9 @@ fn persist_oauth_account(
         }
         save_account(paths, &dup)?;
         *pending_oauth_guard() = None;
+        // 新号入库即补发“登录等价”的激活心跳，否则套餐要等到官方客户端冷启动
+        // 或下一次领取资格刷新才会发放，期间额度只会是「成功但空」。
+        claim::spawn_activation_report(&paths.home, &dup.credentials, mid);
         return Ok(json!({ "id": dup.id, "name": dup.name, "provider": provider, "duplicate": true }));
     }
     let base = credentials
@@ -828,6 +856,7 @@ fn persist_oauth_account(
     }
     save_account(paths, &acc)?;
     *pending_oauth_guard() = None;
+    claim::spawn_activation_report(&paths.home, &acc.credentials, mid);
     Ok(json!({ "id": acc.id, "name": acc.name, "provider": provider }))
 }
 
