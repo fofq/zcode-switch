@@ -198,6 +198,48 @@ function asAuditPush(kind, data) {
 function asAuditLast() {
   return asAudit.length ? asAudit[asAudit.length - 1] : null;
 }
+
+// ---- 热切后验与后置检查（docs/hot-switch-hardening.md）----
+// 后验：客户端日志出现「切换之后」的余额行且池签名变化 = 新号已生效；
+// 签名相同 = 弱确认（两个号池恰好同值）；超时无新行 = unknown（客户端空闲没查余额，不代表失败）。
+// 注意不能用 entitlement_id 匹配——Start Plan 的 ent_2_0817_* 是全舰队共用模板 id。
+let hotVerify = null; // { id, at, preSig, done }
+function poolsSig(pools) {
+  return (pools || [])
+    .map((p) => `${String(p?.show_name || p?.name || "").trim()}=${Number(p?.remaining) || 0}`)
+    .sort()
+    .join("|");
+}
+/** 热切成功后调度：后置检查（8s：凭据复核/二次对齐/重物化）+ 生效后验（≤120s）。
+ *  后置检查必须确认目标仍是当前在用号才执行：8s 窗口内若又切了一次，
+ *  迟到的检查会把 live 凭据重写回旧目标（它无法区分「被客户端覆盖」和「已切走」）。 */
+let hotPostTimer = null;
+function scheduleHotFollowUp(id) {
+  hotVerify = { id, at: Date.now(), preSig: poolsSig(liveSignals?.pools), done: false };
+  if (hotPostTimer) clearTimeout(hotPostTimer);
+  hotPostTimer = setTimeout(() => {
+    hotPostTimer = null;
+    if (state?.active_account_id !== id) return;
+    invoke("hot_switch_post_check", { id })
+      .then((r) => asAuditPush("hot-post", { id, credsResynced: !!r?.creds_resynced }))
+      .catch(() => {});
+  }, 8000);
+}
+function checkHotVerify() {
+  if (!hotVerify || hotVerify.done) return;
+  const at = Number(liveSignals?.pools_at_ms) || 0;
+  if (!at || at <= hotVerify.at + 1000) {
+    if (Date.now() - hotVerify.at > 120 * 1000) {
+      hotVerify.done = true;
+      asAuditPush("hot-verify", { id: hotVerify.id, result: "unknown", note: "idle" });
+    }
+    return;
+  }
+  hotVerify.done = true;
+  const sig = poolsSig(liveSignals?.pools);
+  const result = sig !== hotVerify.preSig ? "applied" : "same-sig";
+  asAuditPush("hot-verify", { id: hotVerify.id, result, ageSec: Math.max(1, Math.round((at - hotVerify.at) / 1000)) });
+}
 /** 设置弹窗里的诊断行：数据源 / 跟随模型 / 剩余时间 / 最近一次决策 */
 function autoSwitchDiagLine() {
   const bits = [];
@@ -1517,6 +1559,7 @@ const actions = {
       ui.expanded.delete(id);
       await refresh(); render();
       pokeAccount(id);
+      if (r?.hot) scheduleHotFollowUp(id);
     });
   },
 
@@ -3062,6 +3105,7 @@ function applySignals(sig) {
 async function pullSignals() {
   try {
     const changed = applySignals(await invoke("live_signals"));
+    checkHotVerify();
     if (changed && state?.auto_switch) autoSwitchTick(false);
   } catch { /* 后端没有该命令（旧版）时静默回落到 HTTP 轮询 */ }
 }
@@ -3410,6 +3454,7 @@ async function doAutoSwitch(d, active, cur, lg) {
       });
       await refresh();
       pokeAccount(best.id);
+      if (r?.hot) scheduleHotFollowUp(best.id);
     } catch (e) {
       // 失败也计一次冷却：只当“抑制器”（否则 ETA 触发会每轮重试），不阻塞后续成功路径
       lastAutoSwitchAt = Date.now();
@@ -3504,6 +3549,7 @@ async function sweepTick() {
         if (st?.usage) twoUsageMap = new Map(Object.entries(st.usage));
         // 兜底：即使事件丢了，也能用 5s 轮询发现新余额并立即判定（纯本地状态读取，不耗风控）
         const sigChanged = applySignals(sig);
+        checkHotVerify();
         if (sigChanged && s?.auto_switch) autoSwitchTick(false);
         if (!uiLocked()) render();
       }).catch(() => {});

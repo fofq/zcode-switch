@@ -835,6 +835,34 @@ fn rematerialize_wiped_builtins(paths: &Paths, target: &Account) {
     }
 }
 
+/// 热切换后置检查（前端在热切成功后约 8s 调用，见 docs/hot-switch-hardening.md）：
+/// 1) live 凭据若已被客户端反写覆盖（身份不符）→ 用目标凭据重写一次；
+/// 2) align_family_domain 重跑（新的 UpdatedAt 兼作一次客户端提示）；
+/// 3) rematerialize_wiped_builtins——可能带网络调用（resolve_zai_business_token，
+///    超时上限 15s），故意放在这里而不是热路径上。
+pub fn hot_switch_post_check(paths: &Paths, target: &Account) -> Result<Value, String> {
+    let mut out = json!({ "creds_ok": true, "creds_resynced": false });
+    if let Ok(Some(live)) = read_live(paths) {
+        let want = zcrypto::account_identity(&target.credentials, &paths.home);
+        // 无身份信号的账号（纯 hash 匹配）无法验证归属，跳过 clobber 检查
+        if identity_has_signal(&want) {
+            let same = is_logged_in(&live)
+                && identity_matches(&want, &zcrypto::account_identity(&live, &paths.home));
+            if !same {
+                crate::flowlog::log("hot-sw", "creds-clobbered", &target.id);
+                let creds = inject_relay_pass_hash(&target.credentials, current_relay_pass(paths).as_ref());
+                hot_swap_verified(paths, target, &creds)?;
+                out["creds_ok"] = json!(false);
+                out["creds_resynced"] = json!(true);
+                crate::flowlog::log("hot-sw", "creds-resync", &target.id);
+            }
+        }
+    }
+    align_family_domain(paths, target);
+    rematerialize_wiped_builtins(paths, target);
+    Ok(out)
+}
+
 pub fn switch_to(paths: &Paths, id: &str, force: bool, restart: bool, hot: bool) -> Result<SwitchResult, String> {
     let target = load_account(paths, id)?;
     let accounts = list_accounts(paths)?;
@@ -902,11 +930,11 @@ pub fn switch_to(paths: &Paths, id: &str, force: bool, restart: bool, hot: bool)
         hot_swap_verified(paths, &target, &creds)?;
         backfill_relay_pass_hash(paths, &target.id, &creds);
         // 热切换也必须让运行中的客户端认到新账号的 provider 家族与 apiKey：
-        // setting.json 的 providerFamilyDomain 带 UpdatedAt 时间戳，客户端靠它感知变更；
-        // config.json 里同家族的 builtin 条目可能已被客户端抹掉/禁用。
-        // 否则跨家族（zai ↔ bigmodel）热切后模型调用会持续失败，需用户手动刷新/等待。
+        // setting.json 的 providerFamilyDomain 带 UpdatedAt 时间戳，客户端靠它感知变更。
+        // 注意：rematerialize_wiped_builtins 不在热路径上跑——它可能触发同步网络调用
+        // （resolve_zai_business_token，超时上限 15s），会拖住整个切换命令；
+        // 改由前端在热切成功后 8s 调 hot_switch_post_check 完成修复（含二次对齐）。
         align_family_domain(paths, &target);
-        rematerialize_wiped_builtins(paths, &target);
         reset_live_plan_cache(paths);
         let mid = ensure_virtual_device_mid_locked(paths, &target.id)?;
         write_live_device_mid(paths, &mid)?;

@@ -194,6 +194,16 @@ async fn update_account_from_live(app: AppHandle, id: String) -> Result<Account,
     r
 }
 
+/// 热切换后置检查：前端在热切成功后约 8s 调用（凭据复核/二次对齐/重物化）。
+/// 详见 docs/hot-switch-hardening.md。
+#[tauri::command]
+async fn hot_switch_post_check(id: String) -> Result<serde_json::Value, String> {
+    let _guard = store_guard();
+    let paths = Paths::detect();
+    let target = store::load_account(&paths, &id)?;
+    store::hot_switch_post_check(&paths, &target)
+}
+
 #[tauri::command]
 async fn switch_to(app: AppHandle, id: String, force: bool, restart: bool, hot: Option<bool>) -> Result<SwitchResult, String> {
     let _guard = store_guard();
@@ -1330,6 +1340,7 @@ pub fn run() {
             set_account_group,
             delete_account,
             update_account_from_live,
+            hot_switch_post_check,
             switch_to,
             get_live_quota,
             get_account_quota,
