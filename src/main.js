@@ -154,6 +154,10 @@ const AUTO_SWITCH_CHECK_MS = 60 * 1000;
 // 冷却只用于「非紧急」切换（百分比越线）：2 分钟。预测式(ETA)/硬信号触发不受冷却限制，
 // 改为用 hardGrace（刚切完的保护窗）+ 「目标必须严格更好」防横跳
 const AUTO_SWITCH_COOLDOWN_MS = 2 * 60 * 1000;
+// 体验：无操作一段时间后视图自动定位到在用账号（任何交互重置计时）
+const AUTO_LOCATE_IDLE_MS = 10 * 1000;
+let lastUserActionAt = Date.now();
+
 let autoSwitchRunning = false;
 // 决策/执行重入锁：预校验会 await 网络，期间事件/定时器/loadAcctQuota 都会再次进入决策，
 // 不上锁会出现「两个并发切换」。autoSwitchRunning 只表达「正在切换」给 UI 看。
@@ -320,6 +324,23 @@ function noteChanged(next) {
   if (next === autoSwitchNote) return;
   autoSwitchNote = next;
   if (!uiLocked()) render();
+}
+
+/** 无操作 AUTO_LOCATE_IDLE_MS 后，视图自动定位到在用账号：
+ *  只在当前筛选/分组包含它、且它不在可视区时才滚动（scrollIntoView nearest 本身就近乎无操作）；
+ *  被筛选掉/分组收起时不定位。 */
+function autoLocateTick() {
+  if (Date.now() - lastUserActionAt < AUTO_LOCATE_IDLE_MS) return;
+  if (isTyping()) return;
+  const activeId = state?.active_account_id;
+  if (!activeId) return;
+  const el = document.querySelector(`.row[data-id="${activeId}"]`);
+  if (!el) return;
+  const listEl = el.closest(".list");
+  const r = el.getBoundingClientRect();
+  const lr = (listEl || document.documentElement).getBoundingClientRect();
+  if (r.top >= lr.top && r.bottom <= lr.bottom) return; // 已在可视区
+  el.scrollIntoView({ block: "nearest", behavior: "smooth" });
 }
 
 function autoSwitchTitle(s) {
@@ -841,6 +862,17 @@ function selectedIds() {
   const all = new Set((state?.accounts || []).map((a) => a.id));
   return [...ui.selected].filter((id) => all.has(id));
 }
+/** 展示层：当前筛选包含在用账号时把它排到最前（平铺视图用；不改底层排序） */
+function pinActiveFirst(list) {
+  const activeId = state?.active_account_id;
+  if (!activeId) return list;
+  const i = (list || []).findIndex((a) => a.id === activeId);
+  if (i <= 0) return list;
+  const arr = list.slice();
+  arr.unshift(...arr.splice(i, 1));
+  return arr;
+}
+
 function visibleAccounts() {
   const hm = healthMapOf();
   const list = sortAccounts(
@@ -854,6 +886,16 @@ function visibleAccounts() {
 /** 分组视图：自定义分组优先，未分组按"额度健康度"分桶 */
 function groupedListHtml(accounts, rowHtml, healthMap) {
   const buckets = bucketAccounts(accounts, { localeTag: localeTag(), healthLabel }, healthMap);
+  // 体验：当前分组/筛选包含在用账号时，它所在分组提到最前、组内排第一；
+  // 不在当前筛选里就不动（不会把在用账号塞进所有分组）
+  const activeId = state?.active_account_id;
+  const bi = activeId ? buckets.findIndex((b) => b.items.some((a) => a.id === activeId)) : -1;
+  if (bi > 0) buckets.unshift(...buckets.splice(bi, 1));
+  if (bi >= 0) {
+    const items = buckets[0].items;
+    const ii = items.findIndex((a) => a.id === activeId);
+    if (ii > 0) items.unshift(...items.splice(ii, 1));
+  }
   let seq = 0; // 序号跨分组连续，跟随当前排序/筛选的展示顺序
   return buckets.map((b) => {
     const collapsed = ui.collapsedSections.has(b.key);
@@ -2846,7 +2888,7 @@ function render(force = false) {
          </div>`
       : s.grouped
         ? groupedListHtml(visible, rowHtml, healthMap)
-        : visible.map((a, i) => rowHtml(a, i + 1)).join("");
+        : pinActiveFirst(visible).map((a, i) => rowHtml(a, i + 1)).join("");
 
   const claimableCount = s.accounts.filter((a) => (claimable[a.id]?.plans || []).length > 0).length;
 
@@ -3024,6 +3066,11 @@ async function pullSignals() {
   } catch { /* 后端没有该命令（旧版）时静默回落到 HTTP 轮询 */ }
 }
 listen("zsignals", () => { pullSignals(); });
+
+// 任何交互都重置「无操作」计时（滚动条拖动只发 scroll，所以 scroll 也要监听）
+["wheel", "touchstart", "mousedown", "keydown"].forEach((ev) =>
+  window.addEventListener(ev, () => { lastUserActionAt = Date.now(); }, { passive: true }));
+document.addEventListener("scroll", () => { lastUserActionAt = Date.now(); }, { capture: true, passive: true });
 
 const SWEEP_PERIOD = 5 * 60 * 1000;
 // 活跃账号的周期由 scheduleNext 按「剩余时间(ETA) / 阈值」自适应（5s–15s，不加抖动）；
@@ -3442,6 +3489,7 @@ async function sweepTick() {
     setTimeout(dismissSplash, 350);
     enrollAccounts();
     sweepTick();
+    setInterval(autoLocateTick, 2000);
     // 启动时把额度拉全（健康度 / 筛选 / 排序都依赖它）
     setTimeout(() => { if (!quotaSweep.running) actions.refreshAll(true); }, 900);
     setInterval(() => {
