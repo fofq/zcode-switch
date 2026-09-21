@@ -384,6 +384,31 @@ ok(sGF.giftExpireMs != null && sGF.giftExpireMs < Date.parse("2026-09-21T23:59")
 const b11 = giftFirstBasis(sGF);
 eq(b11.basis, "gift", "礼物还有 → 礼物口径");
 eq(b11.tokens, 5900000, "礼物口径 token");
+// 11b-2. 阈值规模折算：常规 5M / 礼物 100.2M → 15% 线折成 ~0.75%（等量绝对余量 75 万）
+ok(Math.abs(b11.thrScale - 5000000 / 100200000) < 0.0001, `thrScale=reg/gift（实际 ${b11.thrScale}）`);
+ok(Math.abs(15 * b11.thrScale - 0.7485) < 0.001, `折算后阈值 ≈0.75%（实际 ${15 * b11.thrScale}）`);
+const b11s = giftFirstBasis({ ...sGF, giftTokens: 0, giftPct: 0 });
+eq(b11s.thrScale, 1, "常规口径不折算");
+
+// 11b-3. 大池不再被 15% 线早切：礼物剩 5.7%（折算阈值 0.75%）→ 不触发
+const r11b3 = evaluate({ ...base,
+  cur: { pct: 5.7, tokens: 5_700_000, etaSec: null, level: "ok", ageMs: 1000, gift: true, thr: 15 * b11.thrScale },
+  candidates: [cand("B", 100, { gift: true, tokens: 100_000_000 })],
+});
+eq(r11b3.action, "none", "折算后 5.7% 高于 0.75% 线 → 继续烧（不留 1500 万浪费）");
+const r11b4 = evaluate({ ...base,
+  cur: { pct: 0.5, tokens: 500_000, etaSec: null, level: "low", ageMs: 1000, gift: true, thr: 15 * b11.thrScale },
+  candidates: [cand("B", 100, { gift: true, tokens: 100_000_000 })],
+});
+eq(r11b4.action, "switch", "烧到折算线以下 → 触发切换");
+
+// 11b-5. 候选门槛同样折算：礼物候选 3% ≥ 0.75% → 达标（旧 15% 线下会被排除）
+const rt11e = rankTargets([
+  cand("B", 3, { gift: true, tokens: 30_000_000, thr: 15 * b11.thrScale }),
+  cand("C", 2, { gift: false, tokens: 4_000_000 }),
+], { threshold: 15, giftOrder: "auto" });
+eq(rt11e.ranked[0].id, "B", "礼物候选按折算阈值达标（3% ≥ 0.75%），且礼物层优先");
+eq(rt11e.degraded, false, "有达标候选不算降级");
 const b11b = giftFirstBasis({ ...sGF, giftTokens: 0, giftPct: 0 });
 eq(b11b.basis, "reg", "礼物全部耗尽 → 回落常规口径");
 eq(b11b.tokens, 5000000, "常规口径 token");

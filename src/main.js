@@ -3178,17 +3178,19 @@ function pctPair(focus, all, gf = false) {
   let giftBasis = false;
   let giftKinds = [];
   let giftExpireMs = null;
+  let thrScale = 1;
   if (gf) {
     const b = giftFirstBasis(focus?.matched ? focus : (all ?? focus));
     if (b) {
       giftBasis = b.basis === "gift";
       giftKinds = b.giftKinds ?? [];
       giftExpireMs = b.giftExpireMs ?? null;
+      thrScale = b.thrScale ?? 1;
       if (b.pct != null) pct = b.pct;
       if (b.tokens != null) tokens = b.tokens;
     }
   }
-  return { pct, flowed, tokens, giftBasis, giftKinds, giftExpireMs };
+  return { pct, flowed, tokens, giftBasis, giftKinds, giftExpireMs, thrScale };
 }
 /** 某账号的判定口径（API） */
 function pctPairOf(id, model = effectiveFocusModel(), gf = giftFirstOn()) {
@@ -3300,6 +3302,7 @@ async function autoSwitchTick(manual = false) {
     cur = {
       pct: curPct, etaSec: lg.etaSec, level: levelOf(curPct, thr),
       tokens: b && b.tokens != null ? b.tokens : (lg.totalTokens ?? null),
+      thr: thr * (b?.thrScale ?? 1),
       ageMs: Math.max(0, now - (lg.at || now)), stale: false,
       planUnavailable: !!lg.planUnavailable, source: sampleSrc,
     };
@@ -3314,6 +3317,7 @@ async function autoSwitchTick(manual = false) {
     cur = {
       pct: ap.pct, etaSec: apiEta(active.id), level: levelOf(ap.pct, thr),
       tokens: ap.tokens ?? null,
+      thr: thr * (ap.thrScale ?? 1),
       ageMs, stale: ageMs > AS_DEFAULTS.activeStaleMs, source: sampleSrc, hardDown,
     };
   }
@@ -3339,13 +3343,15 @@ async function autoSwitchTick(manual = false) {
       gift: pair.giftBasis,
       giftKinds: pair.giftKinds ?? [],
       giftExpireMs: pair.giftExpireMs ?? null,
+      // 礼物口径的规模折算阈值（常规口径 = 全局阈值）
+      thr: thr * (pair.thrScale ?? 1),
       fallback: pair.flowed, modelMatched: !!h?.modelMatched,
       ageMs: cs ? now - cs : Infinity,
     });
   }
   // 当前账号“已流转”（关注模型全场耗尽、只是靠其它模型顶着）时，只要还有账号留着关注模型额度，
   // 就把它当成已经耗尽来处理（立即切，不等百分比）——否则会在 5.3 上一直赖着
-  const hasFocusCand = cands.some((c) => !c.flowed && c.pct >= thr);
+  const hasFocusCand = cands.some((c) => !c.flowed && c.pct >= (c.thr ?? thr));
   if (cur.flowed && hasFocusCand) cur = { ...cur, pct: 0, level: "dead" };
 
   const d = evaluate({
@@ -3400,10 +3406,12 @@ async function doAutoSwitch(d, active, cur, lg) {
         c.pct = fresh.pct;
         c.flowed = fresh.flowed;
         c.tokens = fresh.tokens ?? null;
+        c.thr = thr * (fresh.thrScale ?? 1);
         c.ageMs = 0;
         if (c.pct == null) continue;
       }
-      const okPct = d.degrade ? c.pct > 0 : c.pct >= thr;
+      const cThr = c.thr != null && isFinite(c.thr) ? c.thr : thr;
+      const okPct = d.degrade ? c.pct > 0 : c.pct >= cThr;
       // 与 evaluate 同口径：双方 token 可比按绝对余量比，否则按百分比；
       // hardDown 时当前号的旧百分比/旧 token 一律作废（基准视为耗尽）
       const curTokens = d.reason === "hardDown" ? null : (cur.tokens ?? null);

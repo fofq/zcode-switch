@@ -90,10 +90,12 @@ export function summarizePools(list) {
     if (!it || typeof it.name !== "string") continue;
     const pct = pctOf(it);
     if (pct == null) continue;
+    const t = Number(it.total);
     rows.push({
       name: it.name,
       pct,
       tokens: tokensOf(it),
+      total: t != null && isFinite(t) && t > 0 ? t : null,
       gift: it.gift === true ? true : it.gift === false ? false : null,
       giftKind: it.giftKind ?? null,
       expireMs: it.expireMs ?? null,
@@ -111,6 +113,8 @@ export function summarizePools(list) {
   let hasGift = false;
   let hasReg = false;
   let giftExpireMs = null;
+  let giftTotalSum = 0;
+  let regTotalSum = 0;
   const giftKinds = new Set();
   for (const r of rows) {
     if (r.pct > best.pct) best = r;
@@ -123,12 +127,14 @@ export function summarizePools(list) {
     if (r.gift === true) {
       hasGift = true;
       giftTokens += tk;
+      if (r.total != null) giftTotalSum += r.total;
       if (giftPct == null || r.pct > giftPct) giftPct = r.pct;
       if (r.expireMs != null && (giftExpireMs == null || r.expireMs < giftExpireMs)) giftExpireMs = r.expireMs;
       if (r.giftKind) giftKinds.add(r.giftKind);
     } else if (r.gift === false) {
       hasReg = true;
       regTokens += tk;
+      if (r.total != null) regTotalSum += r.total;
       if (regPct == null || r.pct > regPct) regPct = r.pct;
     }
   }
@@ -142,8 +148,10 @@ export function summarizePools(list) {
     totalTokens: tokenRows ? totalTokens : null,
     giftPct: hasGift ? giftPct : null,
     giftTokens: hasGift ? giftTokens : null,
+    giftTotal: hasGift && giftTotalSum > 0 ? giftTotalSum : null,
     regPct: hasReg ? regPct : null,
     regTokens: hasReg ? regTokens : null,
+    regTotal: hasReg && regTotalSum > 0 ? regTotalSum : null,
     giftKinds: hasGift ? [...giftKinds] : [],
     giftExpireMs: hasGift ? giftExpireMs : null,
   };
@@ -156,18 +164,23 @@ export function summarizePools(list) {
 export function giftFirstBasis(st) {
   if (!st) return null;
   if (st.giftTokens != null && st.giftTokens > 0) {
+    // 阈值规模折算：礼物池的切换线 = 常规池在同阈值下会留下的绝对余量。
+    // 15% 对 5M 常规池留 75 万，对 1 亿礼物池也该只留 75 万（0.75%）而不是 1500 万——
+    // 否则切走时浪费的比一个常规号的满额还多。
+    const scale = st.regTotal > 0 && st.giftTotal > 0 ? Math.min(1, st.regTotal / st.giftTotal) : 1;
     return {
       pct: st.giftPct ?? st.bestPct,
       tokens: st.giftTokens,
       basis: "gift",
+      thrScale: scale,
       giftKinds: st.giftKinds ?? [],
       giftExpireMs: st.giftExpireMs ?? null,
     };
   }
   if (st.regTokens != null) {
-    return { pct: st.regPct ?? st.bestPct, tokens: st.regTokens, basis: "reg", giftKinds: [], giftExpireMs: null };
+    return { pct: st.regPct ?? st.bestPct, tokens: st.regTokens, basis: "reg", thrScale: 1, giftKinds: [], giftExpireMs: null };
   }
-  return { pct: st.bestPct, tokens: st.totalTokens ?? null, basis: "all", giftKinds: [], giftExpireMs: null };
+  return { pct: st.bestPct, tokens: st.totalTokens ?? null, basis: "all", thrScale: 1, giftKinds: [], giftExpireMs: null };
 }
 
 /**
@@ -375,8 +388,9 @@ export function rankTargets(cands, opts = AS_DEFAULTS) {
   const usable = (cands || []).filter(
     (c) => c && c.pct != null && isFinite(c.pct) && c.level !== "auth" && c.level !== "fail",
   );
+  const candThr = (c) => (c.thr != null && isFinite(c.thr) ? c.thr : thr);
   const alive = usable.filter((c) => c.pct > 0);
-  const ok = alive.filter((c) => c.pct >= thr);
+  const ok = alive.filter((c) => c.pct >= candThr(c));
   const order = ok.length ? ok : alive;
   const flowed = (c) => (c.flowed || c.fallback ? 1 : 0);
   // 礼物层内排序键：auto=最早到期的礼物先烧（毫秒，缺失排最后）；指定礼物=持有该礼物的在前
@@ -429,6 +443,8 @@ export function evaluate(input) {
   const pctRaw = cur?.pct == null || !isFinite(cur.pct) ? null : cur.pct;
   const pct = hardDown ? -1 : pctRaw;
   const etaSec = cur?.etaSec != null && isFinite(cur.etaSec) ? cur.etaSec : null;
+  // 礼物优先时 cur 带规模折算后的阈值（thr），常规口径回落全局阈值
+  const curThr = cur?.thr != null && isFinite(cur.thr) ? cur.thr : thr;
 
   // 数据新鲜度：陈旧样本不当真值，先要求刷新
   // （例外：「计划不可用」是客户端自己的硬信号、hardDown 是连续刷新失败的硬信号，
@@ -440,7 +456,7 @@ export function evaluate(input) {
   const auth = cur?.level === "auth";
   const zero = pct != null && pct <= 0;
   const etaHit = etaSec != null && etaSec <= opts.marginSec;
-  const pctHit = pct != null && pct <= thr;
+  const pctHit = pct != null && pct <= curThr;
   const trigger = hardDown || planDown || zero || pctHit || etaHit || auth;
   if (!trigger) {
     // 陈旧但还判定为安全 → 依然要求刷新一次（避免用旧数当"安全"证据）

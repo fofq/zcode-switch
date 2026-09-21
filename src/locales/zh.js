@@ -333,7 +333,7 @@ export const zh = {
   "st.autoSwitchDesc": "当前账号额度低于阈值时自动切到额度更多的账号；ZCode 运行中需开启热切换",
   "st.model": "关注模型",
   "st.giftFirst": "优先消耗礼物套餐",
-  "st.giftFirstDesc": "按礼物/赠送类套餐（Weekend/Global Build）的额度判定与切换：当前号礼物见底就提前切，候选优先选还留着礼物额度的账号；全部礼物用尽后才回落常规（Start）额度",
+  "st.giftFirstDesc": "按礼物/赠送类套餐（Weekend/Global Build）的额度判定与切换：候选优先选还留着礼物额度的账号；全部礼物用尽后才回落常规（Start）额度。礼物池的切换线按池规模自动折算（与常规池同阈值等量余量），避免大池按同一百分比早切浪费",
   "st.giftOrder": "礼物消耗顺序",
   "st.giftOrderAuto": "自动（临期优先）",
   "st.giftOrderWeekend": "先 Weekend",

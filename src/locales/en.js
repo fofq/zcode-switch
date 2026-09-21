@@ -333,7 +333,7 @@ export const en = {
   "st.autoSwitchDesc": "Switches to an account with more quota when the current one drops below the threshold; hot switch is required while ZCode is running",
   "st.model": "Focus model",
   "st.giftFirst": "Burn gift plans first",
-  "st.giftFirstDesc": "Judge and switch by gift/bonus plan quota (Weekend/Global Build): leave early when the current account runs low on gifts, prefer candidates that still hold gift quota; regular (Start) quota is only used after all gifts are gone",
+  "st.giftFirstDesc": "Judge and switch by gift/bonus plan quota (Weekend/Global Build): prefer candidates that still hold gift quota; regular (Start) quota is only used after all gifts are gone. The gift-pool switch line is scale-normalized against regular quota size to avoid waste on large pools",
   "st.giftOrder": "Gift burn order",
   "st.giftOrderAuto": "Auto (expiring first)",
   "st.giftOrderWeekend": "Weekend first",
