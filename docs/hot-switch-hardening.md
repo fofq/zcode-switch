@@ -52,3 +52,22 @@
 - [x] `npm run check`（i18n + 决策自检 100 项）+ `node --check`
 - [x] CI 653f525b：`cargo test --lib`（含本轮新增 5 个单测）与 NSIS 打包均 success
 - [ ] 实测观察：热切后审计日志出现 `hot-post`（8s）与 `hot-verify applied/unknown`（≤120s）——待重建安装后观察
+
+## 补充实测（2026-09-22）：热切后的任务停顿
+
+用户报告旧版存在「切过去了任务没断但停一会儿才恢复」。用客户端日志量化了当天 5 次热切：
+
+| 切换 | 切后首个新请求 | 局部基线 | 结论 |
+|---|---|---|---|
+| 08:38 | 4s | 10s | 无停顿 |
+| 09:09 | 13s | 18s | 无停顿 |
+| 09:24 | **41s** | 12s | **停顿 ~30s** |
+| 09:55 | 6s | 19s | 无停顿 |
+| 10:00 | 24s | 26s | 无停顿 |
+
+停顿窗口的客户端行为：切后立即 `coding-plan-subscription.getCapabilities`（重拉套餐能力，
+plan cache 被清的必然结果）→ 44s 空窗 → 恢复 + 连写 4 次 settings（provider 再评估落盘）。
+**机制在客户端内部，工具无法消除**（plan cache 必须清、新号必须重取）；间歇性（1/5）。
+
+对策：post_check 的 align 改为条件化——仅当 providerFamilyDomain 被客户端覆盖/缺失时才写，
+避免 UpdatedAt 的第二次 bump 在任务刚恢复时再触发一轮 provider 再评估。

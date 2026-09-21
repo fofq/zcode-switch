@@ -221,7 +221,7 @@ function scheduleHotFollowUp(id) {
     hotPostTimer = null;
     if (state?.active_account_id !== id) return;
     invoke("hot_switch_post_check", { id })
-      .then((r) => asAuditPush("hot-post", { id, credsResynced: !!r?.creds_resynced }))
+      .then((r) => asAuditPush("hot-post", { id, credsResynced: !!r?.creds_resynced, realigned: !!r?.realigned }))
       .catch(() => {});
   }, 8000);
 }

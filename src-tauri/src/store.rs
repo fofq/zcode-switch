@@ -858,7 +858,23 @@ pub fn hot_switch_post_check(paths: &Paths, target: &Account) -> Result<Value, S
             }
         }
     }
-    align_family_domain(paths, target);
+    // align 重跑——仅当 family domain 被客户端覆盖/缺失时才写。
+    // UpdatedAt 每次变化都会触发客户端 provider 再评估（实测切后有一次 44s 的请求停顿，
+    // 期间客户端重拉套餐能力并连写 4 次 settings）——任务刚恢复时不要无谓地再 bump 一次。
+    let mut realigned = false;
+    if let Ok(raw) = fs::read_to_string(paths.live_setting()) {
+        let cur = serde_json::from_str::<Value>(&raw)
+            .ok()
+            .and_then(|v| v.get("providerFamilyDomain").and_then(|x| x.as_str()).map(String::from));
+        let want = cred_plain(&target.credentials, "oauth:active_provider", &paths.home)
+            .filter(|p| p == "bigmodel" || p == "zai");
+        if want.is_some() && cur.as_deref() != want.as_deref() {
+            align_family_domain(paths, target);
+            realigned = true;
+            crate::flowlog::log("hot-sw", "align-retry", &target.id);
+        }
+    }
+    out["realigned"] = json!(realigned);
     rematerialize_wiped_builtins(paths, target);
     Ok(out)
 }
