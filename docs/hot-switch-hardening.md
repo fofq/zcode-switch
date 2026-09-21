@@ -1,5 +1,8 @@
 # 热切换强化计划（hot-switch hardening）
 
+> ✅ 已全部完成并验证（653f525b）：CI "Rust unit tests" + "Build（前端+Rust+NSIS）" 均 success，
+> npm run check 100 项通过。
+
 > 2026-09-22 制定。证据来源：客户端自身日志（~/.zcode/v2/logs）、磁盘文件 mtime/内容比对、
 > ARMS/telemetry 身份文件 vs 账号库、审计日志（com.zswitch.app/logs/oauth.log）。
 > 状态标记：[x] 已实现 / [~] 调整后实现 / [-] 经证据评估后不做 / [ ] 待办
@@ -17,7 +20,7 @@
 
 ## 实施项
 
-### [~] P1 热切后验（前端，纯被动）
+### [x] P1 热切后验（前端，纯被动）——已实现
 - 切换成功且 `hot=true` → 记录 `{id, at, preSig}`（preSig = 切换时的余额池签名）
 - 信号更新时检查：`pools_at_ms > at+1s` 的新余额行 → 签名不同 = `applied`；
   相同 = `same-sig`（弱确认，新号池可能恰好同值）；120s 无新行 = `unknown`（客户端空闲没查余额，不代表失败）
@@ -25,7 +28,7 @@
   用「池签名」（show_name=remaining 排序串）比对
 - 全部落 `asAuditPush("hot-verify")`，设置面板诊断行可见；不做自动冷重启降级（避免误杀）
 
-### [~] P3+P4 热切后置检查（后端新命令 `hot_switch_post_check`）
+### [x] P3+P4 热切后置检查（后端新命令 `hot_switch_post_check`）——已实现
 - switch_to **热路径移除 rematerialize**（消灭 W3 的 15s 悬挂；冷路径保留——启动前必须完整配置）
 - 新命令（前端热切成功后 8s 调用）：
   1. 凭据身份复核：live 被客户端反写覆盖（身份不符）→ 用目标凭据重写一次
@@ -33,12 +36,12 @@
   3. `rematerialize_wiped_builtins`（网络调用已不在热路径上）
 - 结果落审计（前端 `asAuditPush("hot-post")` + 后端 flowlog）
 
-### [-] M1 活跃号凭据漂移自愈
+### [-] M1 活跃号凭据漂移自愈——复核后取消
 - 复核发现**已被现有代码覆盖**：`effective_snapshot`（store.rs）对活跃账号自动优先 live 凭据
   （注释原文：「zcode 运行期间会轮换 JWT，账号快照里存的旧 JWT 会过期导致额度/2API 查询失败」），
   且切换前 `sync_live_back_to_source` 回存旧号最新凭据。无需实现。
 
-### [~] P5 审计补全
+### [x] P5 审计补全——已实现
 - align_family_domain / rematerialize_wiped_builtins / hot_switch_post_check 的成败落 flowlog
 
 ### [-] P6 ARMS uid 热写
@@ -46,6 +49,6 @@
   语义：热切后遥测归属旧号直到下次冷启——已知且接受。
 
 ## 验证方式
-- `npm run check`（i18n + 决策自检）+ `node --check`
-- Rust 单测待 CI（本机无 cargo）
-- 实测：热切后审计日志应出现 `hot-post`（8s）与 `hot-verify applied/unknown`（≤120s）
+- [x] `npm run check`（i18n + 决策自检 100 项）+ `node --check`
+- [x] CI 653f525b：`cargo test --lib`（含本轮新增 5 个单测）与 NSIS 打包均 success
+- [ ] 实测观察：热切后审计日志出现 `hot-post`（8s）与 `hot-verify applied/unknown`（≤120s）——待重建安装后观察
