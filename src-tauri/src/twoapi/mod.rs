@@ -28,7 +28,6 @@ use crate::oauth::{BIGMODEL_ANTHROPIC_BASE, ZAI_ANTHROPIC_BASE};
 use crate::store::{self, ApiKeyInfo, Paths};
 
 const DEFAULT_ANTHROPIC_VERSION: &str = "2023-06-01";
-const CACHE_TTL: Duration = Duration::from_secs(600);
 const POOL_TTL: Duration = Duration::from_secs(300);
 /// 站方标注长期免费的模型（docs.z.ai/guides/overview/pricing），走 paas/v4 标准端点
 const FREE_MODELS: &[&str] = &["glm-4.7-flash", "glm-4.6v-flash", "glm-4.5-flash"];

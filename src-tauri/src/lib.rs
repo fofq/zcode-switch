@@ -609,8 +609,8 @@ async fn oauth_begin(app: AppHandle, provider: String, browser: Option<bool>) ->
     let app2 = app.clone();
     let (provider2, state2, flow2, mid2) = (provider.clone(), init.state.clone(), flow.clone(), mid.clone());
     let flow_close = flow.clone();
-    let target_url = url
-        .parse::<tauri::Url>()
+    // 仅做授权 URL 格式校验（错误提前传播）；解析值本身不再使用
+    url.parse::<tauri::Url>()
         .map_err(|e| i18n::trf("err.oauth.bad_authorize_url", &[("e", &e.to_string())]))?;
     let mut builder = tauri::WebviewWindowBuilder::new(
         &app,

@@ -199,7 +199,6 @@ pub fn translate_response(up: &Value, fallback_model: &str) -> Value {
 }
 
 struct BlockInfo {
-    is_tool: bool,
     openai_tool_index: Option<usize>,
 }
 
@@ -278,9 +277,9 @@ impl SseTransformer {
                         json!({"tool_calls": [{"index": openai_idx, "id": id, "type": "function", "function": {"name": name, "arguments": ""}}]}),
                         None,
                     );
-                    self.blocks.insert(idx, BlockInfo { is_tool: true, openai_tool_index: Some(openai_idx) });
+                    self.blocks.insert(idx, BlockInfo { openai_tool_index: Some(openai_idx) });
                 } else {
-                    self.blocks.insert(idx, BlockInfo { is_tool: false, openai_tool_index: None });
+                    self.blocks.insert(idx, BlockInfo { openai_tool_index: None });
                 }
             }
             "content_block_delta" => {
