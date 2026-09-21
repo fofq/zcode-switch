@@ -115,8 +115,7 @@ export function planIsGift(p) {
 }
 
 /** 按套餐类别计算关注模型剩余：wantGift=true 只看礼物/赠送类套餐 */
-function modelPctInPlans(q, model, wantGift) {
-  const key = String(model || "").trim().toLowerCase();
+function modelPctInPlans(q, model, wantGift) {  const key = String(model || "").trim().toLowerCase();
   if (!key) return null;
   const d = q?.data;
   if (!d) return null;
@@ -144,6 +143,33 @@ export function modelRemainingPctDetailed(q, model) {
     gift: modelPctInPlans(q, model, true),
     regular: modelPctInPlans(q, model, false),
   };
+}
+
+/**
+ * entitlement_id → {gift, giftKind, expireMs}：给客户端日志的余额池做礼物/常规分类。
+ * 日志里的池只有 id 没有套餐归属，且两个礼物和 Start 的池同名（都叫 GLM-5.3-Flash），
+ * 只能靠 HTTP 套餐数据里的 entitlement_id 建映射；未入库的 id 由调用方按常规（保守）处理。
+ */
+export function entitlementGiftMap(q) {
+  const map = {};
+  const d = q?.data;
+  if (!d) return map;
+  for (const p of livePlans(q)) {
+    const gift = planIsGift(p) === true;
+    const kind = gift ? giftKindOfPlan(p) : null;
+    const txt = String(p?.expire || "");
+    let expireMs = null;
+    if (txt) {
+      const hasTime = txt.length >= 16;
+      const ms = new Date(hasTime ? txt.replace(" ", "T") : txt + "T23:59:59").getTime();
+      if (isFinite(ms)) expireMs = ms;
+    }
+    for (const it of p.items || []) {
+      const id = String(it?.entitlement_id || "").trim();
+      if (id) map[id] = { gift, giftKind: kind, expireMs };
+    }
+  }
+  return map;
 }
 
 /**

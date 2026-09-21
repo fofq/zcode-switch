@@ -1104,6 +1104,10 @@ select.two-input { cursor: pointer; }
   background: rgba(232, 163, 61, .25);
   color: var(--amber);
 }
+.lang-seg.dim {
+  opacity: .45;
+  pointer-events: none;
+}
 
 .tier-b {
   font-family: var(--mono);

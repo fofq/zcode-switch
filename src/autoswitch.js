@@ -8,7 +8,7 @@
 // 3) 判定必须看数据新鲜度：陈旧样本不再当真值用，而是要求先刷新（action:"refresh"）。
 // 4) 无候选时不放弃：降级切「还有额度的最好账号」，并把降级原因暴露给用户。
 
-import { planExpired, modelKeyMatch } from "./list.js";
+import { planExpired, planIsGift, giftKindOfPlan, modelKeyMatch } from "./list.js";
 
 /** 决策参数默认值（main.js 按运行期轮询间隔覆盖 marginSec） */
 export const AS_DEFAULTS = {
@@ -65,10 +65,24 @@ function tokensOf(item) {
   return null;
 }
 
+/** 未过期礼物/常规池的分类元数据：kind（weekend/global/其它礼物）+ 到期时间戳（临期优先排序用） */
+function planExpireMs(s) {
+  const txt = String(s || "");
+  if (!txt) return null;
+  const hasTime = txt.length >= 16;
+  const ms = new Date(hasTime ? txt.replace(" ", "T") : txt + "T23:59:59").getTime();
+  return isFinite(ms) ? ms : null;
+}
+
 /**
  * 把一组额度项汇总成判定用的池统计。
  * best = 最宽松的池（乐观，用于百分比阈值触发，保持旧行为）
  * worst = 最快枯竭的池（悲观，用于 ETA 提前量）
+ * 条目可带 gift（true=礼物/赠送池，false=常规池）与 giftKind/expireMs（礼物细分与到期）：
+ * 额外给出礼物/常规两个口径的拆分（giftPct/giftTokens/regPct/regTokens），
+ * 以及礼物侧的细分（giftKinds）与最早到期（giftExpireMs），「优先消耗礼物套餐」判定用。
+ * @returns {{count,bestPct,worstPct,worstName,bestTokens,worstTokens,totalTokens,
+ *            giftPct,giftTokens,regPct,regTokens,giftKinds,giftExpireMs}}
  */
 export function summarizePools(list) {
   const rows = [];
@@ -76,19 +90,46 @@ export function summarizePools(list) {
     if (!it || typeof it.name !== "string") continue;
     const pct = pctOf(it);
     if (pct == null) continue;
-    rows.push({ name: it.name, pct, tokens: tokensOf(it) });
+    rows.push({
+      name: it.name,
+      pct,
+      tokens: tokensOf(it),
+      gift: it.gift === true ? true : it.gift === false ? false : null,
+      giftKind: it.giftKind ?? null,
+      expireMs: it.expireMs ?? null,
+    });
   }
   if (!rows.length) return null;
   let best = rows[0];
   let worst = rows[0];
   let tokenRows = 0;
   let totalTokens = 0;
+  let giftPct = null;
+  let giftTokens = 0;
+  let regPct = null;
+  let regTokens = 0;
+  let hasGift = false;
+  let hasReg = false;
+  let giftExpireMs = null;
+  const giftKinds = new Set();
   for (const r of rows) {
     if (r.pct > best.pct) best = r;
     if (r.pct < worst.pct) worst = r;
+    const tk = r.tokens != null && isFinite(r.tokens) ? r.tokens : 0;
     if (r.tokens != null && isFinite(r.tokens)) {
       tokenRows++;
       totalTokens += r.tokens;
+    }
+    if (r.gift === true) {
+      hasGift = true;
+      giftTokens += tk;
+      if (giftPct == null || r.pct > giftPct) giftPct = r.pct;
+      if (r.expireMs != null && (giftExpireMs == null || r.expireMs < giftExpireMs)) giftExpireMs = r.expireMs;
+      if (r.giftKind) giftKinds.add(r.giftKind);
+    } else if (r.gift === false) {
+      hasReg = true;
+      regTokens += tk;
+      if (regPct == null || r.pct > regPct) regPct = r.pct;
     }
   }
   return {
@@ -99,7 +140,34 @@ export function summarizePools(list) {
     bestTokens: best.tokens != null && isFinite(best.tokens) ? best.tokens : null,
     worstTokens: worst.tokens != null && isFinite(worst.tokens) ? worst.tokens : null,
     totalTokens: tokenRows ? totalTokens : null,
+    giftPct: hasGift ? giftPct : null,
+    giftTokens: hasGift ? giftTokens : null,
+    regPct: hasReg ? regPct : null,
+    regTokens: hasReg ? regTokens : null,
+    giftKinds: hasGift ? [...giftKinds] : [],
+    giftExpireMs: hasGift ? giftExpireMs : null,
   };
+}
+
+/**
+ * 礼物优先判定基准：礼物池还有剩余 → 按礼物池口径判定（pct/token 都取礼物侧）；
+ * 礼物全部用尽 → 回落常规池口径；连分类都没有（旧数据/未映射）→ 原样透传。
+ */
+export function giftFirstBasis(st) {
+  if (!st) return null;
+  if (st.giftTokens != null && st.giftTokens > 0) {
+    return {
+      pct: st.giftPct ?? st.bestPct,
+      tokens: st.giftTokens,
+      basis: "gift",
+      giftKinds: st.giftKinds ?? [],
+      giftExpireMs: st.giftExpireMs ?? null,
+    };
+  }
+  if (st.regTokens != null) {
+    return { pct: st.regPct ?? st.bestPct, tokens: st.regTokens, basis: "reg", giftKinds: [], giftExpireMs: null };
+  }
+  return { pct: st.bestPct, tokens: st.totalTokens ?? null, basis: "all", giftKinds: [], giftExpireMs: null };
 }
 
 /**
@@ -111,18 +179,26 @@ export function poolStats(q, model) {
   if (!d) return null;
   const key = String(model || "").trim().toLowerCase();
   const all = [];
-  const collect = (arr) => {
+  const collect = (arr, meta = null) => {
     for (const it of arr || []) {
       if (!it || typeof it.name !== "string") continue;
       if (kindOf(it) !== "raw") continue;
-      all.push(it);
+      all.push(meta ? { ...it, ...meta } : it);
     }
   };
   // 只收未过期套餐的池：d.items 是后端「全部套餐（含过期）平铺」，直接收会
   // 1) 与 livePlans 重复计数（token 聚合 ×2）2) 把过期礼物残留灌成可用额度
   // （实测 bestPct 75% 来自过期池）。旧数据没有 plans 数组时才回退平铺 items。
+  // 条目附带礼物分类元数据（gift/giftKind/expireMs），「优先消耗礼物套餐」判定用。
   if (Array.isArray(d.plans)) {
-    for (const p of livePlans(q)) collect(p.items);
+    for (const p of livePlans(q)) {
+      const gift = planIsGift(p);
+      collect(p.items, {
+        gift,
+        giftKind: gift ? giftKindOfPlan(p) : null,
+        expireMs: planExpireMs(p.expire),
+      });
+    }
   } else {
     collect(d.items);
   }
@@ -140,19 +216,25 @@ export function poolStats(q, model) {
   return { ...s, matched: useMatched && !!key, model: key || null, scope: useMatched ? "focus" : "all" };
 }
 
-/** 客户端日志信号里的池（[{show_name,total,used,remaining}]）→ 与 poolStats 同形状 */
-export function poolStatsFromSignals(pools, model) {
+/** 客户端日志信号里的池（[{show_name,total,used,remaining}]）→ 与 poolStats 同形状。
+ * entGift：entitlement_id → {gift, giftKind, expireMs}（由 HTTP 套餐数据构建），
+ * 日志池本身不带套餐归属，礼物优先判定靠它分类；未映射的池按常规（保守）处理。 */
+export function poolStatsFromSignals(pools, model, entGift = null) {
   const list = [];
   for (const p of pools || []) {
     const name = String(p?.show_name || p?.name || "").trim();
     if (!name) continue;
     const total = Number(p?.total);
     const remaining = Number(p?.remaining);
+    const m = entGift ? entGift[String(p?.entitlement_id || "").trim()] : null;
     list.push({
       name,
       total: isFinite(total) && total > 0 ? total : null,
       remaining: isFinite(remaining) ? remaining : null,
       percent_used: isFinite(total) && total > 0 && isFinite(remaining) ? 100 - (remaining / total) * 100 : null,
+      gift: m ? m.gift === true : null,
+      giftKind: m?.giftKind ?? null,
+      expireMs: m?.expireMs ?? null,
     });
   }
   if (!list.length) return null;
@@ -278,16 +360,18 @@ export function etaOf(hist) {
 }
 
 /**
- * 候选排序：非流转优先（关注模型还有额度的账号先选）→ 礼物/临期插队 → 剩余降序。
+ * 候选排序：非流转优先（关注模型还有额度的账号先选）→ 有礼物额度的账号插队 →
+ * 礼物层内按「礼物顺序」配置（auto=越临期越优先 / 指定 weekend|global 优先）→ 绝对余量降序。
  * 同优先级内：全员都有同口径聚合 token（tokens）时按绝对余量降序——百分比在
  * 「最宽池大小不同」的账号之间是伪量纲（90%×450万 不如 50%×4000万）；
  * 有缺失就整体回退百分比，保证比较器全序一致。
  * avoid：最近切出过的账号（防 A→B→A 乒乓）；若排除后为空则忽略它。
- * @param {Array} cands [{id,name,pct,tokens,gift,flowed,fallback,modelMatched,level,ageMs}]
+ * @param {Array} cands [{id,name,pct,tokens,gift,giftKinds,giftExpireMs,flowed,fallback,modelMatched,level,ageMs}]
  */
 export function rankTargets(cands, opts = AS_DEFAULTS) {
   const thr = Number(opts.threshold ?? AS_DEFAULTS.threshold);
   const avoid = opts.avoid instanceof Set ? opts.avoid : new Set(opts.avoid || []);
+  const giftOrder = String(opts.giftOrder || "auto");
   const usable = (cands || []).filter(
     (c) => c && c.pct != null && isFinite(c.pct) && c.level !== "auth" && c.level !== "fail",
   );
@@ -295,13 +379,24 @@ export function rankTargets(cands, opts = AS_DEFAULTS) {
   const ok = alive.filter((c) => c.pct >= thr);
   const order = ok.length ? ok : alive;
   const flowed = (c) => (c.flowed || c.fallback ? 1 : 0);
+  // 礼物层内排序键：auto=最早到期的礼物先烧（毫秒，缺失排最后）；指定礼物=持有该礼物的在前
+  const giftKey = (c) => {
+    if (!c.gift) return 0;
+    if (giftOrder === "weekend" || giftOrder === "global") {
+      return (c.giftKinds || []).includes(giftOrder) ? 0 : 1;
+    }
+    return c.giftExpireMs != null ? c.giftExpireMs : Number.MAX_SAFE_INTEGER;
+  };
   const byTokens = order.length > 1 && order.every((c) => c.tokens != null && isFinite(c.tokens));
   const sizeKey = (c) => (byTokens ? c.tokens : c.pct);
   const sorted = order
     .slice()
     .sort(
       (a, b) =>
-        flowed(a) - flowed(b) || (b.gift ? 1 : 0) - (a.gift ? 1 : 0) || sizeKey(b) - sizeKey(a),
+        flowed(a) - flowed(b)
+        || (b.gift ? 1 : 0) - (a.gift ? 1 : 0)
+        || (a.gift && b.gift ? giftKey(a) - giftKey(b) : 0)
+        || sizeKey(b) - sizeKey(a),
     );
   const fresh = sorted.filter((c) => !avoid.has(c.id));
   const ranked = fresh.length ? fresh : sorted;

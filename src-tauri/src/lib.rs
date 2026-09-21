@@ -1032,6 +1032,7 @@ async fn set_behavior(
     auto_switch_threshold: Option<u32>,
     auto_switch_model: Option<String>,
     auto_switch_gift_first: Option<bool>,
+    auto_switch_gift_order: Option<String>,
     auto_switch_model_fallback: Option<bool>,
 ) -> Result<(), String> {
     let _guard = store_guard();
@@ -1067,6 +1068,14 @@ async fn set_behavior(
     }
     if let Some(v) = auto_switch_gift_first {
         s.auto_switch_gift_first = Some(v);
+    }
+    if let Some(v) = auto_switch_gift_order {
+        // 只接受合法枚举，其余回落 auto（临期优先）
+        let v = match v.as_str() {
+            "weekend" | "global" => v,
+            _ => "auto".into(),
+        };
+        s.auto_switch_gift_order = Some(v);
     }
     if let Some(v) = auto_switch_model_fallback {
         s.auto_switch_model_fallback = Some(v);

@@ -218,6 +218,10 @@ pub struct QuotaItem {
     pub server_percentage: Option<f64>,
     pub unit: String,
     pub period_end: Option<String>,
+    /// 上游 entitlement_id：客户端日志里的余额池只有 id 没有套餐归属，
+    /// 前端靠它把日志池映射到「礼物/常规」分类（礼物优先判定用）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub entitlement_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub kind: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1037,6 +1041,7 @@ fn normalize_quota_limit(limit_resp: &Value, sub_resp: Option<&Value>) -> QuotaO
             server_percentage: percentage,
             unit: unit_str,
             period_end: reset.as_ref().map(|r| format!("{r} 重置")),
+            entitlement_id: None,
             kind: (kind != "").then(|| kind.to_string()),
             window: Some(window),
             unit_code: (unit_code != "").then(|| unit_code.to_string()),
@@ -1362,6 +1367,10 @@ fn normalize_balance(balance_data: &Value) -> QuotaOverview {
                 .get("remaining_units")
                 .and_then(to_number)
                 .or_else(|| item.get("available_units").and_then(to_number));
+            let it_ent = item
+                .get("entitlement_id")
+                .and_then(|v| v.as_str())
+                .map(str::to_string);
             let it = QuotaItem {
                 name: ["show_name", "name", "entitlement_id", "plan_id"]
                     .iter()
@@ -1371,6 +1380,7 @@ fn normalize_balance(balance_data: &Value) -> QuotaOverview {
                 total: it_total,
                 used: it_used,
                 remaining: it_remaining,
+                entitlement_id: it_ent,
                 percent_used: match (it_total, it_used) {
                     (Some(t), Some(u)) if t > 0.0 => Some((u / t * 100.0).clamp(0.0, 100.0)),
                     _ => None,
@@ -1597,5 +1607,30 @@ mod no_plan_tests {
         });
         let err = r.expect_err("非无套餐的业务错误仍应报错，不得归一成 is_empty");
         assert!(!err.is_empty());
+    }
+
+    /// 额度条目必须带 entitlement_id：客户端日志的余额池只有 id 没有套餐归属，
+    /// 前端的「礼物优先」判定靠它把日志池映射到礼物/常规分类。
+    #[test]
+    fn balance_items_carry_entitlement_id() {
+        let balance = json!({
+            "code": 0, "data": {
+                "server_time": 1789910000,
+                "plans": [ { "plan_id": "p1", "name": "ZCode Start Plan", "status": "active",
+                             "entitlements": [ { "entitlement_id": "ent1", "show_name": "GLM-5.3-Flash", "meter": "model_usage", "grant_units": 100 } ] } ],
+                "balances": [ { "plan_id": "p1", "entitlement_id": "ent1", "show_name": "GLM-5.3-Flash",
+                                 "total_units": 100, "used_units": 0, "remaining_units": 100 } ]
+            }
+        });
+        let ov = normalize_balance(&balance);
+        let all: Vec<&QuotaItem> = ov.plans.iter().flat_map(|p| p.items.iter()).collect();
+        assert!(
+            all.iter().any(|i| i.entitlement_id.as_deref() == Some("ent1")),
+            "plans[].items 应携带 entitlement_id，实际: {all:?}"
+        );
+        assert!(
+            ov.items.iter().any(|i| i.entitlement_id.as_deref() == Some("ent1")),
+            "顶层 items 应携带 entitlement_id"
+        );
     }
 }

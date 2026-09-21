@@ -126,6 +126,9 @@ pub struct Settings {
     pub auto_switch_model: Option<String>,
     #[serde(default)]
     pub auto_switch_gift_first: Option<bool>,
+    /// 礼物优先顺序：auto(临期优先) | weekend | global
+    #[serde(default)]
+    pub auto_switch_gift_order: Option<String>,
     #[serde(default)]
     pub auto_switch_model_fallback: Option<bool>,
     #[serde(default)]
@@ -156,7 +159,14 @@ impl Settings {
             .filter(|s| !s.is_empty())
             .map(|s| s.chars().take(40).collect())
     }
-    pub fn auto_switch_gift_first(&self) -> bool { self.auto_switch_gift_first.unwrap_or(false) }
+    pub fn auto_switch_gift_first(&self) -> bool { self.auto_switch_gift_first.unwrap_or(true) }
+    /// auto=临期优先（越早过期越先烧）；weekend/global=指定礼物优先
+    pub fn auto_switch_gift_order(&self) -> String {
+        match self.auto_switch_gift_order.as_deref() {
+            Some("weekend") | Some("global") => self.auto_switch_gift_order.clone().unwrap(),
+            _ => "auto".into(),
+        }
+    }
     pub fn auto_switch_model_fallback(&self) -> bool { self.auto_switch_model_fallback.unwrap_or(false) }
     pub fn auth_proxy(&self) -> Option<&str> {
         if self.auth_proxy_on.unwrap_or(false) {
@@ -217,6 +227,7 @@ pub struct AppState {
     pub auto_switch_threshold: u32,
     pub auto_switch_model: Option<String>,
     pub auto_switch_gift_first: bool,
+    pub auto_switch_gift_order: String,
     pub auto_switch_model_fallback: bool,
     pub auth_proxy_on: bool,
     pub auth_proxy_url: Option<String>,
@@ -1849,6 +1860,7 @@ pub fn get_state(paths: &Paths) -> Result<AppState, String> {
         auto_switch_threshold: settings.auto_switch_threshold(),
         auto_switch_model: settings.auto_switch_model(),
         auto_switch_gift_first: settings.auto_switch_gift_first(),
+        auto_switch_gift_order: settings.auto_switch_gift_order(),
         auto_switch_model_fallback: settings.auto_switch_model_fallback(),
         auth_proxy_on: settings.auth_proxy_on.unwrap_or(false),
         auth_proxy_url: settings.auth_proxy_url.clone(),

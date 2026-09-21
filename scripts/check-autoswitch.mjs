@@ -5,6 +5,7 @@
 import {
   poolStats,
   poolStatsFromSignals,
+  giftFirstBasis,
   summarizePools,
   sampleFrom,
   pushSample,
@@ -361,6 +362,80 @@ const rt10 = rankTargets([cand("B", 90, { tokens: 4_000_000 }), cand("C", 50, { 
 eq(rt10.ranked[0].id, "C", "token 口径下 50%×4000万 优先于 90%×400万");
 const rt10b = rankTargets([cand("B", 90), cand("C", 50)], { threshold: 15 });
 eq(rt10b.ranked[0].id, "B", "无 token 时按 pct 排序（全序一致）");
+
+// ---------- 礼物优先（giftFirst）：礼物池口径判定 + 候选礼物层 + 礼物顺序 ----------
+
+// 11. 池统计的礼物/常规拆分（三套餐：Weekend + Global 礼物，Start 常规）
+const qGF = { data: {
+  plans: [
+    { gift: true,  name: "ZCode Weekend Build", expire: "2026-09-28 09:00", items: [ { name: "GLM-5.3-Flash", total: 200000, used: 0, remaining: 200000 } ] },
+    { gift: true,  name: "ZCode Global Build",  expire: "2026-09-21 09:00", items: [ { name: "GLM-5.3-Flash", total: 100000000, used: 94300000, remaining: 5700000 } ] },
+    { gift: false, name: "ZCode Start Plan",    expire: "2026-09-21 23:59", items: [ { name: "GLM-5.3-Flash", total: 5000000, used: 0, remaining: 5000000 }, { name: "GLM-5.3", total: 3000000, used: 0, remaining: 3000000 } ] },
+  ],
+}};
+const sGF = poolStats(qGF, "GLM-5.3-Flash");
+eq(sGF.giftTokens, 5900000, "礼物池聚合 token（Weekend+Global）");
+eq(sGF.regTokens, 5000000, "常规池聚合 token（仅 Start 的 Flash）");
+ok(Math.abs(sGF.giftPct - 100) < 0.01, `礼物口径 bestPct=Weekend 100%（实际 ${sGF.giftPct}）`);
+ok(sGF.giftKinds.includes("weekend") && sGF.giftKinds.includes("global"), "礼物细分含 weekend/global");
+ok(sGF.giftExpireMs != null && sGF.giftExpireMs < Date.parse("2026-09-21T23:59"), "礼物最早到期取 Global 09:00");
+
+// 11b. giftFirstBasis：礼物还有 → 礼物口径；礼物耗尽 → 回落常规；无拆分 → 透传
+const b11 = giftFirstBasis(sGF);
+eq(b11.basis, "gift", "礼物还有 → 礼物口径");
+eq(b11.tokens, 5900000, "礼物口径 token");
+const b11b = giftFirstBasis({ ...sGF, giftTokens: 0, giftPct: 0 });
+eq(b11b.basis, "reg", "礼物全部耗尽 → 回落常规口径");
+eq(b11b.tokens, 5000000, "常规口径 token");
+const b11c = giftFirstBasis({ bestPct: 80, totalTokens: 123 });
+eq(b11c.basis, "all", "无拆分 → 透传");
+eq(b11c.tokens, 123, "透传 token");
+
+// 11c. 日志信号路径：entitlement → 礼物映射（同名的池只能靠 id 分类）
+const sigGF = poolStatsFromSignals([
+  { entitlement_id: "w", show_name: "GLM-5.3-Flash", total: 200000, remaining: 200000 },
+  { entitlement_id: "g", show_name: "GLM-5.3-Flash", total: 100000000, remaining: 5700000 },
+  { entitlement_id: "s", show_name: "GLM-5.3-Flash", total: 5000000, remaining: 5000000 },
+], "GLM-5.3-Flash", { w: { gift: true, giftKind: "weekend", expireMs: 1 }, g: { gift: true, giftKind: "global", expireMs: 2 }, s: { gift: false, giftKind: null, expireMs: null } });
+eq(sigGF.giftTokens, 5900000, "日志池按 entitlement 分类礼物");
+eq(sigGF.regTokens, 5000000, "日志池常规分类");
+eq(sigGF.giftExpireMs, 1, "日志池礼物最早到期");
+
+// 11d. rankTargets：礼物候选插队（哪怕绝对量小）；礼物层内按顺序配置
+const rt11 = rankTargets([
+  cand("B", 100, { gift: false, tokens: 100_000_000 }),
+  cand("C", 100, { gift: true, tokens: 200_000 }),
+], { threshold: 15, giftOrder: "auto" });
+eq(rt11.ranked[0].id, "C", "礼物候选优先于纯 Start 大号（礼物先烧）");
+const rt11b = rankTargets([
+  cand("B", 100, { gift: true, tokens: 5_000_000, giftKinds: ["global"], giftExpireMs: 2000 }),
+  cand("C", 100, { gift: true, tokens: 200_000, giftKinds: ["weekend"], giftExpireMs: 1000 }),
+], { threshold: 15, giftOrder: "auto" });
+eq(rt11b.ranked[0].id, "C", "auto=越临期越先烧");
+const rt11c = rankTargets([
+  cand("B", 100, { gift: true, tokens: 5_000_000, giftKinds: ["global"] }),
+  cand("C", 100, { gift: true, tokens: 200_000, giftKinds: ["weekend"] }),
+], { threshold: 15, giftOrder: "weekend" });
+eq(rt11c.ranked[0].id, "C", "指定 weekend → Weekend 候选优先");
+const rt11d = rankTargets([
+  cand("B", 100, { gift: false, tokens: 5_000_000 }),
+  cand("C", 100, { gift: false, tokens: 100_000_000 }),
+], { threshold: 15, giftOrder: "auto" });
+eq(rt11d.ranked[0].id, "C", "礼物全没后按绝对余量切（Start 兜底）");
+
+// 11e. 礼物优先端到端：当前号 Global 只剩 5.7%（礼物口径），候选还有 1 亿礼物 → 触发切换
+const r11e = evaluate({ ...base,
+  cur: { pct: 5.7, tokens: 5_700_000, etaSec: 600, level: "low", ageMs: 1000, gift: true },
+  candidates: [cand("B", 100, { gift: true, tokens: 100_000_000, giftKinds: ["global"], giftExpireMs: 2000 })],
+  opts: { ...base.opts, giftOrder: "auto" },
+});
+eq(r11e.action, "switch", "礼物见底提前切（不被常规池 100% 掩盖）");
+const r11f = evaluate({ ...base,
+  cur: { pct: 100, tokens: 5_000_000, etaSec: null, level: "ok", ageMs: 1000 },
+  candidates: [cand("B", 100, { gift: false, tokens: 100_000_000 })],
+  opts: { ...base.opts, giftOrder: "auto" },
+});
+eq(r11f.action, "none", "礼物全没后按常规口径判定，健康就不动");
 
 if (failed) {
   console.error(`\n✗ 自动切换决策自检失败：${failed} 项（通过 ${passed}）`);

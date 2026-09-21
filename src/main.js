@@ -3,8 +3,8 @@ import { listen } from "@tauri-apps/api/event";
 import { esc, toast, openPwModal, openConfirmModal, openProviderModal, installDelegation, dismissSplash } from "./ui.js";
 import { ic } from "./icons.js";
 import { init, t, has, lang, localeTag, stripErr, errCode } from "./i18n.js";
-import { HEALTH_ORDER, healthOf, filterAccounts, sortAccounts, bucketAccounts, summarize, modelKeyMatch, quotaBarParts, planExpired, PENDING_WINDOW_MS } from "./list.js";
-import { AS_DEFAULTS, poolStats, poolStatsFromSignals, poolsRate, sampleFrom, pushSample, etaOf, evaluate, fmtEta } from "./autoswitch.js";
+import { HEALTH_ORDER, healthOf, filterAccounts, sortAccounts, bucketAccounts, summarize, modelKeyMatch, quotaBarParts, planExpired, PENDING_WINDOW_MS, entitlementGiftMap } from "./list.js";
+import { AS_DEFAULTS, poolStats, poolStatsFromSignals, poolsRate, sampleFrom, pushSample, etaOf, evaluate, fmtEta, giftFirstBasis } from "./autoswitch.js";
 
 const $app = document.getElementById("app");
 let state = null;
@@ -272,7 +272,9 @@ function logStats() {
       rate: null, etaSec: 0, at, planUnavailable: true,
     };
   }
-  const st = poolStatsFromSignals(pools, model);
+  // 礼物优先：日志池本身不带套餐归属，用 HTTP 数据里的 entitlement_id 映射分类
+  const entGift = giftFirstOn() ? entitlementGiftMap(acctQuota[activeAccount()?.id]) : null;
+  const st = poolStatsFromSignals(pools, model, entGift);
   if (!st) return null;
   // 烧速的前后两个快照必须同属一次登录：prev 早于最近一次切换 = 跨账号差分
   // （不同账号的同名 entitlement 拼一起会算出垃圾速率），宁可这轮不算
@@ -283,6 +285,11 @@ function logStats() {
   // ETA 用「该模型全部池的剩余之和 / 合计速率」：与 poolsRate 同口径，池变动（补发/过期）不会把速率算歪
   let etaSec = null;
   if (rate && st.totalTokens != null && st.totalTokens > 0 && rate.rate > 0) etaSec = st.totalTokens / rate.rate;
+  // 礼物优先：ETA 按礼物池口径（服务端先扣礼物，聚合烧速≈礼物烧速），
+  // 否则礼物见底时会被常规池的大分母拖住、切晚了
+  if (giftFirstOn() && st.giftTokens != null && st.giftTokens > 0 && rate && rate.rate > 0) {
+    etaSec = st.giftTokens / rate.rate;
+  }
   // plan 信号用自己的新鲜窗口：余额可信而 plan 是旧账号残留时不得触发
   return { ...st, rate, etaSec, at, planUnavailable: planSignalUsable() };
 }
@@ -518,6 +525,15 @@ function stAutoSwitchExtra() {
     <div class="tog-row">
       <div class="tog-info"><div class="tog-label">${t("st.giftFirst")}</div><div class="tog-desc">${t("st.giftFirstDesc")}</div></div>
       <button class="toggle${state?.auto_switch_gift_first ? " on" : ""}" role="switch" aria-checked="${!!state?.auto_switch_gift_first}" aria-label="${esc(t("st.giftFirst"))}" click="actions.stToggle('giftFirst')"><span class="knob"></span></button>
+    </div>
+    <div class="st-row">
+      <div class="st-lab">${t("st.giftOrder")}</div>
+      <div class="st-ctl">
+        <div class="lang-seg${state?.auto_switch_gift_first ? "" : " dim"}" role="radiogroup" aria-label="${esc(t("st.giftOrder"))}">
+          ${[["auto", "st.giftOrderAuto"], ["weekend", "st.giftOrderWeekend"], ["global", "st.giftOrderGlobal"]].map(([v, k]) =>
+            `<button class="lang-opt${giftOrderPref() === v ? " on" : ""}" role="radio" aria-checked="${giftOrderPref() === v}" click="actions.stGiftOrder('${v}')">${esc(t(k))}</button>`).join("")}
+        </div>
+      </div>
     </div>
     <div class="tog-row">
       <div class="tog-info"><div class="tog-label">${t("st.modelFallback")}</div><div class="tog-desc">${t("st.modelFallbackDesc")}</div></div>
@@ -1559,6 +1575,27 @@ const actions = {
       syncSettingsModal();
     } catch (e) {
       if (s) s[field] = prev;
+      render();
+      syncSettingsModal();
+      toast(stripErr(e), "err");
+    }
+  },
+
+  /** 礼物消耗顺序：auto=临期优先 / weekend=先 Weekend Build / global=先 Global Build */
+  async stGiftOrder(v) {
+    const order = v === "weekend" || v === "global" ? v : "auto";
+    const prev = state?.auto_switch_gift_order || "auto";
+    if (order === prev) return;
+    if (state) state.auto_switch_gift_order = order;
+    render();
+    syncSettingsModal();
+    try {
+      await invoke("set_behavior", { autoSwitchGiftOrder: order });
+      await refresh();
+      render();
+      syncSettingsModal();
+    } catch (e) {
+      if (state) state.auto_switch_gift_order = prev;
       render();
       syncSettingsModal();
       toast(stripErr(e), "err");
@@ -3034,27 +3071,47 @@ function enrollAccounts() {
 }
 function pokeAccount(id) { if (id) quotaDue[id] = Date.now(); }
 
-/** 套餐/礼物临期插队：尽快把快过期的额度用掉 */
-function giftSoon(id) {
-  return (acctQuota[id]?.data?.plans || []).some((p) => !planExpired(p) && expireInfo(p.expire)?.warn);
-}
 /** 「关注模型」与「全部池」两个口径的合并：返回用于判定的 pct、聚合剩余 token、是否已流转。
  *  tokens 与 pct 同口径：命中关注模型 → 该模型全部池剩余合计；未命中 → 全部池合计。
- *  跨账号比较用它当绝对量纲（百分比在「最宽池大小不同」的账号之间不可比）。 */
-function pctPair(focus, all) {
+ *  跨账号比较用它当绝对量纲（百分比在「最宽池大小不同」的账号之间不可比）。
+ *  gf=礼物优先：礼物池还有剩余时，pct/token/礼物细分都取礼物侧口径——
+ *  当前号礼物见底要提前切（而不是被常规池的 100% 掩盖），候选优先选还有礼物的号。 */
+function pctPair(focus, all, gf = false) {
   const fPct = focus?.matched ? focus.bestPct : null;
   const aPct = all?.bestPct ?? null;
   const flowed = !!(focus?.matched && (fPct ?? 0) <= 0 && (aPct ?? 0) > 0);
-  const pct = fPct != null && fPct > 0 ? fPct : aPct;
-  const tokens = focus?.matched
+  let pct = fPct != null && fPct > 0 ? fPct : aPct;
+  let tokens = focus?.matched
     ? (focus.totalTokens ?? null)
     : (all?.totalTokens ?? focus?.totalTokens ?? null);
-  return { pct, flowed, tokens };
+  let giftBasis = false;
+  let giftKinds = [];
+  let giftExpireMs = null;
+  if (gf) {
+    const b = giftFirstBasis(focus?.matched ? focus : (all ?? focus));
+    if (b) {
+      giftBasis = b.basis === "gift";
+      giftKinds = b.giftKinds ?? [];
+      giftExpireMs = b.giftExpireMs ?? null;
+      if (b.pct != null) pct = b.pct;
+      if (b.tokens != null) tokens = b.tokens;
+    }
+  }
+  return { pct, flowed, tokens, giftBasis, giftKinds, giftExpireMs };
 }
 /** 某账号的判定口径（API） */
-function pctPairOf(id, model = effectiveFocusModel()) {
+function pctPairOf(id, model = effectiveFocusModel(), gf = giftFirstOn()) {
   const q = acctQuota[id];
-  return pctPair(poolStats(q, model), poolStats(q, ""));
+  return pctPair(poolStats(q, model), poolStats(q, ""), gf);
+}
+/** 礼物优先开关（设置里「优先消耗礼物套餐」，默认开启） */
+function giftFirstOn() {
+  return !!state?.auto_switch_gift_first;
+}
+/** 礼物消耗顺序：auto=临期优先 / weekend / global */
+function giftOrderPref() {
+  const v = String(state?.auto_switch_gift_order || "auto");
+  return v === "weekend" || v === "global" ? v : "auto";
 }
 /** 数据过期 → 让 sweep 下一 tick 立刻重拉（节流，避免风控） */
 function forceRefresh(id) {
@@ -3129,9 +3186,10 @@ async function autoSwitchTick(manual = false) {
 
   // 当前账号：优先客户端日志（秒级），但与 HTTP 样本比「谁更新用谁」
   // —— 日志虽然普遍更早（活跃时 p50 15s），但忙时也可能 1-2 分钟才一条，那时 HTTP 快车道反而更新
+  const gf = giftFirstOn();
   const apFocus = poolStats(acctQuota[active.id], model);
   const apAll = poolStats(acctQuota[active.id], "");
-  const ap = pctPair(apFocus, apAll);
+  const ap = pctPair(apFocus, apAll, gf);
   const sampleAt = quotaSampleAt[active.id] || 0;
   const ageMs = sampleAt ? now - sampleAt : Infinity;
   const lgStrict = logStats();                       // 已按新鲜窗口过滤
@@ -3144,9 +3202,13 @@ async function autoSwitchTick(manual = false) {
   const hm = healthMapOf();
   let cur;
   if (lg) {
+    // 礼物优先：判定基准取礼物池（还有礼物时按礼物的 pct/token/ETA 判，
+    // 不被常规池的满血掩盖）；礼物耗尽自动回落常规口径
+    const b = gf ? giftFirstBasis(lg) : null;
+    const curPct = b && b.pct != null ? b.pct : lg.bestPct;
     cur = {
-      pct: lg.bestPct, etaSec: lg.etaSec, level: levelOf(lg.bestPct, thr),
-      tokens: lg.totalTokens ?? null,
+      pct: curPct, etaSec: lg.etaSec, level: levelOf(curPct, thr),
+      tokens: b && b.tokens != null ? b.tokens : (lg.totalTokens ?? null),
       ageMs: Math.max(0, now - (lg.at || now)), stale: false,
       planUnavailable: !!lg.planUnavailable, source: sampleSrc,
     };
@@ -3181,7 +3243,11 @@ async function autoSwitchTick(manual = false) {
     const cs = quotaSampleAt[a.id] || 0;
     cands.push({
       id: a.id, name: a.name, pct: pair.pct, tokens: pair.tokens ?? null, flowed: pair.flowed,
-      level: h?.level || "unknown", gift: giftSoon(a.id),
+      level: h?.level || "unknown",
+      // gift = 判定基准是礼物池（还留着礼物额度）→ 排序插队；礼物顺序按设置（auto=临期优先）
+      gift: pair.giftBasis,
+      giftKinds: pair.giftKinds ?? [],
+      giftExpireMs: pair.giftExpireMs ?? null,
       fallback: pair.flowed, modelMatched: !!h?.modelMatched,
       ageMs: cs ? now - cs : Infinity,
     });
@@ -3198,6 +3264,7 @@ async function autoSwitchTick(manual = false) {
       threshold: thr,
       marginSec: marginSec(),
       cooldownMs: AUTO_SWITCH_COOLDOWN_MS,
+      giftOrder: gf ? giftOrderPref() : "auto",
       avoid: [...recentFrom.keys()],
     },
   });
