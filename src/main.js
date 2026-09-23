@@ -179,6 +179,11 @@ let quotaForceAt = {};
 // 连续额度查询失败计数（成功清零）：无套餐 500 / 鉴权失效这类确定性故障下，
 // 样本永远刷不新，决策不能永远停在「先刷新」——连续失败按硬信号处理
 let quotaFailStreak = {};
+/** 连续失败 N 次后的重试间隔：6s 起指数退避，上限 30 分钟 */
+function failBackoffMs(streak) {
+  const shift = Math.min(Math.max((streak || 1) - 1, 0), 9);
+  return Math.min(6000 * (2 ** shift), 30 * 60 * 1000);
+}
 // 重活窗口里被要求「尽快重查」的账号（窗口结束后补一轮）
 const staleWant = new Set();
 // 最近切出过的账号（防 A→B→A 乒乓），10 分钟滚动
@@ -1180,8 +1185,9 @@ async function loadAcctQuota(id, opts = {}) {
     // 失败时也保留旧数据展示，错误信息进明细区；没旧数据才回落到错误态
     acctQuota[id] = { data: cur.data || null, err: stripErr(e), code: errCode(e), busy: false };
     quotaFailStreak[id] = (quotaFailStreak[id] || 0) + 1;
-    // 拉取失败（429/3012/网络）→ 下轮尽快重试，不卡在旧样本上
-    quotaDue[id] = Date.now() + 6000;
+    // 拉取失败（429/3012/网络）→ 指数退避（6s → 12s → 24s → …上限 30 分钟；成功清零），
+    // 持续失败的账号不再以 6s 频率轰炸接口；活跃号 hardDown 只需连续 2 次失败，仍可在 ~20s 内触发
+    quotaDue[id] = Date.now() + failBackoffMs(quotaFailStreak[id]);
   }
   if (!uiLocked()) render();
   // 任意账号的额度数据更新 → 立即跑一次切换判定（目标账号拿到额度/当前账号耗尽都能秒级反应）
@@ -3120,6 +3126,10 @@ const SWEEP_PERIOD = 5 * 60 * 1000;
 // 活跃账号的周期由 scheduleNext 按「剩余时间(ETA) / 阈值」自适应（5s–15s，不加抖动）；
 // 其余账号维持长周期长尾刷新
 const SWEEP_JITTER = 0.2;
+// 耗尽号（0 剩余/无套餐/全过期）的复查周期：无可消耗额度，长周期即可——
+// 周礼/Global Build 发放后一次刷新就会回到正常轮换；领取由 autoClaim 独立负责（每分钟轮询，与此无关）
+const SWEEP_PERIOD_DEAD = 90 * 60 * 1000;
+const SWEEP_JITTER_DEAD = 0.33;
 const SWEEP_BATCH = 3; // 每 tick 并发拉取上限（吞吐 0.375/s > 全库需求 0.17/s）
 const TICK_MS = 8000;
 let quotaDue = {};
@@ -3150,6 +3160,13 @@ function scheduleNext(id, base = Date.now()) {
   // 待激活（成功但空）：心跳补发后服务端可能马上就发套餐，90s 复查一次即可
   if (h?.level === "pending") {
     quotaDue[id] = base + 90 * 1000;
+    return;
+  }
+  // 耗尽号：大幅拉长复查周期（60-120 分钟）——几十个死号按 5 分钟刷是纯风控负担；
+  // 新礼物（周礼/Global Build）发放后下一次刷新即恢复 normal 轮换
+  if (h?.level === "dead") {
+    const j = 1 + (Math.random() * 2 - 1) * SWEEP_JITTER_DEAD;
+    quotaDue[id] = base + Math.round(SWEEP_PERIOD_DEAD * j);
     return;
   }
   const jitter = 1 + (Math.random() * 2 - 1) * SWEEP_JITTER;
