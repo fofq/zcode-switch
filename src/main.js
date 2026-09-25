@@ -1125,12 +1125,20 @@ function quotaPanelHtml(tot) {
       const parts = quotaBarParts(src.total > 0 ? (1 - src.remaining / src.total) * 100 : null);
       const bar = parts.segs.map((s) => `<i style="width:${s.width}%;background:${BAR_SEG_COLOR[s.kind]}"></i>`).join("");
       // 同账号的礼物/常规合并为一行；两类都有时拆分展示（数据来源一目了然）
-      const split = src.giftTotal > 0 || src.regTotal > 0
-        ? `<div class="qhd-split">${src.giftTotal > 0 ? `${esc(t("list.qhGift"))} ${esc(fmtTokens(src.giftRemaining))}/${esc(fmtTokens(src.giftTotal))}` : ""}${src.giftTotal > 0 && src.regTotal > 0 ? " · " : ""}${src.regTotal > 0 ? `${esc(t("list.qhReg"))} ${esc(fmtTokens(src.regRemaining))}/${esc(fmtTokens(src.regTotal))}` : ""}</div>`
+      // 拆分行只在「礼物+常规并存」时出现，且只显示剩余量（紧凑）；
+      // 单一类别的账号不重复说明；每类完整额度进 title
+      const hasBoth = src.giftTotal > 0 && src.regTotal > 0;
+      const detail = []
+        .concat(src.giftTotal > 0 ? [`${t("list.qhGift")} ${fmtTokens(src.giftRemaining)}/${fmtTokens(src.giftTotal)}`] : [])
+        .concat(src.regTotal > 0 ? [`${t("list.qhReg")} ${fmtTokens(src.regRemaining)}/${fmtTokens(src.regTotal)}`] : [])
+        .join(" · ");
+      const split = hasBoth
+        ? `<div class="qhd-split">${esc(t("list.qhGift"))}${esc(fmtTokens(src.giftRemaining))} · ${esc(t("list.qhReg"))}${esc(fmtTokens(src.regRemaining))}</div>`
         : "";
+      const numTitle = detail ? ` title="${esc(detail)}"` : "";
       return `<div class="qhd-row">
         <span class="qhd-acct" title="${esc(src.account)}">${esc(src.account)}</span>
-        <div class="qhd-num-wrap"><span class="qhd-num">${esc(fmtTokens(src.remaining))}/${esc(fmtTokens(src.total))}</span>${split}</div>
+        <div class="qhd-num-wrap"${numTitle}><span class="qhd-num">${esc(fmtTokens(src.remaining))}/${esc(fmtTokens(src.total))}</span>${split}</div>
         <span class="qhd-bar">${bar}</span>
         <span class="qhd-pct">${esc(parts.txt)}</span>
       </div>`;
@@ -3019,7 +3027,7 @@ function render(force = false) {
         <div class="row-actions">
           <span class="row-tools">
             <button class="icon-btn" title="${t("btn.copyKey")}" aria-label="${t("btn.copyKey")}" click="actions.copyApiKey('${a.id}')">${ic("copy", 15)}</button>
-            <button class="icon-btn${isFrozen(a.id) ? " on" : ""}" title="${isFrozen(a.id) ? t("btn.unfreeze") : t("btn.freeze")}" aria-label="${isFrozen(a.id) ? t("btn.unfreeze") : t("btn.freeze")}" click="actions.toggleFreeze('${a.id}')">${ic("lock", 15)}</button>
+            <button class="icon-btn${isFrozen(a.id) ? " on" : ""}" title="${isFrozen(a.id) ? t("btn.unfreeze") : t("btn.freeze")}" aria-label="${isFrozen(a.id) ? t("btn.unfreeze") : t("btn.freeze")}" click="actions.toggleFreeze('${a.id}')">${ic("snow", 15)}</button>
             <button class="icon-btn" title="${t("btn.refreshQuota")}" aria-label="${t("btn.refreshQuota")}" click="actions.acctQuota('${a.id}')">${ic("refresh", 15)}</button>
             <button class="icon-btn" title="${t("btn.rename")}" aria-label="${t("btn.rename")}" click="actions.rename('${a.id}')">${ic("pen", 15)}</button>
             <button class="icon-btn" title="${t("btn.export")}" aria-label="${t("btn.export")}" click="actions.exportOne('${a.id}')">${ic("export", 15)}</button>
