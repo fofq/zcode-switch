@@ -1274,6 +1274,10 @@ pub fn live_quota(paths: &Paths) -> Result<quota::QuotaOverview, String> {
     quota::quota_for_live(&paths.home, &creds, live_quota_config(paths).as_ref())
 }
 
+fn live_quota_config(paths: &Paths) -> Option<Value> {
+    if new_gen_provider_config(&paths.data_root) { None } else { read_live_config(paths) }
+}
+
 pub fn account_quota(paths: &Paths, id: &str) -> Result<quota::QuotaOverview, String> {
     let acc = load_account(paths, id)?;
     let (creds, config) = effective_snapshot(paths, &acc);

@@ -5,7 +5,7 @@
 // gift 不再是健康等级：它与 ok/low 是两个正交维度（有礼物 & 额度状态）。
 // 有礼物额度 = 正交筛选 chip（summarize.counts.gift / filterAccounts 特判）+ 行内徽标，
 // 否则 Weekend Build 全量发放后 gift 桶会吞掉额度充足组。
-export const HEALTH_ORDER = ["ok", "low", "flowed", "dead", "pending", "auth", "fail", "unknown"];
+export const HEALTH_ORDER = ["frozen", "ok", "low", "flowed", "dead", "pending", "auth", "fail", "unknown"];
 
 /** 剩余额度低于该百分比视为"紧张" */
 export const LOW_THRESHOLD = 20;
@@ -430,7 +430,7 @@ export function bucketAccounts(accounts, { localeTag = "zh-CN", healthLabel = ()
  * 合计：各健康度计数 + 平均剩余额度百分比（仅统计已拿到额度的账号，单位无关）。
  */
 export function summarize(accounts, healthMap) {
-  const counts = { "gift:weekend": 0, "gift:global": 0, ok: 0, low: 0, flowed: 0, dead: 0, pending: 0, auth: 0, fail: 0, unknown: 0 };
+  const counts = { "gift:weekend": 0, "gift:global": 0, frozen: 0, ok: 0, low: 0, flowed: 0, dead: 0, pending: 0, auth: 0, fail: 0, unknown: 0 };
   let pctSum = 0;
   let pctCount = 0;
   for (const a of accounts || []) {

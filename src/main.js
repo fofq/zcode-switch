@@ -507,6 +507,8 @@ function healthMapOf() {
         h = { ...h, remainingPct: pct, level: levelOf(pct, opts.threshold), modelMatched: true, modelName: lg.worstName || h.modelName, fromLog: true };
       }
     }
+    // 手动冻结的账号单独成组（即使有额度也不参与自动切换候选），组内仍显示真实额度
+    if (isFrozen(a.id)) h = { ...h, level: "frozen" };
     map.set(a.id, h);
   }
   return map;
@@ -1904,6 +1906,14 @@ const actions = {
     try { await invoke("open_external", { url: "https://github.com/pjpv/zcode-switch" }); }
     catch (e) { toast(stripErr(e), "err"); }
   },
+  /** 手动冻结/解冻：冻结的账号单独分组，绝不参与自动切换（手动切换不受影响） */
+  toggleFreeze(id) {
+    toggleFrozen(id);
+    render();
+    const name = accountName(id);
+    toast(t(isFrozen(id) ? "m.frozenToast" : "m.unfrozenToast", { name }), "ok", t("m.frozenDetail"));
+  },
+
   acctQuota(id) {
     const dueAt = quotaDue[id];
     loadAcctQuota(id).then(() => {
@@ -3009,6 +3019,7 @@ function render(force = false) {
         <div class="row-actions">
           <span class="row-tools">
             <button class="icon-btn" title="${t("btn.copyKey")}" aria-label="${t("btn.copyKey")}" click="actions.copyApiKey('${a.id}')">${ic("copy", 15)}</button>
+            <button class="icon-btn${isFrozen(a.id) ? " on" : ""}" title="${isFrozen(a.id) ? t("btn.unfreeze") : t("btn.freeze")}" aria-label="${isFrozen(a.id) ? t("btn.unfreeze") : t("btn.freeze")}" click="actions.toggleFreeze('${a.id}')">${ic("lock", 15)}</button>
             <button class="icon-btn" title="${t("btn.refreshQuota")}" aria-label="${t("btn.refreshQuota")}" click="actions.acctQuota('${a.id}')">${ic("refresh", 15)}</button>
             <button class="icon-btn" title="${t("btn.rename")}" aria-label="${t("btn.rename")}" click="actions.rename('${a.id}')">${ic("pen", 15)}</button>
             <button class="icon-btn" title="${t("btn.export")}" aria-label="${t("btn.export")}" click="actions.exportOne('${a.id}')">${ic("export", 15)}</button>
@@ -3234,6 +3245,22 @@ const SWEEP_JITTER_DEAD = 0.33;
 const SWEEP_CONCURRENCY = 4;   // 刷新并发上限
 const SWEEP_PUMP_MS = 1200;    // 泵间隔：请求起点之间至少错开 1.2s（略微间隔防突发），并行压缩总时长
 let sweepInFlight = 0;         // 当前在飞的刷新数（泵以此限流）
+// 手动冻结：被冻结的账号单独分组，即使有额度也不会被自动切换选中
+//（部分账号被风控标记后换 IP 也无法解除，用户手动停靠）。手动切换不受影响。
+const FROZEN_KEY = "zsw-frozen-ids";
+let frozenIds = (() => {
+  try { return new Set(JSON.parse(localStorage.getItem(FROZEN_KEY) || "[]")); }
+  catch { return new Set(); }
+})();
+function saveFrozen() {
+  try { localStorage.setItem(FROZEN_KEY, JSON.stringify([...frozenIds])); } catch { /* 忽略 */ }
+}
+function isFrozen(id) { return frozenIds.has(id); }
+function toggleFrozen(id) {
+  if (frozenIds.has(id)) frozenIds.delete(id); else frozenIds.add(id);
+  saveFrozen();
+}
+
 // 额度状态持久化：重启不丢「上次已知额度/烧速样本」，启动按优先级补刷而不是全量同时打接口
 const QUOTA_CACHE_KEY = "zsw-quota-cache-v1";
 let quotaCacheDirty = false;
@@ -3508,6 +3535,8 @@ async function autoSwitchTick(manual = false) {
     if (a.id === active.id) continue;
     const h = hm.get(a.id);
     if (h && (h.level === "auth" || h.level === "fail")) continue;
+    // 手动冻结的账号绝不作为自动切换目标（即使有额度）；手动切换不受影响
+    if (isFrozen(a.id)) continue;
     // 最近一次额度查询失败（业务码500无套餐/鉴权/限流）：旧数据不得作为切换依据，
     // 否则会顶着过期前缓存的高百分比被选中/通过预校验；等下次成功拉到数据再回池
     if (acctQuota[a.id]?.err) continue;
