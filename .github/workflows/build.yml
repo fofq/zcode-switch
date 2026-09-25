@@ -19,12 +19,18 @@ jobs:
     name: Build Windows artifacts
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v5
         with:
           node-version: 20
           cache: npm
+
+      # tauri-cli 每次构建都会重新下载 NSIS 工具链（~1 分钟）：缓存它
+      - uses: actions/cache@v4
+        with:
+          path: ~/AppData/Local/tauri
+          key: tauri-cli-nsis-${{ runner.os }}
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -61,7 +67,7 @@ jobs:
           (cd out && sha256sum * > checksums.txt)
           ls -l out
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v5
         with:
           name: zcode-switch-windows-x64
           path: out/*

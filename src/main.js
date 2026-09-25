@@ -3,7 +3,7 @@ import { listen } from "@tauri-apps/api/event";
 import { esc, toast, openPwModal, openConfirmModal, openProviderModal, installDelegation, dismissSplash } from "./ui.js";
 import { ic } from "./icons.js";
 import { init, t, has, lang, localeTag, stripErr, errCode } from "./i18n.js";
-import { HEALTH_ORDER, healthOf, filterAccounts, sortAccounts, bucketAccounts, summarize, modelKeyMatch, quotaBarParts, planExpired, PENDING_WINDOW_MS, entitlementGiftMap } from "./list.js";
+import { HEALTH_ORDER, healthOf, filterAccounts, sortAccounts, bucketAccounts, summarize, modelKeyMatch, quotaBarParts, planExpired, planIsGift, PENDING_WINDOW_MS, entitlementGiftMap } from "./list.js";
 import { AS_DEFAULTS, poolStats, poolStatsFromSignals, poolsRate, sampleFrom, pushSample, etaOf, evaluate, fmtEta, giftFirstBasis } from "./autoswitch.js";
 
 const $app = document.getElementById("app");
@@ -204,6 +204,24 @@ function asAuditLast() {
   return asAudit.length ? asAudit[asAudit.length - 1] : null;
 }
 
+// ---- 热切连击（X-Device-Mid 隔离提醒）----
+// 客户端 deviceMid 进程内单次读取：热切链上所有账号的客户端 billing 请求都带最初号的
+// 设备身份，直到一次冷切换恢复隔离（工具自身查询用每号独立 mid，不受影响）
+const HOT_STREAK_KEY = "zsw-hot-streak";
+let hotStreak = Number(localStorage.getItem(HOT_STREAK_KEY) || 0) || 0;
+function noteHotSwitch() {
+  hotStreak++;
+  try { localStorage.setItem(HOT_STREAK_KEY, String(hotStreak)); } catch { /* 忽略 */ }
+  if (hotStreak >= 12 && hotStreak % 12 === 0) {
+    toast(t("m.hotStreakToast", { n: hotStreak }), "warn", t("m.hotStreakDetail"));
+  }
+}
+function resetHotStreak() {
+  if (hotStreak === 0) return;
+  hotStreak = 0;
+  try { localStorage.setItem(HOT_STREAK_KEY, "0"); } catch { /* 忽略 */ }
+}
+
 // ---- 热切后验与后置检查（docs/hot-switch-hardening.md）----
 // 后验：客户端日志出现「切换之后」的余额行且池签名变化 = 新号已生效；
 // 签名相同 = 弱确认（两个号池恰好同值）；超时无新行 = unknown（客户端空闲没查余额，不代表失败）。
@@ -402,6 +420,7 @@ function autoSwitchTitle(s) {
   const eta = st?.etaSec ?? apiEta(activeAccount()?.id);
   if (eta != null && eta <= 3600) bits.push(t("as.eta", { eta: fmtEta(eta) }));
   bits.push(signalsTrusted() ? t("as.srcLog", { age: Math.max(1, Math.round(poolsAgeMs() / 1000)) }) : t("as.srcApi"));
+  if (hotStreak >= 6) bits.push(t("as.hotStreak", { n: hotStreak }));
   if (autoSwitchRunning) bits.push(t("as.switching"));
   else if (autoSwitchNote) bits.push(autoSwitchNote);
   if (s?.zcode_running && !s?.hot_switch) bits.push(t("as.needHot"));
@@ -999,16 +1018,36 @@ function quotaTotals() {
     const q = acctQuota[a.id];
     if (!q?.data || q.busy || q.err) continue;
     accounts++;
+    // 每账号每模型聚合一行（此前礼物/常规池各占一行，同账号重复出现两次）；
+    // 过期套餐的池不可用，不计入（上一期耗尽的 Global Build 会虚增总量）
+    const byModel = new Map();
     for (const p of q.data.plans || []) {
+      if (planExpired(p)) continue;
+      const gift = planIsGift(p);
       for (const it of p.items || []) {
         if (itemKind(it) !== "raw") continue;
         const name = String(it.name || "?");
-        const agg = per.get(name) || { name, remaining: 0, total: 0, sources: [] };
-        agg.remaining += it.remaining ?? 0;
-        agg.total += it.total ?? 0;
-        agg.sources.push({ account: a.name, remaining: it.remaining ?? 0, total: it.total ?? 0 });
-        per.set(name, agg);
+        let acc = byModel.get(name);
+        if (!acc) {
+          acc = { remaining: 0, total: 0, giftRemaining: 0, giftTotal: 0, regRemaining: 0, regTotal: 0 };
+          byModel.set(name, acc);
+        }
+        acc.remaining += it.remaining ?? 0;
+        acc.total += it.total ?? 0;
+        if (gift) { acc.giftRemaining += it.remaining ?? 0; acc.giftTotal += it.total ?? 0; }
+        else { acc.regRemaining += it.remaining ?? 0; acc.regTotal += it.total ?? 0; }
       }
+    }
+    for (const [name, acc] of byModel) {
+      const agg = per.get(name) || { name, remaining: 0, total: 0, sources: [] };
+      agg.remaining += acc.remaining;
+      agg.total += acc.total;
+      agg.sources.push({
+        account: a.name, remaining: acc.remaining, total: acc.total,
+        giftRemaining: acc.giftRemaining, giftTotal: acc.giftTotal,
+        regRemaining: acc.regRemaining, regTotal: acc.regTotal,
+      });
+      per.set(name, agg);
     }
   }
   const models = [...per.values()].sort((x, y) => y.remaining - x.remaining);
@@ -1039,15 +1078,42 @@ function modelColor(name) {
   return MODEL_COLORS[h % MODEL_COLORS.length];
 }
 
+function quotaUsageHtml(u) {
+  if (!u) return `<div class="qh-empty">${esc(t("list.qhUsageLoading"))}</div>`;
+  if (u.db_missing || (!u.today.length && !u.week.length)) return `<div class="qh-empty">${esc(t("list.qhUsageEmpty"))}</div>`;
+  const rows = u.week.map((w) => {
+    const t0 = u.today.find((x) => x.model === w.model);
+    return `<div class="qhd-row">
+      <span class="qhd-acct" title="${esc(w.model)}">${esc(w.model)}</span>
+      <div class="qhd-num-wrap"><span class="qhd-num">${esc(fmtTokens(t0?.total || 0))}</span><span class="qhd-split">${esc(t("list.qhUsageReq", { n: (t0?.requests || 0) }))}</span></div>
+      <span class="qhd-bar"></span>
+      <span class="qhd-pct">${esc(fmtTokens(w.total))}</span>
+    </div>`;
+  }).join("");
+  return `<div class="qhd-sec-head">
+      <span class="qhd-model">${esc(t("list.qhUsageTodaySum", { n: u.today_requests, v: fmtTokens(u.today_total) }))}</span>
+      <span class="qhd-sum">${esc(t("list.qhUsageWeekSum", { v: fmtTokens(u.week_total) }))}</span>
+    </div>
+    <div class="qhd-thead"><span>${esc(t("list.qhUsageModel"))}</span><span>${esc(t("list.qhUsageToday"))}</span><span></span><span>${esc(t("list.qhUsageWeek"))}</span></div>
+    ${rows}
+    <div class="qhd-split" style="margin-top:8px">${esc(t("list.qhUsageNote"))}</div>`;
+}
+
 function quotaPanelHtml(tot) {
   if (!ui.qhOpen || !tot) return "";
-  // Tab 切换模型：账号多时不用滚动很久才能看到另一个模型
-  const activeTab = tot.models.some((x) => x.name === ui.qhTab) ? ui.qhTab : (tot.focus?.name || tot.models[0]?.name || "");
-  const tabs = tot.models.map((m) => {
-    const on = m.name === activeTab;
-    return `<button class="qhd-tab${on ? " on" : ""}" style="color:${modelColor(m.name)}" click="actions.setQhTab('${esc(m.name)}')">${esc(m.name)}</button>`;
-  }).join("");
+  // Tab 切换模型：账号多时不用滚动很久才能看到另一个模型；「真实用量」为独立 Tab
+  const usageTab = "__usage__";
+  const activeTab = ui.qhTab === usageTab || tot.models.some((x) => x.name === ui.qhTab)
+    ? ui.qhTab
+    : (tot.focus?.name || tot.models[0]?.name || "");
+  const tabs = [
+    `<button class="qhd-tab${activeTab === usageTab ? " on" : ""}" click="actions.setQhTab('${usageTab}')">${esc(t("list.qhUsageTab"))}</button>`,
+    ...tot.models.map((m) => `<button class="qhd-tab${m.name === activeTab ? " on" : ""}" style="color:${modelColor(m.name)}" click="actions.setQhTab('${esc(m.name)}')">${esc(m.name)}</button>`),
+  ].join("");
   let body = "";
+  if (activeTab === usageTab) {
+    body = quotaUsageHtml(usageData);
+  } else {
   const x = tot.models.find((m) => m.name === activeTab);
   if (x) {
     // 面板百分比同样以“剩余”为基准（对齐官方），红段=已用、黄/绿段=剩余
@@ -1056,9 +1122,13 @@ function quotaPanelHtml(tot) {
       // 与行内额度条同一套语义：剩余绿（紧张红）锚左、已用黄从右往左生长
       const parts = quotaBarParts(src.total > 0 ? (1 - src.remaining / src.total) * 100 : null);
       const bar = parts.segs.map((s) => `<i style="width:${s.width}%;background:${BAR_SEG_COLOR[s.kind]}"></i>`).join("");
+      // 同账号的礼物/常规合并为一行；两类都有时拆分展示（数据来源一目了然）
+      const split = src.giftTotal > 0 || src.regTotal > 0
+        ? `<div class="qhd-split">${src.giftTotal > 0 ? `${esc(t("list.qhGift"))} ${esc(fmtTokens(src.giftRemaining))}/${esc(fmtTokens(src.giftTotal))}` : ""}${src.giftTotal > 0 && src.regTotal > 0 ? " · " : ""}${src.regTotal > 0 ? `${esc(t("list.qhReg"))} ${esc(fmtTokens(src.regRemaining))}/${esc(fmtTokens(src.regTotal))}` : ""}</div>`
+        : "";
       return `<div class="qhd-row">
         <span class="qhd-acct" title="${esc(src.account)}">${esc(src.account)}</span>
-        <span class="qhd-num">${esc(fmtTokens(src.remaining))}/${esc(fmtTokens(src.total))}</span>
+        <div class="qhd-num-wrap"><span class="qhd-num">${esc(fmtTokens(src.remaining))}/${esc(fmtTokens(src.total))}</span>${split}</div>
         <span class="qhd-bar">${bar}</span>
         <span class="qhd-pct">${esc(parts.txt)}</span>
       </div>`;
@@ -1071,6 +1141,7 @@ function quotaPanelHtml(tot) {
       ${rows}`;
   } else {
     body = `<div class="qh-empty">${esc(t("list.qhEmpty"))}</div>`;
+  }
   }
   return `<div class="qh-panel" data-qh-pop>
     <div class="qh-head">
@@ -1546,8 +1617,9 @@ const actions = {
       if (r.launched) bits.push(t("m.bitLaunched"));
       if (r.config_stale) bits.push(t("m.bitConfigStale"));
       toast(t("m.toastSwitched", { name: r.name }), r.config_stale ? "warn" : "ok", bits.join(t("common.listSep")));
-      // 同 doSwitch：手动冷切也要作废切换前的日志信号
+      // 同 doSwitch：手动冷切也要作废切换前的日志信号；客户端重启 = 设备身份恢复隔离
       lastAutoSwitchAt = Date.now();
+      resetHotStreak();
       ui.expanded.delete(id);
       await refresh();
       if (!uiLocked()) render();
@@ -1574,6 +1646,7 @@ const actions = {
         // 手动切换同样要作废切换前的日志信号（旧账号余额不得拿来判新账号）
         // 并进入短保护窗，否则最长 3 分钟内决策都拿着上一个账号的快照
         lastAutoSwitchAt = Date.now();
+        if (r?.hot) noteHotSwitch();
       }
       ui.expanded.delete(id);
       await refresh(); render();
@@ -1820,6 +1893,7 @@ const actions = {
       const parts = [];
       if (report.added.length) parts.push(t("s.importAdded", { count: report.added.length, names: report.added.join(t("common.listSep")) }));
       if (report.skipped.length) parts.push(t("s.importSkipped", { count: report.skipped.length }));
+      if (report.provider_config_restored) parts.push(t("s.importProvRestored"));
       if (report.errors.length) parts.push(t("s.importFailed", { count: report.errors.length }));
       toast(parts[0], report.errors.length ? "err" : "ok", parts.slice(1).join(t("common.listSep")));
     }
@@ -2641,6 +2715,18 @@ function giftBtnHtml(claimableCount) {
 
 let quotaModalEl = null;
 let qhOnKey = null;
+// 真实用量（ZCode CLI 本地库，请求完成后落库）：打开面板时读取
+let usageData = null;
+let usageLoading = false;
+async function loadUsageStats() {
+  if (usageLoading) return;
+  usageLoading = true;
+  try {
+    usageData = await invoke("usage_stats", { days: 7 });
+  } catch { usageData = null; }
+  usageLoading = false;
+  if (ui.qhOpen) refreshQuotaModal();
+}
 
 function closeQuotaModal() {
   if (quotaModalEl) { quotaModalEl.remove(); quotaModalEl = null; }
@@ -2659,6 +2745,7 @@ function openQuotaModal() {
   mask.innerHTML = quotaPanelHtml(quotaTotals());
   document.body.appendChild(mask);
   quotaModalEl = mask;
+  loadUsageStats();
   const close = () => { closeQuotaModal(); render(); };
   qhOnKey = (e) => { if (e.key === "Escape") close(); };
   document.addEventListener("keydown", qhOnKey);
@@ -3554,7 +3641,7 @@ async function doAutoSwitch(d, active, cur, lg) {
       });
       await refresh();
       pokeAccount(best.id);
-      if (r?.hot) scheduleHotFollowUp(best.id);
+      if (r?.hot) { scheduleHotFollowUp(best.id); noteHotSwitch(); }
     } catch (e) {
       // 失败也计一次冷却：只当“抑制器”（否则 ETA 触发会每轮重试），不阻塞后续成功路径
       lastAutoSwitchAt = Date.now();

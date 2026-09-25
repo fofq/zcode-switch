@@ -25,6 +25,8 @@ chrono = "0.4"
 aes-gcm = "0.10"
 base64 = "0.22"
 pbkdf2 = { version = "0.12", default-features = false, features = ["hmac"] }
+# 真实用量统计：只读访问 ZCode CLI 的本地 sqlite（~/.zcode/cli/db/db.sqlite）
+rusqlite = { version = "0.32", features = ["bundled"] }
 ureq = { version = "2", features = ["json"] }
 sys-locale = "0.3"
 # 2API 本地服务：axum 监听 + tokio 流式管道

@@ -1853,5 +1853,7 @@ select.two-input { cursor: pointer; }
 .qhd-bar > i { display: block; height: 100%; }
 .qhd-tab { opacity: .55; }
 .qhd-tab.on { opacity: 1; background: rgba(255, 255, 255, .06); border-color: rgba(255, 255, 255, .18); }
+.qhd-num-wrap { display: flex; flex-direction: column; align-items: flex-end; gap: 2px; }
+.qhd-split { font-size: 11px; color: var(--ink-dim); line-height: 1.3; white-space: nowrap; }
 .qhd-pct { text-align: right; font-variant-numeric: tabular-nums; color: #8a90a0; }
 .qh-pop .ms-bar { height: 10px; border-radius: 5px; }

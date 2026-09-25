@@ -3,6 +3,7 @@ pub mod cli;
 pub mod i18n;
 pub mod twoapi;
 mod claim;
+mod usage;
 mod flowlog;
 mod oauth;
 mod quota;
@@ -192,6 +193,15 @@ async fn update_account_from_live(app: AppHandle, id: String) -> Result<Account,
     let r = store::update_account_from_live(&Paths::detect(), &id);
     rebuild_tray(&app);
     r
+}
+
+/// 真实用量统计：只读访问 ZCode CLI 本地库（请求完成后落库），不写不加锁
+#[tauri::command]
+async fn usage_stats(days: Option<u32>) -> Result<usage::UsageStats, String> {
+    let days = days.unwrap_or(7).clamp(1, 30);
+    tauri::async_runtime::spawn_blocking(move || usage::usage_stats(&Paths::detect().home, days))
+        .await
+        .map_err(|e| format!("内部任务失败: {e}"))?
 }
 
 /// 热切换后置检查：前端在热切成功后约 8s 调用（凭据复核/二次对齐/重物化）。
@@ -1173,7 +1183,7 @@ async fn export_pick_path(app: AppHandle, id: String) -> Result<serde_json::Valu
 #[tauri::command]
 async fn export_finalize(path: String, id: String, password: String) -> Result<serde_json::Value, String> {
     let acc = load_account(&Paths::detect(), &id)?;
-    let payload = store::export_bundle_value(std::slice::from_ref(&acc));
+    let payload = store::export_bundle_value(std::slice::from_ref(&acc), false);
     // 密码留空 = 明文导出（用户明确选择，前端有明文警告）
     let sealed = if password.trim().is_empty() {
         cipher::seal_plain(&payload, cipher::FORMAT_BUNDLE)
@@ -1210,7 +1220,7 @@ async fn export_all_finalize(path: String, password: String) -> Result<serde_jso
     if accounts.is_empty() {
         return Err(i18n::tr("err.export.empty_short"));
     }
-    let payload = store::export_bundle_value(&accounts);
+    let payload = store::export_bundle_value(&accounts, true);
     let sealed = if password.trim().is_empty() {
         cipher::seal_plain(&payload, cipher::FORMAT_BUNDLE)
     } else {
@@ -1353,6 +1363,7 @@ pub fn run() {
             delete_account,
             update_account_from_live,
             hot_switch_post_check,
+            usage_stats,
             switch_to,
             get_live_quota,
             get_account_quota,

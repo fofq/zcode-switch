@@ -258,6 +258,9 @@ pub struct ImportReport {
     pub added: Vec<String>,
     pub skipped: Vec<String>,
     pub errors: Vec<String>,
+    /// 捆绑包附带的全局「自定义模型源/中转」配置是否已恢复
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub provider_config_restored: bool,
 }
 
 pub fn now_ts() -> String {
@@ -739,6 +742,9 @@ fn sync_live_back_to_source(paths: &Paths, accounts: &[Account]) -> Result<(), S
 }
 
 fn reset_live_plan_cache(paths: &Paths) {
+    // ZCode v3.14.3 源码证实：coding-plan-cache.json 已无任何读写方（仅存储清理目录
+    // 把它列为可清理工具输出），删除它不影响客户端——切后请求停顿的真因是客户端自身的
+    // entitlement 刷新失败退避（30/60/120/300s）。保留删除动作作为旧版本客户端的保险。
     let p = paths.live_plan_cache();
     if p.exists() {
         if let Err(e) = fs::remove_file(&p) {
@@ -1731,7 +1737,17 @@ fn adopt_virtual_arms_uid(paths: &Paths, acc: &mut Account) -> Result<(), String
     save_account(paths, acc)
 }
 
-pub fn export_bundle_value(accounts: &[Account]) -> Value {
+pub fn export_bundle_value(accounts: &[Account], include_global: bool) -> Value {
+    // include_global=true（全量导出）时附带 provider_config.json——全局的「自定义模型源/中转」
+    // 存储（与账号无关），属于用户手动配置的资产：一并备份，避免 ZCode 重装/文件损坏时
+    // 中转配置全丢。单号导出不带全局段（导入单号不应覆盖当前全局中转配置）。
+    let provider_config = if include_global {
+        fs::read_to_string(paths_live_provider_config_std())
+            .ok()
+            .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+    } else {
+        None
+    };
     json!({
         "format": "zcode-accounts-bundle",
         "version": 2,
@@ -1743,7 +1759,12 @@ pub fn export_bundle_value(accounts: &[Account]) -> Value {
             "config": a.config,
             "group": a.group.clone().map(|g| json!(g)),
         })).collect::<Vec<_>>(),
+        "providerConfig": provider_config,
     })
+}
+
+fn paths_live_provider_config_std() -> std::path::PathBuf {
+    Paths::detect().home.join(".zcode").join("v2").join("provider_config.json")
 }
 
 type ImportCandidate = (Option<String>, Value, Option<Value>, Option<String>);

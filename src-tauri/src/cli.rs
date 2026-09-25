@@ -319,7 +319,7 @@ pub fn run(args: &[String]) -> (String, i32) {
             };
             match load_account(&paths, &id) {
                 Ok(a) => {
-                    let payload = export_bundle_value(std::slice::from_ref(&a));
+                    let payload = export_bundle_value(std::slice::from_ref(&a), false);
                     match crate::cipher::seal(&payload, &password, crate::cipher::FORMAT_BUNDLE) {
                         Ok(sealed) => match serde_json::to_string_pretty(&sealed) {
                             Ok(body) => match atomic_write(std::path::Path::new(&out_path), &(body + "\n")) {
@@ -341,7 +341,7 @@ pub fn run(args: &[String]) -> (String, i32) {
             let Some(password) = resolve_password(rest) else {
                 return (err(&crate::i18n::tr("cli.pw_hint")), 2);
             };
-            match list_accounts(&paths).map(|a| export_bundle_value(&a)) {
+            match list_accounts(&paths).map(|a| export_bundle_value(&a, true)) {
                 Ok(payload) => match crate::cipher::seal(&payload, &password, crate::cipher::FORMAT_BUNDLE) {
                     Ok(sealed) => match atomic_write(std::path::Path::new(&out_path), &(serde_json::to_string_pretty(&sealed).unwrap() + "\n")) {
                         Ok(()) => ok(json!({ "out": out_path, "encrypted": true })),
