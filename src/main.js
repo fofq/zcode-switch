@@ -3130,7 +3130,7 @@ const SWEEP_JITTER = 0.2;
 // 周礼/Global Build 发放后一次刷新就会回到正常轮换；领取由 autoClaim 独立负责（每分钟轮询，与此无关）
 const SWEEP_PERIOD_DEAD = 90 * 60 * 1000;
 const SWEEP_JITTER_DEAD = 0.33;
-const SWEEP_BATCH = 3; // 每 tick 并发拉取上限（吞吐 0.375/s > 全库需求 0.17/s）
+const SWEEP_BATCH = 4; // 每 tick 并发拉取上限（吞吐 0.5/s；70+ 账号 × 5min 需求 ~0.23/s，留出失败重试余量）
 const TICK_MS = 8000;
 let quotaDue = {};
 let ticking = false;
@@ -3236,9 +3236,11 @@ function forceRefresh(id) {
   quotaDue[id] = now;
   asAuditPush("refresh", { id, reason: "stale" });
 }
-/** 全库刷新 / 领取 / 资格刷新正在进行：这些窗口里额度接口本来就很挤 */
+/** 大规模压额度/资格接口的窗口。注意：autoClaim/claimAll 用的是领取接口而非额度接口，
+ *  且 autoClaim 的循环几乎常驻——把它们算进来会让重活窗口≈永远为真，
+ *  直接饿死切换的预校验（09-25 实测 43 次 preflight-fail 全部 tried=0） */
 function heavyWindow() {
-  return !!(quotaSweep.running || refreshClaim.running || claimAllRunning || autoClaimRunning || claimActive);
+  return !!(quotaSweep.running || refreshClaim.running);
 }
 /** 把重活窗口里记下的「待补刷」账号排进去（限量，避免窗口一结束就一次冲 50 个） */
 function drainStaleWant(max = 3) {
@@ -3411,7 +3413,8 @@ async function doAutoSwitch(d, active, cur, lg) {
     let preflights = 0;
     for (const c of d.ranked || []) {
       if (c.ageMs > ageLimit) {
-        if (heavy || preflights >= AS_DEFAULTS.maxPreflight) continue;
+        // 重活窗口也保底 1 次预校验（只够榜首）：彻底禁用会让切换在窗口期完全饿死
+        if (preflights >= (heavy ? 1 : AS_DEFAULTS.maxPreflight)) continue;
         preflights++;
         await loadAcctQuota(c.id, { force: true, quick: true });
         // 本次刷新仍失败（网络/风控/业务码500无套餐）→ 该候选视为不可用。
