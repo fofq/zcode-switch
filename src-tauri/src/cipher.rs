@@ -70,3 +70,20 @@ pub fn open(envelope: &Value, password: &str) -> Result<Value, String> {
 pub fn is_sealed(v: &Value) -> bool {
     v.get("kdf").is_some() && v.get("cipher").is_some()
 }
+
+/// 明文信封：不加密导出（用户明确选择无密码时使用）。
+/// payload 平铺在 "payload" 键下，格式标识与加密信封一致以便导入端统一校验。
+pub fn seal_plain(payload: &Value, format: &str) -> Value {
+    json!({ "format": format, "version": 1, "plain": true, "payload": payload })
+}
+
+pub fn is_plain(v: &Value) -> bool {
+    v.get("plain").and_then(|x| x.as_bool()) == Some(true) && v.get("payload").is_some()
+}
+
+pub fn open_plain(envelope: &Value) -> Result<Value, String> {
+    envelope
+        .get("payload")
+        .cloned()
+        .ok_or_else(|| crate::i18n::tr("err.cipher.no_payload"))
+}

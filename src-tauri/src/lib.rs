@@ -1174,7 +1174,12 @@ async fn export_pick_path(app: AppHandle, id: String) -> Result<serde_json::Valu
 async fn export_finalize(path: String, id: String, password: String) -> Result<serde_json::Value, String> {
     let acc = load_account(&Paths::detect(), &id)?;
     let payload = store::export_bundle_value(std::slice::from_ref(&acc));
-    let sealed = cipher::seal(&payload, &password, cipher::FORMAT_BUNDLE)?;
+    // 密码留空 = 明文导出（用户明确选择，前端有明文警告）
+    let sealed = if password.trim().is_empty() {
+        cipher::seal_plain(&payload, cipher::FORMAT_BUNDLE)
+    } else {
+        cipher::seal(&payload, &password, cipher::FORMAT_BUNDLE)?
+    };
     let body = serde_json::to_string_pretty(&sealed).unwrap() + "\n";
     store::atomic_write(std::path::Path::new(&path), &body).map_err(|e| i18n::trf("err.write", &[("e", &e.to_string())]))?;
     Ok(json!({ "saved": true, "path": path }))
@@ -1206,7 +1211,11 @@ async fn export_all_finalize(path: String, password: String) -> Result<serde_jso
         return Err(i18n::tr("err.export.empty_short"));
     }
     let payload = store::export_bundle_value(&accounts);
-    let sealed = cipher::seal(&payload, &password, cipher::FORMAT_BUNDLE)?;
+    let sealed = if password.trim().is_empty() {
+        cipher::seal_plain(&payload, cipher::FORMAT_BUNDLE)
+    } else {
+        cipher::seal(&payload, &password, cipher::FORMAT_BUNDLE)?
+    };
     let body = serde_json::to_string_pretty(&sealed).unwrap() + "\n";
     store::atomic_write(std::path::Path::new(&path), &body).map_err(|e| i18n::trf("err.write", &[("e", &e.to_string())]))?;
     Ok(json!({ "saved": true, "path": path, "count": accounts.len() }))
@@ -1242,7 +1251,7 @@ async fn import_pick_files(app: AppHandle) -> Result<serde_json::Value, String> 
         };
         match serde_json::from_str::<Value>(&raw) {
             Ok(v) => {
-                if !cipher::is_sealed(&v) {
+                if !cipher::is_sealed(&v) && !cipher::is_plain(&v) {
                     errors.push(i18n::trf("err.import.not_sealed", &[("fname", fname.as_str())]));
                 } else if v.get("format").and_then(|f| f.as_str()) != Some(cipher::FORMAT_BUNDLE) {
                     errors.push(i18n::trf("err.import.not_bundle", &[("fname", fname.as_str())]));
@@ -1253,7 +1262,8 @@ async fn import_pick_files(app: AppHandle) -> Result<serde_json::Value, String> 
             Err(e) => errors.push(i18n::trf("err.import.json", &[("fname", fname.as_str()), ("e", &e.to_string())])),
         }
     }
-    Ok(json!({ "picked": true, "sealed": sealed, "errors": errors }))
+    let plain_count = sealed.iter().filter(|(_, v)| cipher::is_plain(v)).count();
+    Ok(json!({ "picked": true, "sealed": sealed, "plainCount": plain_count, "errors": errors }))
 }
 
 #[tauri::command]
@@ -1262,7 +1272,9 @@ async fn import_sealed(app: AppHandle, files: Vec<(String, Value)>, password: St
     let mut decrypted = vec![];
     let mut errors = vec![];
     for (fname, v) in files {
-        match cipher::open(&v, &password) {
+        // 明文信封不需要密码；加密信封用调用方给的密码解开
+        let opened = if cipher::is_plain(&v) { cipher::open_plain(&v) } else { cipher::open(&v, &password) };
+        match opened {
             Ok(payload) => decrypted.push((fname, payload)),
             Err(e) => errors.push(i18n::trf("err.import.wrap", &[("fname", fname.as_str()), ("e", &e)])),
         }
