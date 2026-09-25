@@ -121,7 +121,12 @@ pub fn set_app_handle(app: tauri::AppHandle) {
 }
 
 pub fn log_dir(home: &Path) -> PathBuf {
-    home.join(".zcode").join("v2").join("logs")
+    // 日志目录跟随 ZCode 的数据根（dataBaseDir 自定义后日志随之移动），
+    // 与 credentials/config 等 v2 数据文件同一基座
+    crate::store::resolve_data_root(home)
+        .join(".zcode")
+        .join("v2")
+        .join("logs")
 }
 
 /// 目录里最新的 .log 文件 + 长度（按修改时间取，天然兼容日期滚动与多进程日志）

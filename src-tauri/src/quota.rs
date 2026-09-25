@@ -46,7 +46,11 @@ pub(crate) fn device_mid() -> Option<String> {
         std::env::var("USERPROFILE").ok().map(std::path::PathBuf::from),
         std::env::var("HOME").ok().map(std::path::PathBuf::from),
     );
-    let p = home.join(".zcode").join("v2").join("telemetry-state.json");
+    // telemetry-state.json 落在 ZCode 的数据根下（dataBaseDir），不是 home 根
+    let p = crate::store::resolve_data_root(&home)
+        .join(".zcode")
+        .join("v2")
+        .join("telemetry-state.json");
     std::fs::read_to_string(p)
         .ok()
         .and_then(|s| serde_json::from_str::<Value>(&s).ok())
@@ -308,7 +312,21 @@ fn coding_plan_api_keys(config: Option<&Value>) -> Vec<String> {
     keys
 }
 
-pub fn candidate_tokens(creds: &Value, config: Option<&Value>, secret: &str) -> Vec<String> {
+/// 新代际客户端把个人 coding-plan 的 API key 存在 credentials.json 的
+/// account-provider:*:api-key 键里（config.json 已是遗留物），从这里提取。
+fn coding_plan_keys_from_creds(creds: &Value, secret: &str) -> Vec<String> {
+    let Some(map) = creds.as_object() else { return vec![] };
+    let mut out: Vec<String> = vec![];
+    for (k, v) in map {
+        if !k.starts_with("account-provider:") || !k.ends_with(":api-key") { continue; }
+        if !k.contains("coding-plan") { continue; }
+        let Some(p) = v.as_str().and_then(|v| safe_decrypt(Some(v), secret)) else { continue };
+        if looks_like_token(&p) && !out.contains(&p) { out.push(p); }
+    }
+    out
+}
+
+pub fn candidate_tokens(creds: &Value, config: Option<&Value>, secret: &str, new_gen: bool) -> Vec<String> {
     let mut tokens: Vec<String> = vec![];
     let add = |plain: Option<String>, tokens: &mut Vec<String>| {
         if let Some(p) = plain {
@@ -317,6 +335,12 @@ pub fn candidate_tokens(creds: &Value, config: Option<&Value>, secret: &str) -> 
             }
         }
     };
+    let creds_keys = coding_plan_keys_from_creds(creds, secret);
+    if new_gen {
+        for k in &creds_keys {
+            add(Some(k.clone()), &mut tokens);
+        }
+    }
     for k in coding_plan_api_keys(config) {
         tokens.push(k);
     }
@@ -339,6 +363,11 @@ pub fn candidate_tokens(creds: &Value, config: Option<&Value>, secret: &str) -> 
             map.and_then(|m| m.get(&key)).and_then(|v| v.as_str()).and_then(|v| safe_decrypt(Some(v), secret)),
             &mut tokens,
         );
+    }
+    if !new_gen {
+        for k in creds_keys {
+            add(Some(k), &mut tokens);
+        }
     }
     tokens
 }
@@ -585,8 +614,20 @@ pub(crate) fn zai_billing_token(creds: &Value, config: Option<&Value>, secret: &
     None
 }
 
-fn pick_channels(creds: &Value, config: Option<&Value>, secret: &str) -> Vec<Channel> {
+pub(crate) fn pick_channels(creds: &Value, config: Option<&Value>, secret: &str, new_gen: bool) -> Vec<Channel> {
     let mut chans: Vec<Channel> = vec![];
+    if new_gen {
+        for k in coding_plan_keys_from_creds(creds, secret) {
+            if !chans.contains(&Channel::Monitor(k.clone())) {
+                chans.push(Channel::Monitor(k));
+            }
+        }
+        if let Some(t) = zai_billing_token(creds, config, secret) {
+            if !chans.contains(&Channel::ZaiBilling(t.clone())) {
+                chans.push(Channel::ZaiBilling(t));
+            }
+        }
+    }
     let providers = match config.and_then(|c| c.get("provider")).and_then(|p| p.as_object()) {
         Some(p) => p,
         None => return chans,
@@ -827,13 +868,14 @@ fn quota_for(
     snapshot: bool,
 ) -> Result<QuotaOverview, String> {
     let secret = zcrypto::default_secret(home);
-    let channels = pick_channels(creds, config, &secret);
+    let new_gen = crate::store::new_gen_provider_config(&crate::store::resolve_data_root(home));
+    let channels = pick_channels(creds, config, &secret, new_gen);
     if !channels.is_empty() {
         if let Ok(ov) = query_channels(&channels, mid) {
             return Ok(mark_snapshot_empty(ov, snapshot));
         }
     }
-    let tokens = candidate_tokens(creds, config, &secret);
+    let tokens = candidate_tokens(creds, config, &secret, new_gen);
     query_quota(&tokens, mid).map(|ov| mark_snapshot_empty(ov, snapshot))
 }
 

@@ -41,7 +41,56 @@ fn detached(mut c: std::process::Command) -> std::process::Command {
 }
 
 pub struct Paths {
+    /// 用户主目录（%USERPROFILE%）。enc:v1 的密钥与 .zcode-switch 账号库都基于它，不能改。
     pub home: PathBuf,
+    /// ZCode 的数据根：取自 <home>/.zcode/v2/setting.json 的 dataBaseDir，未自定义时等于 home。
+    /// ZCode 把 credentials.json / config.json / telemetry-state.json / coding-plan-cache.json
+    /// 放在 <data_root>/.zcode/v2/ 下；而 setting.json 自身恒在 home 下。
+    pub data_root: PathBuf,
+}
+
+fn abs_env_path(name: &str) -> Option<PathBuf> {
+    let raw = std::env::var(name).ok()?;
+    let t = raw.trim();
+    if t.is_empty() {
+        return None;
+    }
+    let p = PathBuf::from(t);
+    p.is_absolute().then_some(p)
+}
+
+/// 读取 bootstrap 配置 <home>/.zcode/v2/setting.json 里的 dataBaseDir。
+fn bootstrap_data_base_dir(home: &Path) -> Option<PathBuf> {
+    fs::read_to_string(home.join(".zcode").join("v2").join("setting.json"))
+        .ok()
+        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+        .and_then(|v| v.get("dataBaseDir").and_then(|d| d.as_str()).map(|s| s.trim().to_string()))
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from)
+        .filter(|d| d.is_absolute())
+}
+
+/// 解析 ZCode 的数据根目录。优先级刻意与 ZCode 主进程保持一致：
+///
+/// `getDataBaseDir() = setting.json.dataBaseDir || env.ZCODE_DATA_BASE_DIR || homedir()`
+///
+/// 数据文件一律落在 `<dataBaseDir>/.zcode/v2/` 下，只有 setting.json 自身恒在 home 下。
+/// 两者一旦不一致，zcode-switch 就会去写 home 下的僵尸副本 ——
+/// 界面显示"切换成功"，ZCode 里账号却纹丝不动（用户把「数据目录」改到别的盘后就会这样）。
+/// 因此这里对 setting.json 的值不做"目录是否存在"的猜测，取到就用，保证不会与 ZCode 分叉。
+///
+/// `ZCODE_SWITCH_DATA_ROOT` 是最高优先级的显式覆盖，供排查/测试使用。
+pub(crate) fn resolve_data_root(home: &Path) -> PathBuf {
+    if let Some(d) = abs_env_path("ZCODE_SWITCH_DATA_ROOT") {
+        return d;
+    }
+    if let Some(d) = bootstrap_data_base_dir(home) {
+        return d;
+    }
+    if let Some(d) = abs_env_path("ZCODE_DATA_BASE_DIR") {
+        return d;
+    }
+    home.to_path_buf()
 }
 
 pub(crate) fn pick_home(zswitch: Option<PathBuf>, userprofile: Option<PathBuf>, home_env: Option<PathBuf>) -> PathBuf {
@@ -58,17 +107,22 @@ impl Paths {
             std::env::var("USERPROFILE").ok().map(PathBuf::from),
             std::env::var("HOME").ok().map(PathBuf::from),
         );
-        Paths { home }
+        let data_root = resolve_data_root(&home);
+        Paths { home, data_root }
     }
+
+    /// ZCode 的实际数据根：<data_root>/.zcode
+    pub fn zcode_dir(&self) -> PathBuf { self.data_root.join(".zcode") }
 
     pub fn store_dir(&self) -> PathBuf { self.home.join(".zcode-switch") }
     pub fn accounts_dir(&self) -> PathBuf { self.store_dir().join("accounts") }
     pub fn settings_file(&self) -> PathBuf { self.store_dir().join("settings.json") }
-    pub fn live_file(&self) -> PathBuf { self.home.join(".zcode").join("v2").join("credentials.json") }
-    pub fn live_config(&self) -> PathBuf { self.home.join(".zcode").join("v2").join("config.json") }
-    pub fn live_telemetry(&self) -> PathBuf { self.home.join(".zcode").join("v2").join("telemetry-state.json") }
+    pub fn live_file(&self) -> PathBuf { self.zcode_dir().join("v2").join("credentials.json") }
+    pub fn live_config(&self) -> PathBuf { self.zcode_dir().join("v2").join("config.json") }
+    pub fn live_telemetry(&self) -> PathBuf { self.zcode_dir().join("v2").join("telemetry-state.json") }
+    /// setting.json 是 bootstrap 文件（里面存着 dataBaseDir 本身），ZCode 永远从 home 根读它。
     pub fn live_setting(&self) -> PathBuf { self.home.join(".zcode").join("v2").join("setting.json") }
-    pub fn live_plan_cache(&self) -> PathBuf { self.home.join(".zcode").join("v2").join("coding-plan-cache.json") }
+    pub fn live_plan_cache(&self) -> PathBuf { self.zcode_dir().join("v2").join("coding-plan-cache.json") }
 
     pub fn ensure_dirs(&self) -> Result<(), String> {
         fs::create_dir_all(self.accounts_dir()).map_err(|e| trf("err.store.mk_accounts_dir", &[("e", &e.to_string())]))?;
@@ -319,6 +373,16 @@ pub fn read_live(paths: &Paths) -> Result<Option<Value>, String> {
         return Err(tr("err.store.not_object"));
     }
     Ok(Some(v))
+}
+
+/// provider_config.json 存在 = 新代际客户端（v3.14.x）：模型源/中转在该文件里，
+/// config.json 是一次性导入的遗留物——写入与重物化都应跳过，额度 token 源改走凭据。
+pub(crate) fn new_gen_provider_config(data_root: &Path) -> bool {
+    data_root.join(".zcode").join("v2").join("provider_config.json").exists()
+}
+
+fn snapshot_config_from_live(paths: &Paths) -> Option<Value> {
+    if new_gen_provider_config(&paths.data_root) { None } else { read_live_config(paths) }
 }
 
 pub fn read_live_config(paths: &Paths) -> Option<Value> {
@@ -688,7 +752,7 @@ fn auto_preserve(paths: &Paths, accounts: &[Account], target_hash: &str) -> Resu
         updated_at: ts,
         hash,
         credentials: live,
-        config: read_live_config(paths),
+        config: snapshot_config_from_live(paths),
         virtual_device_mid: None,
         virtual_arms_uid: None,
         group: None,
@@ -727,7 +791,8 @@ fn sync_live_back_to_source(paths: &Paths, accounts: &[Account]) -> Result<(), S
         src.hash = live_hash;
         changed = true;
     }
-    if src.config.is_some() {
+    // 新代际（provider_config.json 在）下 config.json 是遗留物，不同步
+    if !new_gen_provider_config(&paths.data_root) && src.config.is_some() {
         let cfg = read_live_config(paths);
         if cfg.is_some() && cfg != src.config {
             src.config = cfg;
@@ -789,8 +854,10 @@ fn rematerialize_wiped_builtins(paths: &Paths, target: &Account) {
             .map(|k| k.as_str().map(str::trim).unwrap_or("").is_empty())
             .unwrap_or(true)
             || (cur.get("enabled").and_then(|e| e.as_bool()) == Some(false)
-                && cur.get("systemDisabledReason").and_then(|s| s.as_str())
-                    == Some("oauth_provider_inactive"))
+                && matches!(
+                    cur.get("systemDisabledReason").and_then(|s| s.as_str()),
+                    Some("oauth_provider_inactive") | Some("coding_plan_auth_failed")
+                ))
     };
     let family_prefix = format!("builtin:{provider}");
 
@@ -881,7 +948,9 @@ pub fn hot_switch_post_check(paths: &Paths, target: &Account) -> Result<Value, S
         }
     }
     out["realigned"] = json!(realigned);
-    rematerialize_wiped_builtins(paths, target);
+    if !new_gen_provider_config(&paths.data_root) {
+        rematerialize_wiped_builtins(paths, target);
+    }
     Ok(out)
 }
 
@@ -995,12 +1064,18 @@ pub fn switch_to(paths: &Paths, id: &str, force: bool, restart: bool, hot: bool)
     let creds = inject_relay_pass_hash(&target.credentials, current_relay_pass(paths).as_ref());
     write_live(paths, &creds)?;
     backfill_relay_pass_hash(paths, &target.id, &creds);
-    if let Some(cfg) = &target.config {
-        write_live_config(paths, cfg)?;
+    // 新代际（provider_config.json 在）：config.json 是一次性导入的遗留物，不写不重物化
+    let new_gen = new_gen_provider_config(&paths.data_root);
+    if !new_gen {
+        if let Some(cfg) = &target.config {
+            write_live_config(paths, cfg)?;
+        }
     }
     reset_live_plan_cache(paths);
     align_family_domain(paths, &target);
-    rematerialize_wiped_builtins(paths, &target);
+    if !new_gen {
+        rematerialize_wiped_builtins(paths, &target);
+    }
     let mid = ensure_virtual_device_mid_locked(paths, &target.id)?;
     write_live_device_mid(paths, &mid)?;
     let uid = ensure_virtual_arms_uid_locked(paths, &target.id)?;
@@ -1074,10 +1149,12 @@ fn hot_swap_verified(paths: &Paths, target: &Account, creds: &Value) -> Result<(
             continue;
         }
         if let Some(cfg) = &target.config {
-            if let Err(e) = write_live_config(paths, cfg) {
-                last_err = Some(trf("err.write_config", &[("e", &e)]));
-                backoff(attempt);
-                continue;
+            if !new_gen_provider_config(&paths.data_root) {
+                if let Err(e) = write_live_config(paths, cfg) {
+                    last_err = Some(trf("err.write_config", &[("e", &e)]));
+                    backoff(attempt);
+                    continue;
+                }
             }
         }
         if let Ok(Some(v)) = read_live(paths) {
@@ -1194,7 +1271,7 @@ pub fn live_quota(paths: &Paths) -> Result<quota::QuotaOverview, String> {
     if !is_logged_in(&creds) {
         return Err(tr("err.live.quota"));
     }
-    quota::quota_for_live(&paths.home, &creds, read_live_config(paths).as_ref())
+    quota::quota_for_live(&paths.home, &creds, live_quota_config(paths).as_ref())
 }
 
 pub fn account_quota(paths: &Paths, id: &str) -> Result<quota::QuotaOverview, String> {
@@ -1219,7 +1296,7 @@ fn effective_snapshot(paths: &Paths, acc: &Account) -> (Value, Option<Value>) {
                 }
             };
             if same {
-                return (live, read_live_config(paths));
+                return (live, if new_gen_provider_config(&paths.data_root) { None } else { read_live_config(paths) });
             }
         }
     }
@@ -1764,7 +1841,10 @@ pub fn export_bundle_value(accounts: &[Account], include_global: bool) -> Value 
 }
 
 fn paths_live_provider_config_std() -> std::path::PathBuf {
-    Paths::detect().home.join(".zcode").join("v2").join("provider_config.json")
+    resolve_data_root(&Paths::detect().home)
+        .join(".zcode")
+        .join("v2")
+        .join("provider_config.json")
 }
 
 type ImportCandidate = (Option<String>, Value, Option<Value>, Option<String>);
