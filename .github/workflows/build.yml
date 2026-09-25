@@ -37,6 +37,10 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: src-tauri
+          # 跨分支共享同一份热缓存（否则新分支首建=全量冷编译）+ 失败也保存
+          #（此前失败连锁导致缓存从未保存，每次构建都冷编译依赖）
+          shared-key: windows-build
+          cache-on-failure: true
 
       - name: Install frontend deps
         run: npm ci
