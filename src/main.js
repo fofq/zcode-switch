@@ -6,6 +6,12 @@ import { init, t, has, lang, localeTag, stripErr, errCode } from "./i18n.js";
 import { HEALTH_ORDER, healthOf, filterAccounts, sortAccounts, bucketAccounts, summarize, modelKeyMatch, quotaBarParts, planExpired, planIsGift, PENDING_WINDOW_MS, entitlementGiftMap } from "./list.js";
 import { AS_DEFAULTS, poolStats, poolStatsFromSignals, poolsRate, sampleFrom, pushSample, etaOf, evaluate, fmtEta, giftFirstBasis } from "./autoswitch.js";
 
+// 纯浏览器预览：无 Tauri 后端（普通浏览器开 dev server）时注入 mock IPC 再继续启动；
+// 生产构建里 import.meta.env.DEV 为 false，整段会被剔除，Tauri 真机零影响
+if (import.meta.env.DEV && !("__TAURI_INTERNALS__" in window)) {
+  await import("./mock/tauri-mock.js");
+}
+
 const $app = document.getElementById("app");
 let state = null;
 let renaming = null;
@@ -1041,9 +1047,10 @@ function quotaTotals() {
       }
     }
     for (const [name, acc] of byModel) {
-      const agg = per.get(name) || { name, remaining: 0, total: 0, sources: [] };
+      const agg = per.get(name) || { name, remaining: 0, total: 0, giftRemaining: 0, sources: [] };
       agg.remaining += acc.remaining;
       agg.total += acc.total;
+      agg.giftRemaining += acc.giftRemaining;
       agg.sources.push({
         account: a.name, remaining: acc.remaining, total: acc.total,
         giftRemaining: acc.giftRemaining, giftTotal: acc.giftTotal,
@@ -1080,79 +1087,158 @@ function modelColor(name) {
   return MODEL_COLORS[h % MODEL_COLORS.length];
 }
 
-function quotaUsageHtml(u) {
-  if (!u) return `<div class="qh-empty">${esc(t("list.qhUsageLoading"))}</div>`;
-  if (u.db_missing || (!u.today.length && !u.week.length)) return `<div class="qh-empty">${esc(t("list.qhUsageEmpty"))}</div>`;
-  const rows = u.week.map((w) => {
-    const t0 = u.today.find((x) => x.model === w.model);
-    return `<div class="qhd-row">
-      <span class="qhd-acct" title="${esc(w.model)}">${esc(w.model)}</span>
-      <div class="qhd-num-wrap"><span class="qhd-num">${esc(fmtTokens(t0?.total || 0))}</span><span class="qhd-split">${esc(t("list.qhUsageReq", { n: (t0?.requests || 0) }))}</span></div>
-      <span class="qhd-bar"></span>
-      <span class="qhd-pct">${esc(fmtTokens(w.total))}</span>
+// 统计页 Tab：额度池（按模型汇总） / 用量趋势（CLI 本地库真实用量）
+const QH_TAB_POOLS = "__pools__";
+const QH_TAB_USAGE = "__usage__";
+// 额度池 Tab 里被展开（看按账号拆分）的模型
+const qhExpanded = new Set();
+
+/** KPI 行：关注模型剩余 / 全模型剩余 / 今日消耗 / 7 天消耗（数字等宽字体，来源不同分色） */
+function quotaKpisHtml(tot) {
+  const f = tot.focus;
+  const u = usageData;
+  const dayAvg = u ? Math.round(u.week_total / 7) : null;
+  const val = (v) => (v == null ? "…" : esc(fmtTokens(v)));
+  const card = (label, value, sub) => `
+    <div class="qhp-kpi">
+      <span class="qhp-kpi-label">${esc(label)}</span>
+      <span class="qhp-kpi-val">${value}</span>
+      <span class="qhp-kpi-sub">${esc(sub)}</span>
     </div>`;
-  }).join("");
-  return `<div class="qhd-sec-head">
-      <span class="qhd-model">${esc(t("list.qhUsageTodaySum", { n: u.today_requests, v: fmtTokens(u.today_total) }))}</span>
-      <span class="qhd-sum">${esc(t("list.qhUsageWeekSum", { v: fmtTokens(u.week_total) }))}</span>
-    </div>
-    <div class="qhd-thead"><span>${esc(t("list.qhUsageModel"))}</span><span>${esc(t("list.qhUsageToday"))}</span><span></span><span>${esc(t("list.qhUsageWeek"))}</span></div>
-    ${rows}
-    <div class="qhd-split" style="margin-top:8px">${esc(t("list.qhUsageNote"))}</div>`;
+  return `<div class="qhp-kpis">
+    ${card(t("list.qhpKpiFocus"), f ? val(f.remaining) : "—", f ? f.name : t("list.qhpKpiFocusNone"))}
+    ${card(t("list.qhpKpiAll"), val(tot.all.remaining), t("list.qhpKpiAllSub", { n: tot.models.length }))}
+    ${card(t("list.qhpKpiToday"), u ? val(u.today_total) : "…", u ? t("list.qhpKpiTodaySub", { n: u.today_requests }) : t("list.qhUsageLoading"))}
+    ${card(t("list.qhpKpiWeek"), u ? val(u.week_total) : "…", u ? t("list.qhpKpiWeekSub", { v: fmtTokens(dayAvg) }) : t("list.qhUsageLoading"))}
+  </div>`;
 }
 
-function quotaPanelHtml(tot) {
-  if (!ui.qhOpen || !tot) return "";
-  // Tab 切换模型：账号多时不用滚动很久才能看到另一个模型；「真实用量」为独立 Tab
-  const usageTab = "__usage__";
-  const activeTab = ui.qhTab === usageTab || tot.models.some((x) => x.name === ui.qhTab)
-    ? ui.qhTab
-    : (tot.focus?.name || tot.models[0]?.name || "");
-  const tabs = [
-    `<button class="qhd-tab${activeTab === usageTab ? " on" : ""}" click="actions.setQhTab('${usageTab}')">${esc(t("list.qhUsageTab"))}</button>`,
-    ...tot.models.map((m) => `<button class="qhd-tab${m.name === activeTab ? " on" : ""}" style="color:${modelColor(m.name)}" click="actions.setQhTab('${esc(m.name)}')">${esc(m.name)}</button>`),
-  ].join("");
-  let body = "";
-  if (activeTab === usageTab) {
-    body = quotaUsageHtml(usageData);
-  } else {
-  const x = tot.models.find((m) => m.name === activeTab);
-  if (x) {
-    // 面板百分比同样以“剩余”为基准（对齐官方），红段=已用、黄/绿段=剩余
-    const pct = x.total > 0 ? Math.max(0, Math.min(100, Math.round((x.remaining / x.total) * 100))) : 0;
-    const rows = x.sources.map((src) => {
-      // 与行内额度条同一套语义：剩余绿（紧张红）锚左、已用黄从右往左生长
-      const parts = quotaBarParts(src.total > 0 ? (1 - src.remaining / src.total) * 100 : null);
-      const bar = parts.segs.map((s) => `<i style="width:${s.width}%;background:${BAR_SEG_COLOR[s.kind]}"></i>`).join("");
-      // 同账号的礼物/常规合并为一行；两类都有时拆分展示（数据来源一目了然）
-      // 拆分行只在「礼物+常规并存」时出现，且只显示剩余量（紧凑）；
-      // 单一类别的账号不重复说明；每类完整额度进 title
-      const hasBoth = src.giftTotal > 0 && src.regTotal > 0;
+/** 额度池 Tab：每模型一行「礼/常堆叠」水平条 + 直接标注（点击行展开按账号拆分） */
+function poolsTabHtml(tot) {
+  if (!tot.models.length) return `<div class="qh-empty">${esc(t("list.qhEmpty"))}</div>`;
+  const legend = `<div class="qhp-legend">
+    <span><i class="sw-gift" style="background:var(--ink-mute)"></i>${esc(t("list.qhpLegendGift"))}</span>
+    <span><i style="background:var(--ink-mute)"></i>${esc(t("list.qhpLegendReg"))}</span>
+    <span><i style="background:rgba(255,255,255,.07)"></i>${esc(t("list.qhpLegendUsed"))}</span>
+  </div>`;
+  const rows = tot.models.map((m) => {
+    const color = modelColor(m.name);
+    const remPct = m.total > 0 ? Math.max(0, Math.min(100, (m.remaining / m.total) * 100)) : 0;
+    // 剩余内部再按 礼物/常规 拆两段（同色系，礼物为半透明）
+    const giftPct = m.remaining > 0 ? Math.max(0, Math.min(remPct, (m.giftRemaining / m.total) * 100)) : 0;
+    const regPct = Math.max(0, remPct - giftPct);
+    const open = qhExpanded.has(m.name);
+    const srcs = m.sources.map((src) => {
+      const pct = src.total > 0 ? Math.max(0, Math.min(100, (src.remaining / src.total) * 100)) : 0;
       const detail = []
         .concat(src.giftTotal > 0 ? [`${t("list.qhGift")} ${fmtTokens(src.giftRemaining)}/${fmtTokens(src.giftTotal)}`] : [])
         .concat(src.regTotal > 0 ? [`${t("list.qhReg")} ${fmtTokens(src.regRemaining)}/${fmtTokens(src.regTotal)}`] : [])
         .join(" · ");
-      const split = hasBoth
-        ? `<div class="qhd-split">${esc(t("list.qhGift"))}${esc(fmtTokens(src.giftRemaining))} · ${esc(t("list.qhReg"))}${esc(fmtTokens(src.regRemaining))}</div>`
-        : "";
-      const numTitle = detail ? ` title="${esc(detail)}"` : "";
-      return `<div class="qhd-row">
-        <span class="qhd-acct" title="${esc(src.account)}">${esc(src.account)}</span>
-        <div class="qhd-num-wrap"${numTitle}><span class="qhd-num">${esc(fmtTokens(src.remaining))}/${esc(fmtTokens(src.total))}</span>${split}</div>
-        <span class="qhd-bar">${bar}</span>
-        <span class="qhd-pct">${esc(parts.txt)}</span>
+      return `<div class="qhp-arow" title="${esc(detail)}">
+        <span class="qhp-aname">${esc(src.account)}</span>
+        <span class="qhp-atrack"><i style="width:${pct}%;background:${color}"></i></span>
+        <span class="qhp-aval">${esc(fmtTokens(src.remaining))}<span class="of">/${esc(fmtTokens(src.total))}</span></span>
       </div>`;
     }).join("");
-    body = `<div class="qhd-sec-head">
-        <span class="qhd-model" style="color:${modelColor(x.name)}">${esc(x.name)}</span>
-        <span class="qhd-sum">${esc(fmtTokens(x.remaining))}/${esc(fmtTokens(x.total))} · ${pct}%</span>
-      </div>
-      <div class="qhd-thead"><span>${t("list.qhColAcct")}</span><span>${t("list.qhColLeft")}</span><span></span><span>${t("list.qhColUsed")}</span></div>
-      ${rows}`;
-  } else {
-    body = `<div class="qh-empty">${esc(t("list.qhEmpty"))}</div>`;
+    return `<div class="qhp-mrow${open ? " open" : ""}">
+      <button class="qhp-mhead" aria-expanded="${open}" click="actions.toggleQhModel('${esc(m.name)}')">
+        <span class="qhp-mname" style="color:${color}">${esc(m.name)}<span class="qhp-chev">${ic("chevDown", 11)}</span></span>
+        <span class="qhp-mtrack">
+          ${giftPct > 0 ? `<i class="gift" style="width:${giftPct}%;background:${color}"></i>` : ""}
+          ${regPct > 0 ? `<i class="reg" style="width:${regPct}%;background:${color}"></i>` : ""}
+        </span>
+        <span class="qhp-mval">${esc(fmtTokens(m.remaining))}<span class="of">/${esc(fmtTokens(m.total))}</span></span>
+        <span class="qhp-mpct">${Math.round(remPct)}%</span>
+      </button>
+      ${open && srcs ? `<div class="qhp-arows">${srcs}</div>` : ""}
+    </div>`;
+  }).join("");
+  return `<div class="qhp-sec">${esc(t("list.qhpSecPools"))}</div>${legend}${rows}
+    <div class="qhp-hint">${esc(t("list.qhpExpandHint"))}</div>`;
+}
+
+/** y 轴取整到「好看」的刻度（1/1.2/1.5/2/2.5/3/4/5/6/8/10 × 10^k） */
+function niceCeil(v) {
+  if (!(v > 0)) return 1;
+  const p = 10 ** Math.floor(Math.log10(v));
+  for (const m of [1, 1.2, 1.5, 2, 2.5, 3, 4, 5, 6, 8, 10]) {
+    if (m * p >= v) return m * p;
   }
-  }
+  return 10 * p;
+}
+
+/** 近 7 天用量堆叠柱状图（手绘 SVG，FT/Economist 风格：少网格、直接标注、今天高亮） */
+function trendChartHtml(daily) {
+  if (!Array.isArray(daily) || !daily.length) return `<div class="qh-empty">${esc(t("list.qhpNoDaily"))}</div>`;
+  const W = 640, H = 208;
+  const padL = 50, padR = 6, padT = 10, padB = 24;
+  const iw = W - padL - padR, ih = H - padT - padB;
+  const days = daily.slice(-8);
+  const totals = days.map((d) => (d.models || []).reduce((s, m) => s + (m.total || 0), 0) || d.total || 0);
+  const maxV = niceCeil(Math.max(...totals, 1));
+  const y = (v) => padT + ih - (v / maxV) * ih;
+  const n = days.length;
+  const step = iw / n;
+  const bw = Math.min(38, step * 0.52);
+  const grid = [maxV, maxV / 2].map((v) => `
+    <line class="grid" x1="${padL}" y1="${y(v)}" x2="${W - padR}" y2="${y(v)}"/>
+    <text class="ylab" x="${padL - 6}" y="${y(v) + 3}" text-anchor="end">${esc(fmtTokens(v))}</text>`).join("");
+  const axis = `<line class="axis" x1="${padL}" y1="${y(0)}" x2="${W - padR}" y2="${y(0)}"/>
+    <text class="ylab" x="${padL - 6}" y="${y(0) + 3}" text-anchor="end">0</text>`;
+  let bars = "", labels = "";
+  days.forEach((d, i) => {
+    const isToday = i === n - 1;
+    const x = padL + i * step + (step - bw) / 2;
+    const modelRows = d.models || [];
+    const tip = `${d.date} · ${fmtTokens(totals[i] || 0)}\n` +
+      modelRows.map((m) => `${m.model} ${fmtTokens(m.total)} (${m.requests})`).join("\n");
+    // 自底向上堆叠
+    let acc = 0;
+    const segs = modelRows.map((m) => {
+      const h = (m.total || 0) / maxV * ih;
+      const rect = h > 0
+        ? `<rect class="seg" x="${x}" y="${y(acc + (m.total || 0))}" width="${bw}" height="${Math.max(h, 0.8)}" fill="${modelColor(m.model)}"><title>${esc(tip)}</title></rect>`
+        : "";
+      acc += m.total || 0;
+      return rect;
+    }).join("");
+    bars += `<g class="day${isToday ? " today" : ""}">${segs}</g>`;
+    const lab = d.date.length >= 10 ? d.date.slice(5).replace("-", "/") : d.date;
+    labels += `<text class="xlab${isToday ? " today" : ""}" x="${x + bw / 2}" y="${H - 7}" text-anchor="middle">${esc(lab)}</text>`;
+  });
+  return `<svg class="qhp-trend" viewBox="0 0 ${W} ${H}" role="img" aria-label="${esc(t("list.qhpSecTrend"))}">${grid}${axis}${bars}${labels}</svg>`;
+}
+
+/** 用量趋势 Tab：7 天堆叠柱状图 + 模型明细表（今日/近 7 天/占比） */
+function usageTabHtml() {
+  const u = usageData;
+  if (!u) return `<div class="qh-empty">${esc(t("list.qhUsageLoading"))}</div>`;
+  if (u.db_missing || (!u.today.length && !u.week.length)) return `<div class="qh-empty">${esc(t("list.qhUsageEmpty"))}</div>`;
+  const weekMax = Math.max(...u.week.map((w) => w.total), 1);
+  const rows = u.week.map((w) => {
+    const t0 = u.today.find((x) => x.model === w.model);
+    const share = (w.total / weekMax) * 100;
+    return `<div class="qhp-urow">
+      <span class="qhp-uname" style="color:${modelColor(w.model)}" title="${esc(w.model)}">${esc(w.model)}</span>
+      <span class="qhp-unum">${esc(fmtTokens(t0?.total || 0))}<small>${esc(t("list.qhpKpiTodaySub", { n: t0?.requests || 0 }))}</small></span>
+      <span class="qhp-unum">${esc(fmtTokens(w.total))}</span>
+      <span class="qhp-ushare"><i style="width:${share}%;background:${modelColor(w.model)};opacity:.8"></i></span>
+    </div>`;
+  }).join("");
+  return `
+    <div class="qhp-sec">${esc(t("list.qhpSecTrend"))}</div>
+    <div class="qhp-trend-wrap">${trendChartHtml(u.daily)}</div>
+    <div class="qhp-sec">${esc(t("list.qhpSecModels"))}</div>
+    <div class="qhp-uhead"><span>${esc(t("list.qhUsageModel"))}</span><span>${esc(t("list.qhUsageToday"))}</span><span>${esc(t("list.qhUsageWeek"))}</span><span>${esc(t("list.qhpColShare"))}</span></div>
+    ${rows}
+    <div class="qhp-hint">${esc(t("list.qhUsageNote"))}</div>`;
+}
+
+function quotaPanelHtml(tot) {
+  if (!ui.qhOpen || !tot) return "";
+  // 老会话残留的模型名 Tab 一律回落到额度池
+  const tab = ui.qhTab === QH_TAB_USAGE ? QH_TAB_USAGE : QH_TAB_POOLS;
+  const body = tab === QH_TAB_USAGE ? usageTabHtml() : poolsTabHtml(tot);
   return `<div class="qh-panel" data-qh-pop>
     <div class="qh-head">
       <div>
@@ -1161,8 +1247,13 @@ function quotaPanelHtml(tot) {
       </div>
       <button class="icon-btn sm qh-close" click="actions.toggleQhDetail()" aria-label="close">${ic("x", 14)}</button>
     </div>
-    <div class="qhd-tabs">${tabs}</div>
+    ${quotaKpisHtml(tot)}
+    <div class="qhd-tabs">
+      <button class="qhd-tab${tab === QH_TAB_POOLS ? " on" : ""}" click="actions.setQhTab('${QH_TAB_POOLS}')">${esc(t("list.qhpTabPools"))}</button>
+      <button class="qhd-tab${tab === QH_TAB_USAGE ? " on" : ""}" click="actions.setQhTab('${QH_TAB_USAGE}')">${esc(t("list.qhUsageTab"))}</button>
+    </div>
     <div class="qhd-body" data-qh-scroll>${body}</div>
+    <div class="qh-foot">${esc(t("list.qhUsageNote"))}</div>
   </div>`;
 }
 
@@ -1382,6 +1473,13 @@ const actions = {
 
   setQhTab(name) {
     ui.qhTab = name;
+    refreshQuotaModal();
+  },
+
+  /** 统计页「额度池」：展开/收起某模型的按账号拆分 */
+  toggleQhModel(name) {
+    if (qhExpanded.has(name)) qhExpanded.delete(name);
+    else qhExpanded.add(name);
     refreshQuotaModal();
   },
 
@@ -3063,7 +3161,7 @@ function render(force = false) {
 
   $app.innerHTML = `
     <header class="topbar">
-      <div class="wordmark">Z·SWITCH${appVer ? ` <span class="ver">v${esc(appVer)}</span>` : ""}</div>
+      <div class="wordmark">Z·SWITCH${appVer ? ` <span class="ver">v${esc(appVer)}</span>` : ""}${window.__ZSW_MOCK__ ? `<span class="ver mock-badge">PREVIEW</span>` : ""}</div>
       <div class="top-right">
         <div class="top-status${unsaved ? " unsaved" : ""}">
           <span class="status-dot ${dotCls}"></span>
