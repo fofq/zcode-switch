@@ -366,8 +366,9 @@ export function sortAccounts(accounts, sort, healthMap, localeTag = "zh-CN", opt
     const i = HEALTH_ORDER.indexOf(lv);
     return i < 0 ? HEALTH_ORDER.length : i;
   };
+  // numeric: 数字名的账号按数值排（1 < 2 < 10 < 12），否则字典序会把 1/10/11/12 排在 2 前面
   const byName = (a, b) =>
-    String(a.name || "").localeCompare(String(b.name || ""), localeTag, { sensitivity: "base" });
+    String(a.name || "").localeCompare(String(b.name || ""), localeTag, { sensitivity: "base", numeric: true });
   switch (sort) {
     case "name":
       return arr.sort((a, b) => d * byName(a, b));
