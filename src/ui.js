@@ -117,9 +117,16 @@ export function openConfirmModal(m) {
   panel.addEventListener("click", (e) => e.stopPropagation());
   mask.addEventListener("click", close);
   no.addEventListener("click", close);
-  yes.addEventListener("click", async () => {
+  yes.addEventListener("click", () => {
+    // fireAndForget：确认后立刻关弹窗再执行（删除等可能被后台长操作阻塞的动作，
+    // 结果用 toast 反馈——弹窗不长时间停留在屏幕上）
+    if (m.fireAndForget) {
+      close();
+      try { m.onYes?.(); } catch { /* 调用方自行兜底 */ }
+      return;
+    }
     yes.disabled = true; no.disabled = true;
-    try { await m.onYes?.(); } finally { close(); }
+    (async () => { try { await m.onYes?.(); } finally { close(); } })();
   });
   mask._key = (e) => {
     if (e.key === "Escape") close();
@@ -141,16 +148,21 @@ export function openPwModal(m) {
 
   const mask = document.createElement("div");
   mask.className = "pw-mask";
+  // 导入：所选文件全部是明文信封时无需密码（m.allPlain 由调用方根据 pick 结果传入）
+  const allPlain = m.mode === "import" && m.allPlain === true;
+  const pwRowStyle = allPlain ? ' style="display:none"' : "";
   mask.innerHTML = `
     <div class="pw-panel">
       <div class="pw-title">${title}</div>
       <div class="pw-sub">${sub}</div>
-      <input class="pw-input" type="password" id="pw1" placeholder="${isExport ? t("pw.setPw") : t("pw.pw")}" autocomplete="off">
-      ${isExport ? `<input class="pw-input" type="password" id="pw2" placeholder="${t("pw.pwAgain")}" autocomplete="off">` : ""}
+      <input class="pw-input" type="password" id="pw1" placeholder="${isExport ? t("pw.setPw") : t("pw.pw")}" autocomplete="off"${pwRowStyle}>
+      ${isExport ? `<input class="pw-input" type="password" id="pw2" placeholder="${t("pw.pwAgain")}" autocomplete="off"${pwRowStyle}>` : ""}
+      ${isExport ? `<div class="pw-hint pw-plain-hint" style="display:none">${esc(t("pw.plainHint"))}</div>` : ""}
+      ${allPlain ? `<div class="pw-hint">${esc(t("pw.importPlainHint"))}</div>` : ""}
       <div class="pw-err"></div>
       <div class="pw-actions">
         <button class="btn-ghost pw-cancel">${t("common.cancel")}</button>
-        <button class="btn-primary pw-go has-ic">${isExport ? ic("lock", 14) + " " + t("pw.encryptExport") : ic("lockOpen", 14) + " " + t("pw.decryptImport")}</button>
+        <button class="btn-primary pw-go has-ic">${allPlain ? ic("lockOpen", 14) + " " + t("pw.importPlainGo") : isExport ? ic("lock", 14) + " " + t("pw.encryptExport") : ic("lockOpen", 14) + " " + t("pw.decryptImport")}</button>
       </div>
     </div>`;
   document.body.appendChild(mask);
@@ -170,10 +182,22 @@ export function openPwModal(m) {
   [input1, input2].forEach((i) => i?.addEventListener("keydown", key));
   input1.focus();
 
+  // 导出：密码留空 = 明文导出（按钮与提示会随之切换）；加密密码仍要求 ≥6 位
+  const hintEl = mask.querySelector(".pw-plain-hint");
+  const updateGo = () => {
+    if (!isExport) return;
+    const plain = !(input1?.value || "").length;
+    go.innerHTML = plain ? ic("alert", 14) + " " + esc(t("pw.plainGo")) : ic("lock", 14) + " " + esc(t("pw.encryptExport"));
+    if (hintEl) hintEl.style.display = plain ? "" : "none";
+  };
+  input1?.addEventListener("input", updateGo);
+  updateGo();
+
   async function confirm() {
     const pw1 = input1?.value || "";
     const pw2 = input2?.value;
-    if (pw1.length < 6) return (errEl.textContent = t("pw.errMinLen"));
+    if (!allPlain && pw1.length > 0 && pw1.length < 6) return (errEl.textContent = t("pw.errMinLen"));
+    if (!allPlain && pw1.length === 0) return (errEl.textContent = t("pw.errMinLen"));
     if (pw2 !== undefined && pw2 !== null && pw1 !== pw2) return (errEl.textContent = t("pw.errMismatch"));
     go.disabled = true;
     try {

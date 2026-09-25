@@ -860,7 +860,7 @@ select.two-input { cursor: pointer; }
   display: flex;
   flex-direction: column;
   gap: 6px;
-  z-index: 1300; /* 高于弹窗遮罩(1200)，保证弹窗内操作也有提示 */
+  z-index: 1500; /* 最顶层：高于设置(1200)/导入导出(1300)/确认(1400) 弹窗 */
   align-items: center;
   pointer-events: none;
 }
@@ -1147,7 +1147,7 @@ select.two-input { cursor: pointer; }
   display: flex;
   align-items: center;
   justify-content: center;
-  z-index: 100;
+  z-index: 1300; /* 高于设置弹窗(1200)：从设置里发起导入/导出时必须浮在上层 */
 }
 .pw-panel {
   width: 380px;
@@ -1174,6 +1174,7 @@ select.two-input { cursor: pointer; }
 }
 .pw-input:focus { outline: none; border-color: var(--amber-deep); }
 .pw-err { font-size: 14px; color: var(--red); min-height: 16px; margin-bottom: 6px; }
+.pw-hint { font-size: 13px; color: var(--amber); line-height: 1.6; margin: -2px 0 9px; }
 .pw-actions { display: flex; gap: 8px; justify-content: flex-end; }
 .pw-actions .pw-go { flex: none; padding: 8px 18px; }
 
@@ -1184,7 +1185,7 @@ select.two-input { cursor: pointer; }
   display: flex;
   align-items: center;
   justify-content: center;
-  z-index: 110;
+  z-index: 1400; /* 确认弹窗最顶层（高于设置/导入导出弹窗） */
 }
 .cm-panel {
   position: relative;

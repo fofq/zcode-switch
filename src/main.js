@@ -1475,6 +1475,9 @@ const actions = {
       title: t("m.deleteTitle", { name: a.name }),
       desc: t("m.deleteDesc"),
       yesLabel: t("common.delete"),
+      // 确认即关弹窗：删除可能被后台长操作（持全局锁的网络调用等）短暂阻塞，
+      // 结果用 toast 反馈，UI 不停留在删除确认上
+      fireAndForget: true,
       onYes: () => actions.doDelete(id),
     });
   },
@@ -1794,7 +1797,8 @@ const actions = {
       const sealed = p.sealed || [];
       const preErrors = p.errors || [];
       if (sealed.length) {
-        openPwModal({ mode: "import", files: sealed, preErrors, onDone: (rep) => actions.stFinishImport(rep) });
+        const allPlain = p.plainCount === sealed.length;
+        openPwModal({ mode: "import", files: sealed, preErrors, allPlain, onDone: (rep) => actions.stFinishImport(rep) });
         return;
       }
       actions.stFinishImport({ added: [], skipped: [], errors: preErrors });
