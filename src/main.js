@@ -86,6 +86,10 @@ const ui = {
   sort: SORTS.includes(savedPrefs.sort) ? savedPrefs.sort : "quota",
   sortDir: savedPrefs.sortDir === -1 ? -1 : 1,
   density: savedPrefs.density === "detail" ? "detail" : "compact",
+  // 视图模式：flat=平铺列表 / card=卡片网格（分组沿用 s.grouped，与二者正交组合时以分组优先）
+  view: savedPrefs.view === "card" ? "card" : "flat",
+  // 强调色主题：amber=琥珀(默认) / teal=苍青 / mono=墨石
+  theme: ["amber", "teal", "mono"].includes(savedPrefs.theme) ? savedPrefs.theme : "amber",
   hideInfo: savedPrefs.hideInfo === true,
   qhOpen: false,
   qhTab: "",
@@ -94,6 +98,14 @@ const ui = {
   expanded: new Set(),
   collapsedSections: new Set(),
 };
+
+/** 应用主题：html[data-theme] 驱动 CSS 变量；默认主题不挂属性 */
+function applyTheme(theme) {
+  ui.theme = ["teal", "mono"].includes(theme) ? theme : "amber";
+  if (ui.theme === "amber") document.documentElement.removeAttribute("data-theme");
+  else document.documentElement.dataset.theme = ui.theme;
+}
+applyTheme(ui.theme);
 
 // 剪贴板：优先 navigator.clipboard，失败回退 execCommand（webview 环境兜底）
 async function copyText(text) {
@@ -124,7 +136,7 @@ function autoCollapseTick() {
   const now = Date.now();
   let changed = false;
   for (const id of [...ui.expanded]) {
-    const el = $app.querySelector(`.row[data-id="${CSS.escape(id)}"]`);
+    const el = $app.querySelector(`.row[data-id="${CSS.escape(id)}"], .card[data-id="${CSS.escape(id)}"]`);
     if (el && el.matches(":hover")) { expandAt.set(id, now); continue; }
     if (now - (expandAt.get(id) || 0) >= EXPAND_AUTO_COLLAPSE_MS) {
       ui.expanded.delete(id);
@@ -435,7 +447,7 @@ function autoSwitchTitle(s) {
 
 function savePrefs() {
   try {
-    localStorage.setItem(UI_PREFS_KEY, JSON.stringify({ sort: ui.sort, sortDir: ui.sortDir, density: ui.density, hideInfo: ui.hideInfo }));
+    localStorage.setItem(UI_PREFS_KEY, JSON.stringify({ sort: ui.sort, sortDir: ui.sortDir, density: ui.density, hideInfo: ui.hideInfo, view: ui.view, theme: ui.theme }));
   } catch { /* 忽略 */ }
 }
 
@@ -658,6 +670,17 @@ function settingsFormHtml() {
       ${stToggle("tray", t("s.closeTray"), t("s.closeTrayDesc"), !!s.close_to_tray)}
       ${stToggle("hot", t("s.hotSwitch"), t("s.hotSwitchDesc"), !!s.hot_switch)}
       ${stToggle("grouped", t("s.grouped"), t("s.groupedDesc"), s.grouped !== false)}
+
+      <div class="st-sec">${t("s.appearance")}</div>
+      <div class="st-row">
+        <div class="st-lab">${t("s.theme")}</div>
+        <div class="st-ctl">
+          <div class="lang-seg" role="radiogroup" aria-label="${esc(t("s.theme"))}">
+            ${[["amber", "s.themeAmber"], ["teal", "s.themeTeal"], ["mono", "s.themeMono"]].map(([v, k]) =>
+              `<button class="lang-opt${ui.theme === v ? " on" : ""}" role="radio" aria-checked="${ui.theme === v}" click="actions.stSetTheme('${v}')">${esc(t(k))}</button>`).join("")}
+          </div>
+        </div>
+      </div>
 
       <div class="st-sec">${t("s.authLabel")}</div>
       ${stToggle("oauthBrowser", t("s.oauthBrowser"), t("s.oauthBrowserDesc"), s.oauth_browser !== false)}
@@ -1080,7 +1103,7 @@ function quotaHeadChipHtml(tot) {
 }
 
 // 模型专属颜色：按模型名稳定散列取色（标题/Tab 标识用，不参与额度状态色）
-const MODEL_COLORS = ["#e8a33d", "#6aa9e0", "#b48be8", "#e08aa0", "#62c370"];
+const MODEL_COLORS = ["#a9834f", "#5f7d99", "#8672a0", "#a06a72", "#6a9480"];
 function modelColor(name) {
   let h = 0;
   for (let i = 0; i < String(name).length; i++) h = (h * 31 + String(name).charCodeAt(i)) >>> 0;
@@ -1271,6 +1294,7 @@ function bulkBarHtml() {
 function listHeadHtml(s, sum, visible) {
   const allOn = visible.length > 0 && visible.every((a) => ui.selected.has(a.id));
   const qt = quotaTotals();
+  const viewName = s.grouped ? "grouped" : ui.view;
   return `
     <div class="list-head">
       <div class="lh-row">
@@ -1281,8 +1305,8 @@ function listHeadHtml(s, sum, visible) {
           ${ui.search ? `<button class="search-clear" title="${esc(t("list.clearSearch"))}" click="actions.setSearch('')">${ic("x", 12)}</button>` : ""}
         </div>
         <div class="view-seg" role="group" aria-label="${esc(t("grp.viewLabel"))}">
-          <button class="vs-opt${s.grouped ? "" : " on"}" aria-pressed="${!s.grouped}" click="actions.setGrouped(false)">${t("grp.flat")}</button>
-          <button class="vs-opt${s.grouped ? " on" : ""}" aria-pressed="${!!s.grouped}" click="actions.setGrouped(true)">${t("grp.grouped")}</button>
+          ${[["flat", "grp.flat"], ["card", "grp.card"], ["grouped", "grp.grouped"]].map(([v, key]) =>
+            `<button class="vs-opt${viewName === v ? " on" : ""}" aria-pressed="${viewName === v}" click="${v === "grouped" ? "actions.setGrouped(true)" : `actions.setView('${v}')`}">${t(key)}</button>`).join("")}
         </div>
       </div>
       <div class="lh-row">${chipsHtml(sum)}</div>
@@ -1298,10 +1322,11 @@ function listHeadHtml(s, sum, visible) {
           ${SORTS.map((v) => `<option value="${v}"${ui.sort === v ? " selected" : ""}>${esc(t(SORT_PREFIX + v))}</option>`).join("")}
         </select>
         <button class="icon-btn sm" title="${t("list.sortDirTitle")}" aria-label="${t("list.sortDirTitle")}" click="actions.setSortDir()">${ic(ui.sortDir === -1 ? "arrowUp" : "arrowDown", 13)}</button>
+        ${viewName === "card" ? "" : `
         <div class="view-seg" role="group" aria-label="${esc(t("list.densityLabel"))}">
           <button class="vs-opt${ui.density === "compact" ? " on" : ""}" aria-pressed="${ui.density === "compact"}" click="actions.setDensity('compact')">${t("list.density.compact")}</button>
           <button class="vs-opt${ui.density === "detail" ? " on" : ""}" aria-pressed="${ui.density === "detail"}" click="actions.setDensity('detail')">${t("list.density.detail")}</button>
-        </div>
+        </div>`}
       </div>
       ${bulkBarHtml()}
     </div>`;
@@ -1489,12 +1514,40 @@ const actions = {
     render();
   },
 
+  /** 卡片即切换：点卡片 = askSwitch；在用账号点卡片无效 */
+  cardSwitch(id) {
+    if (state?.accounts?.some((a) => a.id === id && a.is_active)) return;
+    actions.askSwitch(id);
+  },
+
+  /** 空操作：占位阻断事件冒泡到卡片级 click（如卡片工具条容器） */
+  noop() {},
+
   async setGrouped(on) {
     if (!!state?.grouped === !!on) return;
     await guard(async () => {
       await invoke("set_behavior", { grouped: on });
       await refresh(); render();
     });
+  },
+
+  /** 视图切换（平铺/卡片/分组）：平铺与卡片是列表形态，分组沿用后端 grouped 开关 */
+  async setView(v) {
+    const view = v === "card" ? "card" : "flat";
+    if (ui.view !== view) { ui.view = view; savePrefs(); }
+    if (state?.grouped) {
+      await guard(async () => {
+        await invoke("set_behavior", { grouped: false });
+        await refresh(); render();
+      });
+    } else render();
+  },
+
+  /** 强调色主题：html[data-theme] 即时生效，偏好落 localStorage */
+  stSetTheme(v) {
+    applyTheme(v);
+    savePrefs();
+    syncSettingsModal();
   },
 
   toggleSection(ev) {
@@ -1539,7 +1592,7 @@ const actions = {
   },
 
   toggleRow(ev) {
-    const id = ev?.target?.closest?.(".row")?.dataset?.id;
+    const id = ev?.target?.closest?.(".row, .card")?.dataset?.id;
     if (!id) return;
     if (ui.expanded.has(id)) {
       ui.expanded.delete(id);
@@ -2058,7 +2111,7 @@ const actions = {
 
   /** 悬浮按钮：滚动定位到当前使用的账号 */
   locateActive() {
-    const row = document.querySelector(".row.active");
+    const row = document.querySelector(".row.active, .card.active");
     if (row) {
       row.scrollIntoView({ behavior: "smooth", block: "center" });
       return;
@@ -2068,7 +2121,7 @@ const actions = {
       ui.search = "";
       ui.health = "all";
       render(true);
-      requestAnimationFrame(() => document.querySelector(".row.active")?.scrollIntoView({ behavior: "smooth", block: "center" }));
+      requestAnimationFrame(() => document.querySelector(".row.active, .card.active")?.scrollIntoView({ behavior: "smooth", block: "center" }));
       return;
     }
     toast(t("list.locateMissing"), "warn");
@@ -2509,7 +2562,7 @@ async function autoClaimTick() {
 }
 
 // 额度状态色：剩余=绿（快用尽转红）、已用=黄、完全用尽=整条黄
-const BAR_GREEN = "#62c370", BAR_RED = "#e0566a", BAR_YELLOW = "#e6c84a";
+const BAR_GREEN = "#7fa886", BAR_RED = "#c4766f", BAR_YELLOW = "#b3a269";
 const BAR_SEG_COLOR = { green: BAR_GREEN, red: BAR_RED, yellow: BAR_YELLOW };
 
 // 条内标签以“剩余”为基准（对齐官方 3.14 额度面板的 9.7% 剩余语义）：
@@ -2642,19 +2695,17 @@ function grantLabel(plan) {
   }
   return (plan.grants || [])[0] || "";
 }
-function claimStripHtml(id) {
+/** 领取迷你按钮：一个 🎁 图标（点击效果与「领取」一致），详情进 tooltip；
+ *  渲染在固定槽位（卡片底行 / 列表工具条），出现与消失都不引起布局位移 */
+function claimMiniBtnHtml(id) {
   const c = claimable[id];
   const plan = c?.plans?.[0];
   if (!plan) return "";
   const grants = grantLabel(plan);
   const label = plan.name || plan.plan_id;
-  return `
-  <div class="claim-strip" title="${esc(plan.description || label)}">
-    ${ic("gift", 15)}
-    <span class="claim-name">${esc(label)}</span>
-    ${grants ? `<span class="claim-grants">${esc(grants)}</span>` : ""}
-    <button class="btn-claim has-ic" click="actions.claim('${id}')" ${claimAllRunning || refreshClaim.running || claimActive || autoClaimRunning ? "disabled" : ""}>${ic("gift", 13)} ${t("btn.claim")}</button>
-  </div>`;
+  const tip = [label, grants, plan.description].filter(Boolean).join(" · ");
+  return `<button class="card-claim" title="${esc(`${t("btn.claim")} · ${tip}`)}" aria-label="${esc(t("btn.claim"))}"
+    click="actions.claim('${id}')" ${claimAllRunning || refreshClaim.running || claimActive || autoClaimRunning ? "disabled" : ""}>${ic("gift", 15)}</button>`;
 }
 
 function slotRowsHtml(items) {
@@ -2736,21 +2787,62 @@ function quotaDetailHtml(id) {
   return `<span class="aq-loading">${t("q.other")}</span>`;
 }
 
-/** 行内额度区：可领条永远显示；额度明细按展开状态决定 */
+/** 行内额度区：只含额度明细（领取按钮在固定槽位，见 claimMiniBtnHtml） */
 function quotaSlotInner(id, showDetail) {
-  return `${claimStripHtml(id)}${showDetail ? quotaDetailHtml(id) : ""}`;
+  return `${showDetail ? quotaDetailHtml(id) : ""}`;
 }
 function quotaSlotHtml(id, showDetail) {
   const inner = quotaSlotInner(id, showDetail);
   if (!inner) return "";
   return `<div class="row-quota-slot" data-quota-slot>${inner}</div>`;
 }
+/** 卡片收起态的「主额度条」：与 chip 同语义——关注模型的最好池优先，流转/耗尽回落到全场最好池 */
+function cardPrimaryPoolHtml(id) {
+  const d = acctQuota[id]?.data;
+  if (!d) return "";
+  const key = String(focusModel() || "").trim().toLowerCase();
+  const pools = [];
+  for (const p of d.plans || []) {
+    if (planExpired(p)) continue;
+    for (const it of p.items || []) {
+      if (itemKind(it) !== "raw") continue;
+      const used = Number(it.percent_used);
+      pools.push({
+        it,
+        rem: isFinite(used) ? 100 - used : -1,
+        focus: key ? modelKeyMatch(String(it.name || "").toLowerCase(), key) : false,
+      });
+    }
+  }
+  const pick = (list) => list.reduce((b, x) => (!b || x.rem > b.rem ? x : b), null);
+  // 顺序：关注模型且有余量（正常号，与 chip 的“剩 x%”同池）→ 全场有余量（流转号）→ 兜底（耗尽号画 0% 条）
+  const hit = pick(pools.filter((x) => x.focus && x.rem > 0)) || pick(pools.filter((x) => x.rem > 0)) || pick(pools);
+  if (hit) return balRowHtml(hit.it);
+  if ((d.items || []).length) {
+    const win = d.items.find((it) => itemKind(it) === "prompt_count");
+    if (win) return winRowHtml(win, " mini");
+  }
+  if (d.percent_used != null) return winRowHtml({ name: d.plan_tier || t("q.other"), percent_used: d.percent_used, window: "cycle" }, " mini");
+  return "";
+}
+
+/** 卡片额度区：收起=主额度条；展开=完整明细；busy 无旧数据给一行“查询中” */
+function cardQuotaSlotHtml(id) {
+  if (ui.expanded.has(id)) {
+    return `<div class="row-quota-slot card-quota" data-quota-slot>${quotaSlotInner(id, true)}</div>`;
+  }
+  const q = acctQuota[id];
+  const loading = q?.busy && !q?.data ? `<span class="aq-loading">${t("q.loading")}</span>` : "";
+  const body = `${loading}${cardPrimaryPoolHtml(id)}`;
+  if (!body) return `<div class="card-quota-empty" data-quota-slot></div>`;
+  return `<div class="row-quota-slot card-quota" data-quota-slot>${body}</div>`;
+}
 
 function captureScroll() {
   const list = $app.querySelector(".list");
   if (!list || list.scrollTop === 0) return null;
   const listTop = list.getBoundingClientRect().top;
-  for (const row of list.querySelectorAll(".row[data-id]")) {
+  for (const row of list.querySelectorAll(".row[data-id], .card[data-id]")) {
     if (row.getBoundingClientRect().bottom > listTop) {
       return { id: row.dataset.id, offset: row.getBoundingClientRect().top - listTop, scrollTop: list.scrollTop };
     }
@@ -2761,7 +2853,7 @@ function restoreScroll(cap) {
   if (!cap) return;
   const list = $app.querySelector(".list");
   if (!list) return;
-  const row = list.querySelector(`.row[data-id="${CSS.escape(cap.id)}"]`);
+  const row = list.querySelector(`.row[data-id="${CSS.escape(cap.id)}"], .card[data-id="${CSS.escape(cap.id)}"]`);
   if (row) {
     const delta = row.getBoundingClientRect().top - list.getBoundingClientRect().top;
     list.scrollTop = delta - cap.offset;
@@ -2808,7 +2900,7 @@ function renderSignature() {
   return JSON.stringify([
     state, autoSwitchNote, twoLastStatus,
     [...ui.expanded], [...ui.selected], [...ui.collapsedSections],
-    ui.search, ui.health, ui.sort, ui.sortDir, ui.density, ui.hideInfo, ui.qhOpen, ui.qhTab, renaming,
+    ui.search, ui.health, ui.sort, ui.sortDir, ui.density, ui.hideInfo, ui.qhOpen, ui.qhTab, renaming, ui.view,
     appVer, autoSwitchRunning, autoClaimRunning, claimActive, busy,
   ]);
 }
@@ -2904,19 +2996,6 @@ function patchProgressDom() {
   if (claimableCount > 0 || claimAllState.running) {
     replace("[data-gift-btn]", giftBtnHtml(claimableCount));
   }
-  for (const a of state?.accounts || []) {
-    const row = $app.querySelector(`.row[data-id="${CSS.escape(a.id)}"]`);
-    if (!row) continue;
-    const usage = twoUsageMap.get(a.id) || 0;
-    const cur = row.querySelector("[data-usage]");
-    if (!usage) { if (cur) cur.remove(); continue; }
-    const html = `<span class="row-usage" data-usage title="${esc(t("list.usageTitle"))}">${usage > 999 ? (usage / 1000).toFixed(1) + "k" : usage}</span>`;
-    if (!cur) row.insertAdjacentHTML("afterbegin", html);
-    else {
-      const wantText = usage > 999 ? (usage / 1000).toFixed(1) + "k" : String(usage);
-      if (cur.textContent !== wantText) cur.outerHTML = html;
-    }
-  }
 }
 
 /** 结构未变、仅额度数据变化时的精准补丁：只就地更新额度相关 DOM，宽度/滚动零扰动 */
@@ -2937,29 +3016,39 @@ function patchQuotaDom() {
   replace("[data-qh-chip]", quotaHeadChipHtml(qt));
   if (ui.qhOpen || quotaModalEl) refreshQuotaModal();
   for (const a of visible) {
-    const row = $app.querySelector(`.row[data-id="${CSS.escape(a.id)}"]`);
-    if (!row) continue;
+    const node = $app.querySelector(`.row[data-id="${CSS.escape(a.id)}"], .card[data-id="${CSS.escape(a.id)}"]`);
+    if (!node) continue;
+    const isCard = node.classList.contains("card");
     const h = hm.get(a.id) || { level: "unknown", remainingPct: null };
-    const dot = row.querySelector(".hdot");
+    const dot = node.querySelector(".hdot");
     if (dot) {
       const tpl = document.createElement("template");
       tpl.innerHTML = healthDotHtml(h).trim();
-      const node = tpl.content.firstElementChild;
-      if (node) dot.replaceWith(node);
+      const n = tpl.content.firstElementChild;
+      if (n) dot.replaceWith(n);
     }
     const q = acctQuota[a.id];
     const exp = expireInfo(q?.data?.plan_expire);
-    const slim = row.classList.contains("slim");
-    const info = row.querySelector(".row-info");
+    const slim = !isCard && node.classList.contains("slim");
+    const info = node.querySelector(".row-info");
     if (info) {
       const expSoon = slim && exp?.warn
         ? `<span class="meta-chip warn" title="${esc(t("q.validUntil", { date: exp.text }))}">${esc(expSoonLabel(exp))}</span>`
         : "";
-      const showChip = slim || !hasQuotaDetail(a.id);
+      // 卡片：chip 常驻在头像侧；列表：有明细时让位给明细区
+      const showChip = isCard || slim || !hasQuotaDetail(a.id);
       info.innerHTML = expSoon + (showChip ? quotaChipHtml(a.id, h) : "");
     }
-    const slot = row.querySelector("[data-quota-slot]");
-    if (slot) slot.innerHTML = quotaSlotInner(a.id, !slim);
+    const slot = node.querySelector("[data-quota-slot]");
+    if (slot) {
+      const fresh = cardQuotaSlotHtml(a.id);
+      if (fresh !== slot.outerHTML) slot.outerHTML = fresh;
+    }
+    const cs = node.querySelector("[data-claim-slot]");
+    if (cs) {
+      const btn = claimMiniBtnHtml(a.id);
+      if (cs.innerHTML !== btn) cs.innerHTML = btn;
+    }
   }
 }
 // 滚动期间延迟重渲染：列表在滚动时被全量重建会造成掉帧
@@ -3104,26 +3193,22 @@ function render(force = false) {
     const displayName = (baseName && baseName.trim())
       || (ident ? (ui.hideInfo && looksSecret(ident) ? t("list.hidden") : ident) : "")
       || t("list.unnamed");
-    // 2API 累计请求数（左上角小计数，0 不显示）；默认序号紧挨其前
-    const usage = twoUsageMap.get(a.id) || 0;
-    const usageBadge = usage
-      ? `<span class="row-usage" data-usage title="${esc(t("list.usageTitle"))}">${usage > 999 ? (usage / 1000).toFixed(1) + "k" : usage}</span>`
-      : "";
     const seqBadge = seq != null ? `<span class="row-seq" title="${esc(t("list.seqTitle"))}">${seq}</span>` : "";
     return `
     <div class="row${isActive ? " active" : ""}${checked ? " picked" : ""}${slim ? " slim" : ""}" data-id="${a.id}">
-      ${seqBadge}${usageBadge}
+      ${seqBadge}
       <div class="row-top">
         <span class="rchk" role="checkbox" aria-checked="${checked}" title="${esc(t("list.selectHint"))}" click="actions.toggleSelect('${a.id}')">${ic("check", 11)}</span>
         ${healthDotHtml(h)}
         ${slim ? "" : `<span class="notch" style="background:${notchColor(a.id)}"></span>`}
         <div class="row-main"${ui.density === "compact" ? ` click="actions.toggleRow(event)" title="${esc(slim ? t("list.expandTitle") : t("list.collapseTitle"))}"` : ""}>
-          <div class="row-name">${ui.density === "compact" ? `<span class="row-chev${slim ? "" : " open"}">${ic("chevDown", 12)}</span>` : ""}${tierBadgeFor(a.id)}${giftBadgeFor(a.id)}<span class="rn-text" title="${esc(displayName)}">${esc(displayName)}</span>${isActive ? `<span class="tag-use">${t("btn.inUse")}</span>` : ""}${a.has_user_info === false ? `<span class="tag-relogin" title="${esc(t("btn.reloginTitle"))}">${t("btn.relogin")}</span>` : ""}</div>
+          <div class="row-name">${ui.density === "compact" ? `<span class="row-chev${slim ? "" : " open"}">${ic("chevDown", 12)}</span>` : ""}${tierBadgeFor(a.id)}<span class="rn-text" title="${esc(displayName)}">${giftBadgeFor(a.id)}${esc(displayName)}</span>${a.has_user_info === false ? `<span class="tag-relogin" title="${esc(t("btn.reloginTitle"))}">${t("btn.relogin")}</span>` : ""}</div>
           <div class="row-meta">${meta}</div>
         </div>
         <div class="row-info">${expSoon}${showChip ? quotaChipHtml(a.id, h) : ""}</div>
         <div class="row-actions">
           <span class="row-tools">
+            <span class="claim-slot" data-claim-slot></span>
             <button class="icon-btn" title="${t("btn.copyKey")}" aria-label="${t("btn.copyKey")}" click="actions.copyApiKey('${a.id}')">${ic("copy", 15)}</button>
             <button class="icon-btn${isFrozen(a.id) ? " on" : ""}" title="${isFrozen(a.id) ? t("btn.unfreeze") : t("btn.freeze")}" aria-label="${isFrozen(a.id) ? t("btn.unfreeze") : t("btn.freeze")}" click="actions.toggleFreeze('${a.id}')">${ic("snow", 15)}</button>
             <button class="icon-btn" title="${t("btn.refreshQuota")}" aria-label="${t("btn.refreshQuota")}" click="actions.acctQuota('${a.id}')">${ic("refresh", 15)}</button>
@@ -3141,6 +3226,84 @@ function render(force = false) {
     </div>`;
   };
 
+  // ---- 卡片视图：结构固定（两行头部 + 模型条 + 底行），任何状态下各元素位置一致 ----
+  const cardRowHtml = (a, seq) => {
+    const h = healthMap.get(a.id) || { level: "unknown", remainingPct: null };
+    const isActive = a.is_active;
+    if (renaming === a.id) {
+      return `
+      <div class="card${isActive ? " active" : ""}" data-id="${a.id}">
+        <div class="card-head">
+          <div class="card-id">
+            <input class="rename-input" value="${esc(a.name)}" maxlength="40" style="max-width:none"
+              keydown="onRenameKey(event,'${a.id}')" blur="actions.deferCancelRename('${a.id}')">
+            <div class="row-meta">${t("btn.renameMeta")}</div>
+          </div>
+        </div>
+        <div class="card-foot">
+          <button class="btn-ghost" style="padding:4px 10px" click="actions.doRename('${a.id}')">${t("common.save")}</button>
+          <span style="flex:1"></span>
+          <button class="btn-ghost" style="padding:4px 10px" click="actions.cancelRename()">${t("common.cancel")}</button>
+        </div>
+      </div>`;
+    }
+    const nm = String(a.name || "").trim().toLowerCase();
+    const ident = [a.identity?.username, a.identity?.email]
+      .filter(Boolean)
+      .filter((x) => x.trim().toLowerCase() !== nm)
+      .join(" · ");
+    const q = acctQuota[a.id];
+    // meta 行固定一行：档位/礼物徽标 + 状态徽标在前，身份信息殿后（溢出省略）
+    let meta = `${tierBadgeFor(a.id)}`;
+    if (a.has_user_info === false) meta += `<span class="tag-relogin" title="${esc(t("btn.reloginTitle"))}">${t("btn.relogin")}</span>`;
+    if (!a.has_config) meta += `<span class="meta-chip warn" title="${esc(t("q.noCfg"))}">${esc(t("q.noCfgShort"))}</span>`;
+    const exp = expireInfo(q?.data?.plan_expire);
+    if (exp) meta += `<span class="meta-chip${exp.warn ? " warn" : ""}" title="${esc(t("q.validUntil", { date: exp.text }))}">${esc(t("q.validUntilShort", { date: exp.text }))}</span>`;
+    if (ident && ident.toLowerCase() !== nm) {
+      meta += ui.hideInfo
+        ? `<span class="meta-id masked">${esc(t("list.hidden"))}</span>`
+        : `<span class="meta-id" title="${esc(ident)}">${esc(ident)}</span>`;
+    }
+    const checked = ui.selected.has(a.id);
+    const expanded = ui.expanded.has(a.id);
+    const baseName = nameText(a);
+    const displayName = (baseName && baseName.trim())
+      || (ident ? (ui.hideInfo && looksSecret(ident) ? t("list.hidden") : ident) : "")
+      || t("list.unnamed");
+    // 卡片即切换按钮：点击卡片 = askSwitch（在用账号由 cardSwitch 忽略）；
+    // 头部固定两行：名称行（序号+名称+使用中）/ 徽标行，模型条位置恒定。
+    return `
+    <div class="card${isActive ? " active" : ""}${checked ? " picked" : ""}${expanded ? " expanded" : ""}" data-id="${a.id}"
+      ${isActive ? "" : `click="actions.cardSwitch('${a.id}')"`} title="${isActive ? "" : esc(t("btn.switch"))}">
+      <span class="notch" style="background:${notchColor(a.id)}"></span>
+      <div class="card-head">
+        <div class="card-id">
+          <div class="row-name">${seq != null ? `<span class="card-seq" title="${esc(t("list.seqTitle"))}">${seq}</span>` : ""}${giftBadgeFor(a.id)}<span class="rn-text" title="${esc(displayName)}">${esc(displayName)}</span></div>
+          <div class="row-meta">${meta}</div>
+        </div>
+        <span class="card-side">
+          <span class="rchk" role="checkbox" aria-checked="${checked}" title="${esc(t("list.selectHint"))}" click="actions.toggleSelect('${a.id}')">${ic("check", 11)}</span>
+          <span class="card-side-info">${healthDotHtml(h)}<span class="row-info">${quotaChipHtml(a.id, h)}</span></span>
+          <button class="card-expand" title="${esc(expanded ? t("list.collapseTitle") : t("list.expandTitle"))}" aria-label="${esc(expanded ? t("list.collapseTitle") : t("list.expandTitle"))}" click="actions.toggleRow(event)">${ic("chevDown", 13)}</button>
+        </span>
+      </div>
+      ${cardQuotaSlotHtml(a.id)}
+      <div class="card-foot">
+        <span class="card-foot-info"></span>
+        <span class="claim-slot" data-claim-slot></span>
+        <span class="card-tools" click="actions.noop()">
+          <button class="icon-btn sm" title="${t("btn.copyKey")}" aria-label="${t("btn.copyKey")}" click="actions.copyApiKey('${a.id}')">${ic("copy", 14)}</button>
+          <button class="icon-btn sm${isFrozen(a.id) ? " on" : ""}" title="${isFrozen(a.id) ? t("btn.unfreeze") : t("btn.freeze")}" aria-label="${isFrozen(a.id) ? t("btn.unfreeze") : t("btn.freeze")}" click="actions.toggleFreeze('${a.id}')">${ic("snow", 14)}</button>
+          <button class="icon-btn sm" title="${t("btn.refreshQuota")}" aria-label="${t("btn.refreshQuota")}" click="actions.acctQuota('${a.id}')">${ic("refresh", 14)}</button>
+          <button class="icon-btn sm" title="${t("btn.rename")}" aria-label="${t("btn.rename")}" click="actions.rename('${a.id}')">${ic("pen", 14)}</button>
+          <button class="icon-btn sm" title="${t("btn.export")}" aria-label="${t("btn.export")}" click="actions.exportOne('${a.id}')">${ic("export", 14)}</button>
+          <button class="icon-btn sm${isActive ? " on" : ""}" title="${t("btn.coldSwitch")}" aria-label="${t("btn.coldSwitch")}" click="actions.askColdSwitch('${a.id}')">${ic("power", 14)}</button>
+          <button class="icon-btn sm danger" title="${t("btn.delete")}" aria-label="${t("btn.delete")}" click="actions.delete('${a.id}')">${ic("x", 14)}</button>
+        </span>
+      </div>
+    </div>`;
+  };
+
   const listHtml = s.accounts.length === 0
     ? `<div class="empty">
          <div class="glyph">${ic("empty", 34)}</div>
@@ -3155,7 +3318,9 @@ function render(force = false) {
          </div>`
       : s.grouped
         ? groupedListHtml(visible, rowHtml, healthMap)
-        : pinActiveFirst(visible).map((a, i) => rowHtml(a, i + 1)).join("");
+        : ui.view === "card"
+          ? `<div class="card-grid">${pinActiveFirst(visible).map((a, i) => cardRowHtml(a, i + 1)).join("")}</div>`
+          : pinActiveFirst(visible).map((a, i) => rowHtml(a, i + 1)).join("");
 
   const claimableCount = s.accounts.filter((a) => (claimable[a.id]?.plans || []).length > 0).length;
 
@@ -3888,7 +4053,7 @@ async function sweepTick() {
     setInterval(autoCollapseTick, 1000);
     // 行内任何点击都算“有操作”，刷新自动收起倒计时
     $app.addEventListener("click", (e) => {
-      const row = e.target?.closest?.(".row");
+      const row = e.target?.closest?.(".row, .card");
       if (row?.dataset?.id) expandTouch(row.dataset.id);
     });
     setTimeout(autoClaimTick, AUTO_CLAIM_FIRST_DELAY_MS);
