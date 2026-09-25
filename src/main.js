@@ -1170,8 +1170,6 @@ async function loadAcctQuota(id, opts = {}) {
     const data = await invoke("get_account_quota", { id, quick: !!opts.quick });
     acctQuota[id] = { data, err: null, code: null, busy: false };
     quotaFailStreak[id] = 0;
-    markQuotaCacheDirty();
-    flushQuotaCache();
     // 采样入队（算烧速/ETA 用）；失败时刻意不刷新样本时间，让“陈旧 → 先刷新”的门禁生效
     quotaSampleAt[id] = Date.now();
     const st = apiStats(id);
@@ -1183,6 +1181,9 @@ async function loadAcctQuota(id, opts = {}) {
       const base = Array.isArray(hist) && hist.length && (hist[hist.length - 1].model || "") === m ? hist : [];
       quotaHist[id] = pushSample(base, sampleFrom(st, Date.now(), m));
     }
+    // 采样更新完再落盘：缓存里的 t/hist 与 data 同拍（先落盘会把时间戳/样本滞后一个周期）
+    markQuotaCacheDirty();
+    flushQuotaCache();
   } catch (e) {
     // 失败时也保留旧数据展示，错误信息进明细区；没旧数据才回落到错误态
     acctQuota[id] = { data: cur.data || null, err: stripErr(e), code: errCode(e), busy: false };
@@ -1485,6 +1486,13 @@ const actions = {
   async doDelete(id) {
     await guard(async () => {
       await invoke("delete_account", { id });
+      // 会话内状态一并清掉：否则该号残留在额度缓存/采样/队列里，
+      // 且持久化缓存会把已删除的号一直带下去（下次启动又出现）
+      delete acctQuota[id]; delete quotaHist[id]; delete quotaSampleAt[id];
+      delete quotaDue[id]; delete quotaFailStreak[id]; delete quotaForceAt[id];
+      delete autoClaimCooldown[id]; delete claimable[id];
+      ui.selected.delete(id); ui.expanded.delete(id);
+      markQuotaCacheDirty(); flushQuotaCache(true);
       toast(t("m.toastDeleted"));
       await refresh(); render();
     });

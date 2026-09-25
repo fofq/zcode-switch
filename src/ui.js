@@ -194,11 +194,16 @@ export function openPwModal(m) {
   updateGo();
 
   async function confirm() {
+    // 导出：密码留空 = 明文导出；填了就要求 ≥6 位且两次一致。
+    // 导入：全部明文文件无需密码；含加密文件时密码必填。
     const pw1 = input1?.value || "";
     const pw2 = input2?.value;
-    if (!allPlain && pw1.length > 0 && pw1.length < 6) return (errEl.textContent = t("pw.errMinLen"));
-    if (!allPlain && pw1.length === 0) return (errEl.textContent = t("pw.errMinLen"));
-    if (pw2 !== undefined && pw2 !== null && pw1 !== pw2) return (errEl.textContent = t("pw.errMismatch"));
+    if (isExport) {
+      if (pw1.length > 0 && pw1.length < 6) return (errEl.textContent = t("pw.errMinLen"));
+      if (pw2 !== undefined && pw2 !== null && pw1 !== pw2) return (errEl.textContent = t("pw.errMismatch"));
+    } else if (!allPlain && pw1.length < 6) {
+      return (errEl.textContent = t("pw.errMinLen"));
+    }
     go.disabled = true;
     try {
       if (m.mode === "export") {
