@@ -1170,6 +1170,8 @@ async function loadAcctQuota(id, opts = {}) {
     const data = await invoke("get_account_quota", { id, quick: !!opts.quick });
     acctQuota[id] = { data, err: null, code: null, busy: false };
     quotaFailStreak[id] = 0;
+    markQuotaCacheDirty();
+    flushQuotaCache();
     // 采样入队（算烧速/ETA 用）；失败时刻意不刷新样本时间，让“陈旧 → 先刷新”的门禁生效
     quotaSampleAt[id] = Date.now();
     const st = apiStats(id);
@@ -3130,10 +3132,68 @@ const SWEEP_JITTER = 0.2;
 // 周礼/Global Build 发放后一次刷新就会回到正常轮换；领取由 autoClaim 独立负责（每分钟轮询，与此无关）
 const SWEEP_PERIOD_DEAD = 90 * 60 * 1000;
 const SWEEP_JITTER_DEAD = 0.33;
-const SWEEP_BATCH = 4; // 每 tick 并发拉取上限（吞吐 0.5/s；70+ 账号 × 5min 需求 ~0.23/s，留出失败重试余量）
+const SWEEP_CONCURRENCY = 4;   // 刷新并发上限
+const SWEEP_PUMP_MS = 1200;    // 泵间隔：请求起点之间至少错开 1.2s（略微间隔防突发），并行压缩总时长
+let sweepInFlight = 0;         // 当前在飞的刷新数（泵以此限流）
+// 额度状态持久化：重启不丢「上次已知额度/烧速样本」，启动按优先级补刷而不是全量同时打接口
+const QUOTA_CACHE_KEY = "zsw-quota-cache-v1";
+let quotaCacheDirty = false;
+let quotaCacheLastFlush = 0;
+function markQuotaCacheDirty() { quotaCacheDirty = true; }
+function flushQuotaCache(force = false) {
+  if (!quotaCacheDirty && !force) return;
+  const now = Date.now();
+  if (!force && now - quotaCacheLastFlush < 20 * 1000) return;
+  quotaCacheLastFlush = now;
+  quotaCacheDirty = false;
+  try {
+    const out = {};
+    for (const [id, q] of Object.entries(acctQuota)) {
+      if (!q?.data || q.err) continue;
+      out[id] = { t: quotaSampleAt[id] || now, data: q.data, hist: (quotaHist[id] || []).slice(-8) };
+    }
+    localStorage.setItem(QUOTA_CACHE_KEY, JSON.stringify(out));
+  } catch { /* 存储不可用则退化为无缓存（冷启动全量刷新） */ }
+}
+function loadQuotaCache() {
+  try {
+    const raw = localStorage.getItem(QUOTA_CACHE_KEY);
+    if (!raw) return 0;
+    const parsed = JSON.parse(raw);
+    const live = new Set((state?.accounts || []).map((a) => a.id));
+    const now = Date.now();
+    let n = 0;
+    for (const [id, e] of Object.entries(parsed || {})) {
+      if (!live.has(id) || !e?.data) continue;
+      acctQuota[id] = { data: e.data, err: null, code: null, busy: false };
+      quotaSampleAt[id] = Number(e.t) || now;
+      if (Array.isArray(e.hist) && e.hist.length) quotaHist[id] = e.hist;
+      n++;
+    }
+    return n;
+  } catch { return 0; }
+}
+/** 启动种子：按优先级铺开首刷时间（活跃号立即 → 待定 → 有额度 → 耗尽号最晚），避免全量同时打接口 */
+function seedStartupDue() {
+  const now = Date.now();
+  const hm = healthMapOf();
+  const activeId = state?.active_account_id;
+  const g = { first: [], pending: [], mid: [], dead: [] };
+  for (const a of state?.accounts || []) {
+    if (a.id === activeId) { g.first.push(a.id); continue; }
+    const lv = hm.get(a.id)?.level || "unknown";
+    if (lv === "dead") g.dead.push(a.id);
+    else if (lv === "pending" || lv === "auth" || lv === "fail") g.pending.push(a.id);
+    else g.mid.push(a.id);
+  }
+  const put = (ids, lo, hi) => ids.forEach((id) => { quotaDue[id] = now + lo + Math.random() * (hi - lo); });
+  put(g.first, 0, 2000);
+  put(g.pending, 5000, 30000);
+  put(g.mid, 15000, 150000);              // 最近有额度的：前 2.5 分钟内错开铺开
+  put(g.dead, 5 * 60000, 90 * 60000);     // 耗尽号：延续其 60-120 分钟节奏
+}
 const TICK_MS = 8000;
 let quotaDue = {};
-let ticking = false;
 
 function scheduleNext(id, base = Date.now()) {
   const h = healthMapOf().get(id);
@@ -3516,55 +3576,59 @@ function expiryRefreshTick() {
   }
 }
 
-async function sweepTick() {
-  if (ticking || quotaSweep.running) return;
-  enrollAccounts();
-  expiryRefreshTick();
-  drainStaleWant();
+/** 刷新泵：并发上限 SWEEP_CONCURRENCY，每 SWEEP_PUMP_MS 最多起一个请求——
+ *  起点天然错开（略微间隔防突发），并行在飞压短 70+ 账号整库扫描的总时长 */
+function pumpSweep() {
+  if (quotaSweep.running) return;
+  if (sweepInFlight >= SWEEP_CONCURRENCY) return;
   const now = Date.now();
-  // 饥饿修复：扫描 8s 一发、每轮 1 个账号的吞吐（0.125/s）低于全库需求
-  // （51 号 × 45s 周期 ≈ 0.17/s），按列表顺序取会让排后的账号（含当前账号快车道）
-  // 永远轮不到——额度耗尽只能靠手动刷新发现。改为：当前账号优先，其余按到期时间
-  // 升序，每轮最多并发 SWEEP_BATCH 个拉取。
   const due = (state?.accounts || []).filter(
     (a) => (quotaDue[a.id] ?? Infinity) <= now && !acctQuota[a.id]?.busy && !claimable[a.id]?.busy,
   );
   if (!due.length) return;
   due.sort((x, y) => (quotaDue[x.id] ?? 0) - (quotaDue[y.id] ?? 0));
+  // 在用账号永远最优先（决定“要不要切”的判定数据就是它）
   const activeIdx = due.findIndex((a) => a.is_active);
-  const batch = [];
-  if (activeIdx >= 0) batch.push(due[activeIdx]);
-  for (const a of due) {
-    if (batch.length >= SWEEP_BATCH) break;
-    if (!batch.includes(a)) batch.push(a);
-  }
-  ticking = true;
-  const dueAtMap = new Map(batch.map((a) => [a.id, quotaDue[a.id]]));
-  try {
-    await Promise.all(batch.map((a) => loadAcctQuota(a.id, { quick: true })));
-    for (const a of batch) {
-      if (quotaDue[a.id] === dueAtMap.get(a.id)) scheduleNext(a.id);
-    }
-    // 刷新后即时切换：loadAcctQuota 每次成功拉到数据都会自己跑一次判定（见其内部），
-    // 这里不再需要额外的「跨阈值」旁路（旧实现用 manual 绕过冷却，容易造成贴边横跳）。
-    if (!uiLocked()) render();
-  } finally {
-    ticking = false;
-  }
+  const acc = activeIdx >= 0 ? due[activeIdx] : due[0];
+  const id = acc.id;
+  const dueAt = quotaDue[id];
+  sweepInFlight++;
+  loadAcctQuota(id, { quick: true }).finally(() => {
+    sweepInFlight--;
+    // 手动刷新/紧急需求可能在拉取期间又 poke 过：仅当 due 没被别人动过才按周期重排
+    if (quotaDue[id] === dueAt) scheduleNext(id);
+    flushQuotaCache();
+  });
+  // 刷新后即时切换：loadAcctQuota 每次成功拉到数据都会自己跑一次判定（见其内部）
+}
+async function sweepTick() {
+  if (quotaSweep.running) return;
+  enrollAccounts();
+  expiryRefreshTick();
+  drainStaleWant();
+  pumpSweep();
 }
 
 (async () => {
   try {
     appVer = await invoke("app_version").catch(() => "");
     await refresh();
+    // 启动恢复：读入上次会话的「已知额度/烧速样本」（在首帧渲染前，避免闪「待查询额度」），
+    // 再按优先级铺开首刷——活跃号立即、有额度号前 2.5 分钟错开、耗尽号延续 60-120 分钟节奏
+    // （不停刷：礼物发放时刻并不固定）。冷启动无缓存才退回旧的全量刷新
+    const seeded = loadQuotaCache();
+    enrollAccounts();
+    if (seeded > 0) seedStartupDue();
     render();
     await invoke("reveal_main");
     setTimeout(dismissSplash, 350);
-    enrollAccounts();
     sweepTick();
+    setInterval(pumpSweep, SWEEP_PUMP_MS);
     setInterval(autoLocateTick, 2000);
-    // 启动时把额度拉全（健康度 / 筛选 / 排序都依赖它）
-    setTimeout(() => { if (!quotaSweep.running) actions.refreshAll(true); }, 900);
+    if (seeded === 0) {
+      // 冷启动：没有任何缓存可恢复，全量刷一遍建立基线（健康度/筛选/排序都依赖它）
+      setTimeout(() => { if (!quotaSweep.running) actions.refreshAll(true); }, 900);
+    }
     setInterval(() => {
       Promise.all([
         invoke("get_state"),
@@ -3583,6 +3647,9 @@ async function sweepTick() {
       }).catch(() => {});
     }, 5000);
     setInterval(sweepTick, TICK_MS);
+    setInterval(() => flushQuotaCache(), 30 * 1000);
+    window.addEventListener("pagehide", () => flushQuotaCache(true));
+    window.addEventListener("beforeunload", () => flushQuotaCache(true));
     setInterval(autoSwitchTick, AUTO_SWITCH_CHECK_MS);
     setInterval(autoCollapseTick, 1000);
     // 行内任何点击都算“有操作”，刷新自动收起倒计时
