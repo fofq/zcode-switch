@@ -28,6 +28,12 @@ function fakeKey(seed) {
 
 let autostartOn = false;
 let twoStats = { requests: 1284, errors: 6, last_request_at: Math.floor(Date.now() / 1000) - 90 };
+// 测试钩子：模拟事件上报被风控拦截（DEV 预览专用）
+const mockActivationRisk = new Set();
+window.__MOCK_VERSION__ = 3;
+window.__MOCK_SET_ACTIVATION_RISK__ = (id) => mockActivationRisk.add(id);
+window.__MOCK_CLEAR_ACTIVATION_RISK__ = () => mockActivationRisk.clear();
+window.__MOCK_HAS_ACTIVATION_RISK__ = (id) => mockActivationRisk.has(id);
 
 // 各命令的 mock 实现；返回 null/对象都行，未列出的命令回退为 null 并告警
 const commands = {
@@ -42,7 +48,17 @@ const commands = {
   },
 
   async claim_preview({ id }) { return mockClaimPlans(id); },
-  async claim_refresh({ id }) { return { plans: mockClaimPlans(id), activated: false, activation_error: null }; },
+  async claim_refresh({ id }) {
+    // 字段名与真实后端一致（camelCase activationError）；测试钩子模拟事件上报被风控拦截
+    window.__LAST_CLAIM_REFRESH_ID__ = id;
+    return {
+      plans: mockClaimPlans(id),
+      activated: false,
+      activationError: mockActivationRisk.has(id)
+        ? "领取请求失败 HTTP 405: request has been blocked due to unusual activity"
+        : null,
+    };
+  },
 
   async claim_start({ id }) {
     const acc = mockAccounts().find((a) => a.id === id);

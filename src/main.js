@@ -1662,11 +1662,14 @@ const actions = {
     if (!ids.length) return;
     for (const id of ids) {
       if (freeze) frozenIds.add(id);
-      else frozenIds.delete(id);
-      if (freeze && autoFrozenAt[id]) { delete autoFrozenAt[id]; }
+      else {
+        frozenIds.delete(id);
+        delete autoFrozenAt[id];
+        autoRiskStreak[id] = 0;
+        delete autoClaimCooldown[id];
+      }
     }
-    if (ids.length) saveFrozen();
-    if (ids.length) saveAutoFrozen();
+    if (ids.length) { saveFrozen(); saveAutoFrozen(); }
     toast(t(freeze ? "list.toastBulkFrozen" : "list.toastBulkUnfrozen", { n: ids.length }), "ok", t("m.frozenDetail"));
     render();
     // 冻结在用账号 = 明确要求切走：立即触发自动切换
@@ -2094,7 +2097,14 @@ const actions = {
   /** 手动冻结/解冻：冻结的账号单独分组，绝不参与自动切换（手动切换不受影响） */
   toggleFreeze(id) {
     toggleFrozen(id);
-    if (isFrozen(id) && autoFrozenAt[id]) { delete autoFrozenAt[id]; saveAutoFrozen(); }
+    // 解冻 = 重新入轮换：清干净自动冻结标记/风控计数/探测冷却，避免残留导致
+    // 此后无法再次自动冻结、或旧冷却压住新状态
+    if (!isFrozen(id)) {
+      delete autoFrozenAt[id];
+      autoRiskStreak[id] = 0;
+      delete autoClaimCooldown[id];
+      saveAutoFrozen();
+    }
     render();
     const name = accountName(id);
     toast(t(isFrozen(id) ? "m.frozenToast" : "m.unfrozenToast", { name }), "ok", t("m.frozenDetail"));
@@ -2574,6 +2584,10 @@ async function autoClaimTick() {
       try {
         const r = await invoke("claim_refresh", { id });
         claimable[id] = { plans: r.plans || [], err: null, busy: false };
+        // 事件上报（activation POST）的风控响应同样实时记账：
+        // 上游在 event/report 上返回拒绝码/HTTP 错误 = 该号已被风控盯上，
+        // 与领取失败共用同一套双信号冻结判定
+        if (r.activationError && riskInText(stripErr(r.activationError))) noteClaimRisk(id);
       } catch (e) {
         claimable[id] = { plans: claimable[id]?.plans || [], err: String(e), busy: false };
         if (riskInText(stripErr(e))) noteClaimRisk(id);
