@@ -20,6 +20,7 @@ let appVer = "";
 let acctQuota = {};
 let claimable = {};
 let claimAllRunning = false;
+let claimAllAbort = false;
 let claimAllState = { running: false, done: 0, total: 0 };
 
 const AUTO_CLAIM_INTERVAL_MS = 10 * 60 * 1000;
@@ -39,6 +40,20 @@ let autoClaimEmptyRounds = {};
 // 连续领取失败轮数 → 失败冷却同样翻倍至 24h 封顶：持续失败的领取多半是
 // 号被标记/资格问题，每 30min 重试只会加固风控画像
 let autoClaimFailRounds = {};
+// 自动风控冻结：连续 2 次风控信号且仍有额度的账号自动冻结（不参与自动切换），
+// 3h 冷却到期后随领取轮探测，提交成功即自动解冻。手动冻结不在此列（永不自动解冻）
+const AUTO_FROZEN_KEY = "zsw-auto-frozen";
+let autoFrozenAt = (() => {
+  try { return JSON.parse(localStorage.getItem(AUTO_FROZEN_KEY) || "{}"); }
+  catch { return {}; }
+})();
+function saveAutoFrozen() {
+  try { localStorage.setItem(AUTO_FROZEN_KEY, JSON.stringify(autoFrozenAt)); } catch { /* 忽略 */ }
+}
+let autoRiskStreak = {};
+function riskInText(text) {
+  return /HTTP \d{3}|unusual activity|blocked/i.test(String(text || ""));
+}
 // 手动操作（单账号领取/手动刷新/一键领取）抢占自动轮时置位：轮次就地收尾，
 // 手动完成后由后续 tick 接续余下账号（tick 开始时复位）
 let autoClaimPaused = false;
@@ -1154,8 +1169,7 @@ function poolsTabHtml(tot) {
       ${open && srcs ? `<div class="qhp-arows">${srcs}</div>` : ""}
     </div>`;
   }).join("");
-  return `<div class="qhp-sec">${esc(t("list.qhpSecPools"))}</div>${legend}${rows}
-    <div class="qhp-hint">${esc(t("list.qhpExpandHint"))}</div>`;
+  return `<div class="qhp-sec">${esc(t("list.qhpSecPools"))}</div>${legend}${rows}`;
 }
 
 /** y 轴取整到「好看」的刻度（1/1.2/1.5/2/2.5/3/4/5/6/8/10 × 10^k） */
@@ -1231,8 +1245,7 @@ function usageTabHtml() {
     <div class="qhp-trend-wrap">${trendChartHtml(u.daily)}</div>
     <div class="qhp-sec">${esc(t("list.qhpSecModels"))}</div>
     <div class="qhp-uhead"><span>${esc(t("list.qhUsageModel"))}</span><span>${esc(t("list.qhUsageToday"))}</span><span>${esc(t("list.qhUsageWeek"))}</span><span>${esc(t("list.qhpColShare"))}</span></div>
-    ${rows}
-    <div class="qhp-hint">${esc(t("list.qhUsageNote"))}</div>`;
+    ${rows}`;
 }
 
 function quotaPanelHtml(tot) {
@@ -1254,16 +1267,19 @@ function quotaPanelHtml(tot) {
       <button class="qhd-tab${tab === QH_TAB_USAGE ? " on" : ""}" click="actions.setQhTab('${QH_TAB_USAGE}')">${esc(t("list.qhUsageTab"))}</button>
     </div>
     <div class="qhd-body" data-qh-scroll>${body}</div>
-    <div class="qh-foot">${esc(t("list.qhUsageNote"))}</div>
+    <div class="qh-foot">${esc(tab === QH_TAB_USAGE ? t("list.qhUsageNote") : t("list.qhpExpandHint"))}</div>
   </div>`;
 }
 
 function bulkBarHtml() {
-  const n = selectedIds().length;
+  const ids = selectedIds();
+  const n = ids.length;
   if (!n) return "";
+  const allFrozen = ids.every((id) => isFrozen(id));
   return `<div class="bulk-bar">
     <span class="bulk-n">${esc(t("list.selected", { n }))}</span>
     <span class="lh-sp"></span>
+    <button class="btn-ghost has-ic" click="actions.doBulkFreeze(${allFrozen ? "false" : "true"})">${ic("snow", 13)} ${allFrozen ? t("list.bulkUnfreeze") : t("list.bulkFreeze")}</button>
     <button class="btn-ghost danger has-ic" click="actions.askBulkDelete()">${ic("x", 13)} ${t("list.bulkDelete")}</button>
     <button class="btn-ghost" click="actions.clearSelection()">${t("list.clearSel")}</button>
   </div>`;
@@ -1412,7 +1428,7 @@ function preemptAutoClaim() {
   if (w) w.finish({ ok: false, code: "preempted", accountId: w.accountId, accountName: accountName(w.accountId) });
   return invoke("claim_cancel").catch(() => {});
 }
-async function waitAutoClaimWindDown(timeoutMs = 10000) {
+async function waitAutoClaimWindDown(timeoutMs = 15000) {
   const deadline = Date.now() + timeoutMs;
   while (autoClaimRunning && Date.now() < deadline) {
     await new Promise((r) => setTimeout(r, 100));
@@ -1640,6 +1656,25 @@ const actions = {
     });
   },
 
+  /** 批量冻结/解冻：冻结的账号不参与自动切换（手动切换不受影响） */
+  doBulkFreeze(freeze) {
+    const ids = selectedIds();
+    if (!ids.length) return;
+    for (const id of ids) {
+      if (freeze) frozenIds.add(id);
+      else frozenIds.delete(id);
+      if (freeze && autoFrozenAt[id]) { delete autoFrozenAt[id]; }
+    }
+    if (ids.length) saveFrozen();
+    if (ids.length) saveAutoFrozen();
+    toast(t(freeze ? "list.toastBulkFrozen" : "list.toastBulkUnfrozen", { n: ids.length }), "ok", t("m.frozenDetail"));
+    render();
+    // 冻结在用账号 = 明确要求切走：立即触发自动切换
+    if (freeze && state?.auto_switch && ids.some((id) => state?.accounts?.some((a) => a.id === id && a.is_active))) {
+      autoSwitchTick(true);
+    }
+  },
+
   async doBulkDelete(ids) {
     await guard(async () => {
       let ok = 0;
@@ -1713,7 +1748,7 @@ const actions = {
       // 且持久化缓存会把已删除的号一直带下去（下次启动又出现）
       delete acctQuota[id]; delete quotaHist[id]; delete quotaSampleAt[id];
       delete quotaDue[id]; delete quotaFailStreak[id]; delete quotaForceAt[id];
-      delete autoClaimCooldown[id]; delete autoClaimEmptyRounds[id]; delete autoClaimFailRounds[id]; delete claimable[id];
+      delete autoClaimCooldown[id]; delete autoClaimEmptyRounds[id]; delete autoClaimFailRounds[id]; delete autoFrozenAt[id]; delete autoRiskStreak[id]; delete claimable[id];
       ui.selected.delete(id); ui.expanded.delete(id);
       markQuotaCacheDirty(); flushQuotaCache(true);
       toast(t("m.toastDeleted"));
@@ -2059,6 +2094,7 @@ const actions = {
   /** 手动冻结/解冻：冻结的账号单独分组，绝不参与自动切换（手动切换不受影响） */
   toggleFreeze(id) {
     toggleFrozen(id);
+    if (isFrozen(id) && autoFrozenAt[id]) { delete autoFrozenAt[id]; saveAutoFrozen(); }
     render();
     const name = accountName(id);
     toast(t(isFrozen(id) ? "m.frozenToast" : "m.unfrozenToast", { name }), "ok", t("m.frozenDetail"));
@@ -2298,6 +2334,7 @@ const actions = {
       if (!r) toast(t("m.claimTimeout"), "warn");
       else pokeAccount(id);
     } catch (e) {
+      if (riskInText(stripErr(e))) noteClaimRisk(id);
       toast(stripErr(e), "err");
     } finally {
       claimActive = false;
@@ -2307,9 +2344,17 @@ const actions = {
   },
 
   async claimAll() {
-    const ids = (state?.accounts || [])
-      .map((a) => a.id)
-      .filter((id) => (claimable[id]?.plans || []).length > 0);
+    // 批处理进行中：再点一次 = 停止（当前账号完成后收尾）
+    if (claimAllState.running) {
+      claimAllAbort = true;
+      toast(t("m.claimAllStopping"), "warn");
+      return;
+    }
+    const ids = accountsNewFirst(
+      (state?.accounts || [])
+        .map((a) => a.id)
+        .filter((id) => (claimable[id]?.plans || []).length > 0),
+    );
     if (!ids.length) { toast(t("m.noClaimableAccounts"), "warn"); return; }
     if (claimActive && !autoClaimRunning) return;
     const preemptRound = autoClaimRunning;
@@ -2319,10 +2364,13 @@ const actions = {
     }
     claimAllRunning = true;
     claimActive = true;
+    claimAllAbort = false;
     claimAllState = { running: true, done: 0, total: ids.length };
     render();
+    let stopped = false;
     try {
       for (let i = 0; i < ids.length; i++) {
+        if (claimAllAbort) { stopped = true; break; }
         const id = ids[i];
         claimAllState.done = i;
         if (!isTyping()) render();
@@ -2331,21 +2379,43 @@ const actions = {
         try {
           await invoke("claim_start", { id, planId: plan.plan_id });
         } catch (e) {
+          if (riskInText(stripErr(e))) noteClaimRisk(id);
           toast(t("m.claimAccountErr", { name, err: stripErr(e) }), "err");
+          // 单账号失败：该号进入冷却，批次继续（一个号的问题不代表其他号）
+          autoClaimCooldown[id] = Math.max(autoClaimCooldown[id] ?? 0,
+            Date.now() + autoClaimGap(AUTO_CLAIM_FAIL_MIN_MS));
           continue;
         }
         const r = await waitForClaimResult(id, 120000);
         if (!r) {
           toast(t("m.claimAcctTimeout", { name }), "warn");
           await invoke("claim_cancel").catch(() => {});
-        } else pokeAccount(id);
-        if (i < ids.length - 1) await new Promise((res) => setTimeout(res, 1200));
+          autoClaimCooldown[id] = Math.max(autoClaimCooldown[id] ?? 0,
+            Date.now() + autoClaimGap(AUTO_CLAIM_FAIL_MIN_MS));
+          continue;
+        }
+        if (r.ok === false) {
+          // 单账号失败 ≠ 其他账号也会失败：该号进入冷却（风控信号则冻结数小时），
+          // 批次继续但降速
+          autoClaimCooldown[id] = Math.max(autoClaimCooldown[id] ?? 0, autoClaimCooldownFor(r));
+          if (claimFailureRisk(r)) {
+            autoClaimCooldown[id] = Date.now() + autoClaimGap(3 * 60 * 60 * 1000);
+            autoClaimSlowUntil = Date.now() + 5 * 60 * 1000;
+          }
+          continue;
+        }
+        pokeAccount(id);
+        if (i < ids.length - 1) await new Promise((res) => setTimeout(res,
+          (1200 + Math.random() * 1200) * (Date.now() < autoClaimSlowUntil ? 2.5 : 1)));
       }
     } finally {
+      const done = claimAllState.done;
+      const total = claimAllState.total;
       claimAllRunning = false;
       claimActive = false;
       claimAllState = { running: false, done: 0, total: 0 };
       render();
+      if (stopped) toast(t("m.claimAllStopped", { done, total }), "warn");
       if (preemptRound) setTimeout(() => autoClaimTick(), 2500);
     }
   },
@@ -2412,6 +2482,16 @@ const actions = {
   },
 };
 
+// 新入库账号排前：新号礼包好领、资格激活收益最高（自动轮与手动批处理共用）
+function accountsNewFirst(ids) {
+  const createdAt = (id) => {
+    const a = (state?.accounts || []).find((x) => x.id === id);
+    return Date.parse(String(a?.created_at || "").replace(" ", "T")) || 0;
+  };
+  return [...ids].sort((x, y) => createdAt(y) - createdAt(x));
+}
+// 风控降速：出现风控信号后 5 分钟内，轮内/批内账号间隙放大 2.5 倍
+let autoClaimSlowUntil = 0;
 // 冷却去相位：±50% 抖动。76 个账号若在同一轮同时进入冷却，到期会同时对齐，
 // 形成每 10/30 分钟一次的请求风暴（今天日志 12:00 的 54 次/2min 爆发即此形态）
 function autoClaimGap(ms) {
@@ -2419,6 +2499,44 @@ function autoClaimGap(ms) {
 }
 // 领取失败的冷却下限：30 分钟。上游拒绝后的快速重试只会加固风控画像
 const AUTO_CLAIM_FAIL_MIN_MS = 30 * 60 * 1000;
+// 风控信号判定：HTTP 层拒绝（405/429/401 等）或上游明确提示异常活动——
+// 这类失败继续打只会让整个 IP 画像恶化，必须立即熔断而不是换号继续
+function claimFailureRisk(r) {
+  return r.ok === false && riskInText(r.message);
+}
+
+/** 风控信号记账：连续 2 次 + 仍有额度 → 自动冻结（数小时后随轮次探测恢复） */
+function noteClaimRisk(id) {
+  if (isFrozen(id) && !autoFrozenAt[id]) return; // 手动冻结：用户决定，不介入
+  autoRiskStreak[id] = (autoRiskStreak[id] || 0) + 1;
+  if (autoRiskStreak[id] < 2) return; // 单次信号不冻，防瞬时抖动误判
+  if (autoFrozenAt[id]) { // 已在自动冻结期：顺延探测时间即可
+    autoClaimCooldown[id] = Date.now() + autoClaimGap(3 * 60 * 60 * 1000);
+    return;
+  }
+  const h = healthMapOf().get(id);
+  if (!h || h.remainingPct == null || h.remainingPct <= 0) return; // 无额度：交给正常耗尽判定
+  frozenIds.add(id);
+  autoFrozenAt[id] = Date.now();
+  autoClaimCooldown[id] = Date.now() + autoClaimGap(3 * 60 * 60 * 1000);
+  saveFrozen(); saveAutoFrozen();
+  toast(t("m.autoFrozenToast", { name: accountName(id) }), "warn", t("m.autoFrozenDetail"));
+  render();
+}
+
+/** 探测通过（提交成功）→ 自动解冻恢复 */
+function autoUnfreeze(id) {
+  if (!isFrozen(id)) return;
+  const wasAuto = !!autoFrozenAt[id];
+  delete autoFrozenAt[id];
+  autoRiskStreak[id] = 0;
+  frozenIds.delete(id);
+  saveFrozen(); saveAutoFrozen();
+  toast(t("m.autoUnfrozenToast", { name: accountName(id) }), "ok",
+    wasAuto ? t("m.autoUnfrozenDetail") : t("m.manualUnfrozenDetail"));
+  pokeAccount(id);
+  render();
+}
 function autoClaimCooldownFor(r) {
   const now = Date.now();
   if (r.code === 1005 && r.nextAt) return Math.max(r.nextAt, now + AUTO_CLAIM_FAIL_MIN_MS);
@@ -2432,10 +2550,11 @@ function autoClaimCooldownFor(r) {
 async function autoClaimTick() {
   if (!state?.auto_claim || autoClaimRunning) return;
   if (claimActive || claimAllRunning) return;
-  const ids = (state.accounts || [])
-    .map((a) => a.id)
-    .filter((id) => (autoClaimCooldown[id] ?? 0) <= Date.now())
-    .slice(0, AUTO_CLAIM_ROUND_CAP);
+  const ids = accountsNewFirst(
+    (state.accounts || [])
+      .map((a) => a.id)
+      .filter((id) => (autoClaimCooldown[id] ?? 0) <= Date.now()),
+  ).slice(0, AUTO_CLAIM_ROUND_CAP);
   if (!ids.length) {
     if ((state.accounts || []).some((a) => (claimable[a.id]?.plans || []).length > 0)) {
       lastAutoRound = { at: Date.now(), claimed: 0, skipped: 0, cooldownAll: true };
@@ -2457,6 +2576,7 @@ async function autoClaimTick() {
         claimable[id] = { plans: r.plans || [], err: null, busy: false };
       } catch (e) {
         claimable[id] = { plans: claimable[id]?.plans || [], err: String(e), busy: false };
+        if (riskInText(stripErr(e))) noteClaimRisk(id);
         autoClaimCooldown[id] = Date.now() + autoClaimGap(AUTO_CLAIM_INTERVAL_MS);
         roundSkipped++;
         continue;
@@ -2478,6 +2598,7 @@ async function autoClaimTick() {
             break;
           }
         } catch (e) {
+          if (riskInText(stripErr(e))) noteClaimRisk(id);
           await invoke("claim_cancel").catch(() => {});
           autoClaimCooldown[id] = Date.now() + autoClaimGap(AUTO_CLAIM_INTERVAL_MS);
           failed = true;
@@ -2495,6 +2616,12 @@ async function autoClaimTick() {
           const streak = (autoClaimFailRounds[id] = (autoClaimFailRounds[id] || 0) + 1);
           const escalate = Date.now() + autoClaimGap(AUTO_CLAIM_FAIL_MIN_MS * (2 ** Math.min(streak - 1, 3)));
           autoClaimCooldown[id] = Math.max(autoClaimCooldownFor(r), escalate);
+          // 风控信号：只冻结该账号数小时（几小时后自动分批重试），轮次继续
+          // 但整体降速——一个号 405 不代表其他号也有问题，整轮停止过度保守
+          if (claimFailureRisk(r)) {
+            autoClaimCooldown[id] = Date.now() + autoClaimGap(3 * 60 * 60 * 1000);
+            autoClaimSlowUntil = Date.now() + 5 * 60 * 1000;
+          }
           failed = true;
           break;
         }
@@ -2520,10 +2647,11 @@ async function autoClaimTick() {
           autoClaimCooldown[id] = Date.now() + autoClaimGap(AUTO_CLAIM_INTERVAL_MS);
         }
       }
-      // 轮内账号间隙 12s±50%：一轮 76 账号从 ~6 分钟摊到 ~15 分钟，
-      // 领取端点（activation/preview/submit）的顺序扫账号节奏减半——同 IP 顺序
-      // 轮询多账号本身即风控信号，间距是最有效的压降手段
-      await new Promise((res) => setTimeout(res, AUTO_CLAIM_ACCT_GAP_MS * (1 + Math.random() * 0.5)));
+      // 轮内账号间隙 12s±50%（风控信号后 5 分钟内 ×2.5）：一轮 76 账号从 ~6 分钟
+      // 摊到 ~15 分钟，领取端点（activation/preview/submit）的顺序扫账号节奏减半
+      // ——同 IP 顺序轮询多账号本身即风控信号，间距是最有效的压降手段
+      await new Promise((res) => setTimeout(res,
+        AUTO_CLAIM_ACCT_GAP_MS * (1 + Math.random() * 0.5) * (Date.now() < autoClaimSlowUntil ? 2.5 : 1)));
     }
   } finally {
     autoClaimRunning = false; claimActive = false;
@@ -2876,7 +3004,7 @@ function renderProgressSig() {
 function giftBtnHtml(claimableCount) {
   return `<button class="icon-btn tb-btn tb-gift${claimAllState.running ? " running" : ""}" data-gift-btn click="actions.claimAll()" ${claimAllRunning || (claimActive && !autoClaimRunning) ? "disabled" : ""}
       aria-label="${t("btn.claimAll")}" title="${claimAllState.running
-        ? esc(t("btn.claimAllRunning", { done: claimAllState.done, total: claimAllState.total }))
+        ? esc(t("btn.claimAllRunning", { done: claimAllState.done, total: claimAllState.total }) + " · " + t("btn.claimAllStopHint"))
         : esc(t("btn.claimAllTitle"))}${claimableCount > 1 ? ` (${claimableCount})` : ""}">
       ${ic("gift", 17)}${claimAllState.running
         ? `<span class="tb-badge">${claimAllState.done}/${claimAllState.total}</span>`
@@ -3136,10 +3264,11 @@ function render(force = false) {
     }
     // 身份信息与账号名去重：用户名与账号名相同时不再在 meta 行重复展示
     const nm = String(a.name || "").trim().toLowerCase();
-    const ident = [a.identity?.username, a.identity?.email]
+    // 身份信息只显示邮箱（无邮箱回退用户名），不再拼「名称 · 邮箱」
+    const ident = [a.identity?.email, a.identity?.username]
       .filter(Boolean)
-      .filter((x) => x.trim().toLowerCase() !== nm)
-      .join(" · ");
+      .map((x) => x.trim())
+      .filter((x) => x.toLowerCase() !== nm)[0] || "";
     const q = acctQuota[a.id];
     let meta = "";
     if (!a.has_config) meta += `<span class="meta-chip warn" title="${esc(t("q.noCfg"))}">${esc(t("q.noCfgShort"))}</span>`;
@@ -3221,10 +3350,11 @@ function render(force = false) {
       </div>`;
     }
     const nm = String(a.name || "").trim().toLowerCase();
-    const ident = [a.identity?.username, a.identity?.email]
+    // 身份信息只显示邮箱（无邮箱回退用户名），不再拼「名称 · 邮箱」
+    const ident = [a.identity?.email, a.identity?.username]
       .filter(Boolean)
-      .filter((x) => x.trim().toLowerCase() !== nm)
-      .join(" · ");
+      .map((x) => x.trim())
+      .filter((x) => x.toLowerCase() !== nm)[0] || "";
     const q = acctQuota[a.id];
     // meta 行固定一行：档位/礼物徽标 + 状态徽标在前，身份信息殿后（溢出省略）
     let meta = `${tierBadgeFor(a.id)}`;
@@ -3383,6 +3513,7 @@ if (import.meta.env.DEV) {
     get autoAbortRequested() { return autoAbortRequested; },
     get cooldowns() { return { ...autoClaimCooldown }; },
     get emptyRounds() { return { ...autoClaimEmptyRounds }; },
+    clearCooldowns() { for (const k of Object.keys(autoClaimCooldown)) delete autoClaimCooldown[k]; },
     tick: () => autoClaimTick(),
   };
 }
@@ -3416,7 +3547,10 @@ listen("claim://result", (ev) => {
       msg += t("m.claimNextAt", { time: new Date(p.nextAt).toLocaleString(localeTag(), { hour12: false }) });
     }
     toast(t("m.claimFailed", { name: p.accountName, msg }), "err");
+    if (claimFailureRisk(p)) noteClaimRisk(p.accountId); // 风控信号记账（双信号确认后自动冻结）
   } else {
+    autoRiskStreak[p.accountId] = 0; // 领取成功：风控怀疑清零
+    if (isFrozen(p.accountId)) autoUnfreeze(p.accountId); // 探测通过 → 解冻（手动/自动一视同仁）
     const bits = [];
     const now = p.serverTime || Date.now();
     if (p.startsAt && p.startsAt > now) bits.push(t("m.claimStartsAt", { time: new Date(p.startsAt).toLocaleString(localeTag(), { hour12: false }) }));
