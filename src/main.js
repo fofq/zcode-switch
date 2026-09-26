@@ -34,6 +34,14 @@ const AUTO_CLAIM_FIRST_DELAY_MS = 2 * 60 * 1000;
 const AUTO_CLAIM_WAIT_MS = 45_000;
 const AUTO_CLAIM_PER_ACCOUNT_CAP = 5;
 const AUTO_CLAIM_ACCT_GAP_MS = 5_000;
+// 单轮最多处理的账号数：冷启动/冷却对齐时不至于一轮打穿全部账号，
+// 余下的交给下一个 60s tick（autoClaimRunning 串行化）
+const AUTO_CLAIM_ROUND_CAP = 25;
+// 连续空手（无可领礼包）轮数 → 冷却 30min 翻倍至 4h 封顶
+let autoClaimEmptyRounds = {};
+// 手动操作（单账号领取/手动刷新/一键领取）抢占自动轮时置位：轮次就地收尾，
+// 手动完成后由后续 tick 接续余下账号（tick 开始时复位）
+let autoClaimPaused = false;
 const AUTO_ABORT_WAIT_MS = 90_000;
 let autoClaimRunning = false;
 let autoClaimCooldown = {};
@@ -1403,6 +1411,24 @@ function waitForClaimResult(accountId, timeoutMs = 90000) {
   });
 }
 
+// 手动操作抢占自动领取轮：立即终结进行中的等待、取消挂起领取，
+// 轮次就地收尾（finally 释放 autoClaimRunning）；被抢占账号 90s 后即可重试，
+// 余下账号由后续 tick 接续。手动领取/手动刷新完成后自动恢复。
+function preemptAutoClaim() {
+  autoAbortRequested = true;
+  autoClaimPaused = true;
+  const w = claimWaiter;
+  if (w) w.finish({ ok: false, code: "preempted", accountId: w.accountId, accountName: accountName(w.accountId) });
+  return invoke("claim_cancel").catch(() => {});
+}
+async function waitAutoClaimWindDown(timeoutMs = 10000) {
+  const deadline = Date.now() + timeoutMs;
+  while (autoClaimRunning && Date.now() < deadline) {
+    await new Promise((r) => setTimeout(r, 100));
+  }
+  return !autoClaimRunning;
+}
+
 async function awaitClaimPreviewFresh(id) {
   claimable[id] = { ...(claimable[id] || {}), busy: true };
   try {
@@ -1661,7 +1687,9 @@ const actions = {
         await loadAcctQuota(id, { quick: true });
         quotaSweep.done++;
         if (!isTyping()) render();
-        await new Promise((r) => setTimeout(r, 200));
+        // 批量刷新限速：每账号 1.2s±40%。一次全量 = 76 × 2-3 个上游请求，
+        // 旧的 200ms 节奏会在 ~30s 内堆出 150+ 请求，直接触发风控
+        await new Promise((r) => setTimeout(r, 1200 + Math.random() * 800));
       }
     } finally {
       const done = quotaSweep.done;
@@ -1701,7 +1729,7 @@ const actions = {
       // 且持久化缓存会把已删除的号一直带下去（下次启动又出现）
       delete acctQuota[id]; delete quotaHist[id]; delete quotaSampleAt[id];
       delete quotaDue[id]; delete quotaFailStreak[id]; delete quotaForceAt[id];
-      delete autoClaimCooldown[id]; delete claimable[id];
+      delete autoClaimCooldown[id]; delete autoClaimEmptyRounds[id]; delete claimable[id];
       ui.selected.delete(id); ui.expanded.delete(id);
       markQuotaCacheDirty(); flushQuotaCache(true);
       toast(t("m.toastDeleted"));
@@ -2266,14 +2294,22 @@ const actions = {
   },
 
   async claim(id) {
-    if (claimActive || claimAllRunning || refreshClaim.running) { toast(t("m.claimBusy"), "warn"); return; }
+    // 自动领取轮进行中：允许手动抢占（轮次就地收尾、稍后自动续跑余下账号）；
+    // 一键领取批处理与资格刷新仍互斥
+    if (claimAllRunning || refreshClaim.running) { toast(t("m.claimBusy"), "warn"); return; }
+    if (claimActive && !autoClaimRunning) return;
     const plans = claimable[id]?.plans || [];
     const plan = plans[0];
     if (!plan) { toast(t("m.noClaimable"), "warn"); return; }
+    const preemptRound = autoClaimRunning;
+    if (preemptRound) {
+      await preemptAutoClaim();
+      if (!(await waitAutoClaimWindDown())) return; // 极端未收尾：放弃本次手动领取
+    }
     claimActive = true;
     try {
       await invoke("claim_start", { id, planId: plan.plan_id });
-      toast(t("m.claimVerify", { name: plan.name || plan.plan_id }), "ok", t("m.claimVerifyDetail"));
+      toast(t("m.claimVerify", { name: planDisplayName(plan.name || plan.plan_id) }), "ok", t("m.claimVerifyDetail"));
       const r = await waitForClaimResult(id);
       if (!r) toast(t("m.claimTimeout"), "warn");
       else pokeAccount(id);
@@ -2281,6 +2317,8 @@ const actions = {
       toast(stripErr(e), "err");
     } finally {
       claimActive = false;
+      // 被抢占的自动轮：手动领取结束后尽快续跑余下账号
+      if (preemptRound) setTimeout(() => autoClaimTick(), 2500);
     }
   },
 
@@ -2289,7 +2327,13 @@ const actions = {
       .map((a) => a.id)
       .filter((id) => (claimable[id]?.plans || []).length > 0);
     if (!ids.length) { toast(t("m.noClaimableAccounts"), "warn"); return; }
-    if (claimActive || claimAllRunning || refreshClaim.running) return;
+    if (refreshClaim.running) return;
+    if (claimActive && !autoClaimRunning) return;
+    const preemptRound = autoClaimRunning;
+    if (preemptRound) {
+      await preemptAutoClaim();
+      if (!(await waitAutoClaimWindDown())) return;
+    }
     claimAllRunning = true;
     claimActive = true;
     claimAllState = { running: true, done: 0, total: ids.length };
@@ -2319,6 +2363,7 @@ const actions = {
       claimActive = false;
       claimAllState = { running: false, done: 0, total: 0 };
       render();
+      if (preemptRound) setTimeout(() => autoClaimTick(), 2500);
     }
   },
 
@@ -2334,12 +2379,9 @@ const actions = {
     refreshClaim = { running: true, done: 0, total: ids.length, cooldownUntil: 0 };
     startRefreshTicker();
     if (autoClaimRunning) {
-      autoAbortRequested = true;
-      const deadline = Date.now() + AUTO_ABORT_WAIT_MS;
-      while (autoClaimRunning && Date.now() < deadline) {
-        await new Promise((res) => setTimeout(res, 300));
-      }
-      if (autoClaimRunning) {
+      // 手动刷新最高优先级：立即抢占自动领取轮（终结等待 + 撤销挂起），毫秒级收尾
+      await preemptAutoClaim();
+      if (!(await waitAutoClaimWindDown())) {
         refreshClaim.running = false;
         refreshClaim.cooldownUntil = Date.now() + REFRESH_CLAIM_COOLDOWN_MS;
         toast(t("m.claimBusy"), "warn");
@@ -2453,12 +2495,21 @@ function stopRefreshTickerIfIdle() {
   }
 }
 
+// 冷却去相位：±50% 抖动。76 个账号若在同一轮同时进入冷却，到期会同时对齐，
+// 形成每 10/30 分钟一次的请求风暴（今天日志 12:00 的 54 次/2min 爆发即此形态）
+function autoClaimGap(ms) {
+  return Math.round(ms * (1 + Math.random() * 0.5));
+}
+// 领取失败的冷却下限：30 分钟。上游拒绝后的快速重试只会加固风控画像
+const AUTO_CLAIM_FAIL_MIN_MS = 30 * 60 * 1000;
 function autoClaimCooldownFor(r) {
   const now = Date.now();
-  if (r.code === 1005 && r.nextAt) return r.nextAt;
-  if (Number.isFinite(r.code) && r.code >= 1000) return now + 60 * 60 * 1000;
-  if (r.code === "interactive") return now + 60 * 60 * 1000;
-  return now + AUTO_CLAIM_INTERVAL_MS;
+  if (r.code === 1005 && r.nextAt) return Math.max(r.nextAt, now + AUTO_CLAIM_FAIL_MIN_MS);
+  if (Number.isFinite(r.code) && r.code >= 1000) return now + 60 * 60 * 1000 + autoClaimGap(10 * 60 * 1000);
+  if (r.code === "interactive") return now + 60 * 60 * 1000 + autoClaimGap(10 * 60 * 1000);
+  // 被手动操作抢占的账号：短冷却，手动领取结束后优先续跑
+  if (r.code === "preempted") return now + 90 * 1000;
+  return now + autoClaimGap(AUTO_CLAIM_FAIL_MIN_MS);
 }
 
 async function autoClaimTick() {
@@ -2466,19 +2517,20 @@ async function autoClaimTick() {
   if (claimActive || claimAllRunning || refreshClaim.running) return;
   const ids = (state.accounts || [])
     .map((a) => a.id)
-    .filter((id) => (autoClaimCooldown[id] ?? 0) <= Date.now());
+    .filter((id) => (autoClaimCooldown[id] ?? 0) <= Date.now())
+    .slice(0, AUTO_CLAIM_ROUND_CAP);
   if (!ids.length) {
     if ((state.accounts || []).some((a) => (claimable[a.id]?.plans || []).length > 0)) {
       lastAutoRound = { at: Date.now(), claimed: 0, skipped: 0, cooldownAll: true };
     }
     return;
   }
-  autoClaimRunning = true; claimActive = true; autoAbortRequested = false;
+  autoClaimRunning = true; claimActive = true; autoAbortRequested = false; autoClaimPaused = false;
   let roundClaimed = 0, roundSkipped = 0;
   if (!uiLocked()) render();
   try {
     for (const id of ids) {
-      if (!state?.auto_claim || autoAbortRequested) break;
+      if (!state?.auto_claim || autoAbortRequested || autoClaimPaused) break;
       if (!(state.accounts || []).some((a) => a.id === id)) continue;
       let gotAny = false;
       let failed = false;
@@ -2488,7 +2540,7 @@ async function autoClaimTick() {
         claimable[id] = { plans: r.plans || [], err: null, busy: false };
       } catch (e) {
         claimable[id] = { plans: claimable[id]?.plans || [], err: String(e), busy: false };
-        autoClaimCooldown[id] = Date.now() + AUTO_CLAIM_INTERVAL_MS;
+        autoClaimCooldown[id] = Date.now() + autoClaimGap(AUTO_CLAIM_INTERVAL_MS);
         roundSkipped++;
         continue;
       }
@@ -2496,23 +2548,28 @@ async function autoClaimTick() {
       let attempts = 0;
       let progressed = true;
       while (progressed && attempts < AUTO_CLAIM_PER_ACCOUNT_CAP) {
-        if (autoAbortRequested) break;
+        if (autoAbortRequested || autoClaimPaused) break;
         attempts++;
         progressed = false;
         const plan = claimable[id]?.plans?.[0];
         if (!plan) break;
         try {
           await invoke("claim_start", { id, planId: plan.plan_id, auto: true });
+          // 手动操作抢占：claim_start 刚挂上的 pending 立即撤销，避免与新手动领取争抢全局槽位
+          if (autoAbortRequested || autoClaimPaused) {
+            await invoke("claim_cancel").catch(() => {});
+            break;
+          }
         } catch (e) {
           await invoke("claim_cancel").catch(() => {});
-          autoClaimCooldown[id] = Date.now() + AUTO_CLAIM_INTERVAL_MS;
+          autoClaimCooldown[id] = Date.now() + autoClaimGap(AUTO_CLAIM_INTERVAL_MS);
           failed = true;
           break;
         }
         const r = await waitForClaimResult(id, AUTO_CLAIM_WAIT_MS);
         if (!r) {
           await invoke("claim_cancel").catch(() => {});
-          autoClaimCooldown[id] = Date.now() + AUTO_CLAIM_INTERVAL_MS;
+          autoClaimCooldown[id] = Date.now() + autoClaimGap(AUTO_CLAIM_INTERVAL_MS);
           failed = true;
           break;
         }
@@ -2529,12 +2586,19 @@ async function autoClaimTick() {
         progressed = true;
         await new Promise((res) => setTimeout(res, 1200));
       }
+      if (gotAny) autoClaimEmptyRounds[id] = 0;
       if (!gotAny && (claimable[id]?.plans || []).length) roundSkipped++;
-      // 统一收尾冷却：有失败走失败时已设的冷却；领完/无可领 → 30 分钟后再查。
-      // 不设冷却的话每轮都会把所有无 pending 的账号重复刷一遍领奖接口
+      // 统一收尾冷却（带去相位抖动）：有失败走失败时已设的冷却；
+      // 连续空手的账号渐进退避 30min → 1h → 2h → 4h —— 76 个账号里绝大多数
+      // 从来没有礼包，不该以固定 30min 的频率轮询领奖接口（今天 654 次激活上报的根源）
       if (!failed) {
         const remaining = (claimable[id]?.plans || []).length;
-        autoClaimCooldown[id] = Date.now() + (remaining === 0 ? AUTO_CLAIM_RECHECK_MS : AUTO_CLAIM_INTERVAL_MS);
+        if (remaining === 0) {
+          const streak = (autoClaimEmptyRounds[id] = (autoClaimEmptyRounds[id] || 0) + 1);
+          autoClaimCooldown[id] = Date.now() + autoClaimGap(AUTO_CLAIM_RECHECK_MS * (2 ** Math.min(streak - 1, 3)));
+        } else {
+          autoClaimCooldown[id] = Date.now() + autoClaimGap(AUTO_CLAIM_INTERVAL_MS);
+        }
       }
       await new Promise((res) => setTimeout(res, AUTO_CLAIM_ACCT_GAP_MS));
     }
@@ -2686,10 +2750,10 @@ function claimMiniBtnHtml(id) {
   const plan = c?.plans?.[0];
   if (!plan) return "";
   const grants = grantLabel(plan);
-  const label = plan.name || plan.plan_id;
+  const label = planDisplayName(plan.name || plan.plan_id);
   const tip = [label, grants, plan.description].filter(Boolean).join(" · ");
   return `<button class="card-claim" title="${esc(`${t("btn.claim")} · ${tip}`)}" aria-label="${esc(t("btn.claim"))}"
-    click="actions.claim('${id}')" ${claimAllRunning || refreshClaim.running || claimActive || autoClaimRunning ? "disabled" : ""}>${ic("gift", 15)}</button>`;
+    click="actions.claim('${id}')" ${claimAllRunning || refreshClaim.running || (claimActive && !autoClaimRunning) ? "disabled" : ""}>${ic("gift", 15)}</button>`;
 }
 
 function slotRowsHtml(items) {
@@ -2719,19 +2783,13 @@ function expireInfo(s) {
   return { text: soon && hasTime ? s : s.slice(0, 10), soon, warn };
 }
 
-/** 明细区是否已经有内容（有的话行内就不再重复显示额度小条） */
-function hasQuotaDetail(id) {
-  const q = acctQuota[id];
-  if (q?.busy || q?.err) return true;
-  const d = q?.data;
-  if (!d) return false;
-  if ((d.plans || []).length >= 2) return true;
-  if ((d.items || []).length) return true;
-  return d.percent_used != null;
+/** 套餐展示名：去掉中文后缀（礼包/活动包/体验包/包），只保留英文主体（Weekend Build 等） */
+function planDisplayName(name) {
+  return String(name || "").replace(/\s*(礼包|活动包|体验包|赠送包|包)\s*$/g, "").trim();
 }
 
 function planGroupHtml(p, omitTier = false) {
-  const label = p.tier_code === "other" && !p.pid ? t("q.other") : (p.name || p.tier || "");
+  const label = p.tier_code === "other" && !p.pid ? t("q.other") : planDisplayName(p.name || p.tier || "");
   const expiredTag = planExpired(p) ? `<span class="plan-expired">${esc(t("list.planExpired"))}</span>` : "";
   const exp = expireInfo(p.expire);
   return `
@@ -2893,7 +2951,7 @@ function renderProgressSig() {
 }
 
 function giftBtnHtml(claimableCount) {
-  return `<button class="icon-btn tb-btn tb-gift${claimAllState.running ? " running" : ""}" data-gift-btn click="actions.claimAll()" ${claimAllRunning || refreshClaim.running || autoClaimRunning ? "disabled" : ""}
+  return `<button class="icon-btn tb-btn tb-gift${claimAllState.running ? " running" : ""}" data-gift-btn click="actions.claimAll()" ${claimAllRunning || refreshClaim.running || (claimActive && !autoClaimRunning) ? "disabled" : ""}
       aria-label="${t("btn.claimAll")}" title="${claimAllState.running
         ? esc(t("btn.claimAllRunning", { done: claimAllState.done, total: claimAllState.total }))
         : esc(t("btn.claimAllTitle"))}${claimableCount > 1 ? ` (${claimableCount})` : ""}">
@@ -3019,14 +3077,22 @@ function patchQuotaDom() {
       const expSoon = slim && exp?.warn
         ? `<span class="meta-chip warn" title="${esc(t("q.validUntil", { date: exp.text }))}">${esc(expSoonLabel(exp))}</span>`
         : "";
-      // 卡片：chip 常驻在头像侧；列表：有明细时让位给明细区
-      const showChip = isCard || slim || !hasQuotaDetail(a.id);
+      // 卡片：chip 常驻（收起态的唯一额度指示）；列表：仅紧凑（slim）行显示
+      const showChip = isCard || slim;
       info.innerHTML = expSoon + (showChip ? quotaChipHtml(a.id, h) : "");
     }
     const slot = node.querySelector("[data-quota-slot]");
     if (slot) {
-      const fresh = cardQuotaSlotHtml(a.id);
-      if (fresh !== slot.outerHTML) slot.outerHTML = fresh;
+      // 卡片与列表行的槽位结构不同：卡片走 cardQuotaSlotHtml（收起=主额度条），
+      // 列表行走 quotaSlotInner（完整套餐组）——统一会用卡片的裸池条补丁列表行，
+      // 造成密度切换/额度更新时明细退化成裸条的布局错乱
+      const fresh = isCard
+        ? cardQuotaSlotHtml(a.id)
+        : (quotaSlotInner(a.id, !slim)
+            ? `<div class="row-quota-slot" data-quota-slot>${quotaSlotInner(a.id, !slim)}</div>`
+            : "");
+      if (!fresh) { slot.remove(); }
+      else if (fresh !== slot.outerHTML) slot.outerHTML = fresh;
     }
     const cs = node.querySelector("[data-claim-slot]");
     if (cs) {
@@ -3166,8 +3232,8 @@ function render(force = false) {
     }
     const checked = ui.selected.has(a.id);
     const slim = ui.density === "compact" && !ui.expanded.has(a.id);
-    // 详细（或已展开）且明细区有内容时，行内不再重复展示额度小条
-    const showChip = slim || !hasQuotaDetail(a.id);
+    // 额度小条仅紧凑（slim）行显示：详细模式明细区已有完整套餐组，同屏即设计混用
+    const showChip = slim;
     // 紧凑模式隐藏了 meta，这里只把“快到期”单独顶出来，避免漏看
     const expSoon = slim && exp?.warn
       ? `<span class="meta-chip warn" title="${esc(t("q.validUntil", { date: exp.text }))}">${esc(expSoonLabel(exp))}</span>`
@@ -3384,6 +3450,20 @@ function render(force = false) {
 }
 
 window.actions = actions;
+// DEV 预览调试钩子（生产构建剔除）：读取领取/刷新守卫的实时状态
+if (import.meta.env.DEV) {
+  window.__zswDebug = {
+    get autoClaimRunning() { return autoClaimRunning; },
+    get claimActive() { return claimActive; },
+    get claimAllRunning() { return claimAllRunning; },
+    get refreshClaimRunning() { return refreshClaim.running; },
+    get autoClaimPaused() { return autoClaimPaused; },
+    get autoAbortRequested() { return autoAbortRequested; },
+    get cooldowns() { return { ...autoClaimCooldown }; },
+    get emptyRounds() { return { ...autoClaimEmptyRounds }; },
+    tick: () => autoClaimTick(),
+  };
+}
 window.onProxyKey = (e) => { if (e.key === "Enter") actions.stSaveProxy(); };
 window.onPathKey = (e) => { if (e.key === "Enter") actions.stSavePath(); };
 window.onRenameKey = (e, id) => {
@@ -3419,7 +3499,7 @@ listen("claim://result", (ev) => {
     const now = p.serverTime || Date.now();
     if (p.startsAt && p.startsAt > now) bits.push(t("m.claimStartsAt", { time: new Date(p.startsAt).toLocaleString(localeTag(), { hour12: false }) }));
     if (p.endsAt) bits.push(t("m.claimEndsAt", { time: new Date(p.endsAt).toLocaleString(localeTag(), { hour12: false }) }));
-    toast(t("m.claimOk", { name: p.accountName, plan: p.planName }), "ok", bits.join(t("common.listSep")));
+    toast(t("m.claimOk", { name: p.accountName, plan: planDisplayName(p.planName) }), "ok", bits.join(t("common.listSep")));
   }
   if (p.accountId) {
     loadAcctQuota(p.accountId);

@@ -372,9 +372,12 @@ async fn claim_refresh(id: String) -> Result<ClaimRefreshResult, String> {
     let acc = load_account(&paths, &id)?;
     let (activated, activation_error) =
         match claim::telemetry_user_id(&paths.home, &acc.credentials) {
-            Some(uid) => match claim::report_activation_events(&uid, &mid) {
-                Ok(()) => (true, None),
-                Err(e) => (false, Some(e)),
+            // 激活上报走 180s 节流槽（与 spawn 路径共享预算）：
+            // None = 节流期内跳过，无界面/无请求，spawn 路径会在槽位空出时补报
+            Some(uid) => match claim::activation_report_throttled(&uid, &mid) {
+                Some(Ok(())) => (true, None),
+                Some(Err(e)) => (false, Some(e)),
+                None => (false, None),
             },
             None => (false, None),
         };

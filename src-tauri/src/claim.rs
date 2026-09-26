@@ -276,6 +276,26 @@ pub fn spawn_activation_report(home: &Path, creds: &Value, device_mid: &str) {
     });
 }
 
+/// claim_refresh 的激活上报走与 spawn_activation_report 相同的 180s 节流槽——
+/// 此前 claim_refresh 直连上报、绕过节流：76 账号 × 每 10-30min 一轮 = 全天
+/// 数百次激活 POST（2026-09-26 单日实测 654 次），是风控画像的主要来源之一。
+/// 返回 None = 节流期内跳过本次上报（spawn 路径会在槽位空出时补报）。
+pub fn activation_report_throttled(user_id: &str, device_mid: &str) -> Option<Result<(), String>> {
+    let key = format!("{user_id}|{device_mid}");
+    if !activation_slot_free(&key, Duration::from_secs(180)) {
+        return None;
+    }
+    let r = report_activation_events(user_id, device_mid);
+    match &r {
+        Ok(()) => crate::flowlog::log("activate", "ok", &format!("user={user_id}")),
+        Err(e) => {
+            activation_forget(&key);
+            crate::flowlog::log("activate", "fail", e);
+        }
+    }
+    Some(r)
+}
+
 pub fn preview_plans(
     home: &Path,
     creds: &Value,
