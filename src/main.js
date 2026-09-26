@@ -1134,9 +1134,9 @@ function quotaKpisHtml(tot) {
 function poolsTabHtml(tot) {
   if (!tot.models.length) return `<div class="qh-empty">${esc(t("list.qhEmpty"))}</div>`;
   const legend = `<div class="qhp-legend">
-    <span><i class="sw-gift" style="background:var(--ink-mute)"></i>${esc(t("list.qhpLegendGift"))}</span>
-    <span><i style="background:var(--ink-mute)"></i>${esc(t("list.qhpLegendReg"))}</span>
-    <span><i style="background:rgba(255,255,255,.07)"></i>${esc(t("list.qhpLegendUsed"))}</span>
+    <span><i class="sw-gift"></i>${esc(t("list.qhpLegendGift"))}</span>
+    <span><i class="sw-reg"></i>${esc(t("list.qhpLegendReg"))}</span>
+    <span><i class="sw-used"></i>${esc(t("list.qhpLegendUsed"))}</span>
   </div>`;
   const rows = tot.models.map((m) => {
     const color = modelColor(m.name);
@@ -3095,13 +3095,18 @@ function refreshQuotaModal() {
   if (!pop) return;
   const sc = pop.querySelector("[data-qh-scroll]");
   const st = sc ? sc.scrollTop : 0;
+  const mask = pop.parentElement; // 遮罩层：面板高于视口时的滚动容器
+  const mst = mask ? mask.scrollTop : 0;
   const tpl = document.createElement("template");
   tpl.innerHTML = quotaPanelHtml(quotaTotals()).trim();
   const node = tpl.content.firstElementChild;
   if (!node) return;
+  pop.replaceWith(node);
+  // 滚动恢复必须在节点入 DOM 之后：对游离元素赋 scrollTop 是空操作，
+  // 会导致每次额度更新后弹窗滚动位置被重置回顶部
   const nsc = node.querySelector("[data-qh-scroll]");
   if (nsc) nsc.scrollTop = st;
-  pop.replaceWith(node);
+  if (mask && mask.isConnected) mask.scrollTop = mst;
 }
 
 /** 进度/用量类就地补丁：批量刷新计数、礼物按钮徽标、行内 2API 用量 */

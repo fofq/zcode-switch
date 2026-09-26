@@ -1926,14 +1926,18 @@ select.two-input { cursor: pointer; }
 }
 .qhp-legend i {
   display: inline-block;
-  width: 10px; height: 10px;
-  border-radius: 2.5px;
+  width: 12px; height: 12px;
+  border-radius: 3px;
   margin-right: 5px;
-  vertical-align: -1px;
+  vertical-align: -2px;
 }
+/* 三种池状态用明显不同的视觉：斜纹中灰 / 实色浅灰 / 深色轨道 */
 .qhp-legend i.sw-gift {
-  background-image: repeating-linear-gradient(135deg, transparent 0 2px, rgba(16, 17, 20, .55) 2px 4px);
+  background-color: #9aa0ad;
+  background-image: repeating-linear-gradient(135deg, transparent 0 2px, #23252c 2px 4px);
 }
+.qhp-legend i.sw-reg { background-color: #c9cdd6; }
+.qhp-legend i.sw-used { background-color: #3a3d45; }
 .qhp-mrow { border-bottom: 1px solid rgba(255, 255, 255, .05); }
 .qhp-mrow:last-child { border-bottom: none; }
 .qhp-mhead {
@@ -2001,14 +2005,15 @@ select.two-input { cursor: pointer; }
   font-variant-numeric: tabular-nums;
 }
 .qhp-arows {
-  padding: 2px 2px 9px 14px;
+  padding: 2px 2px 9px 2px;
   display: flex;
   flex-direction: column;
   gap: 5px;
 }
+/* 列宽与折叠行(.qhp-mhead)完全一致：名称/轨道/数值/预留，滚动对齐零偏移 */
 .qhp-arow {
   display: grid;
-  grid-template-columns: minmax(88px, 140px) 1fr 132px;
+  grid-template-columns: minmax(96px, 158px) 1fr 112px 42px;
   gap: 10px;
   align-items: center;
   font-size: 11.5px;
