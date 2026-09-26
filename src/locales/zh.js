@@ -87,6 +87,7 @@ export const zh = {
   "m.manualUnfrozenDetail": "探测请求已通过，账号按你的要求解冻恢复",
   "m.claimAllStopping": "正在停止批量领取（完成当前账号后收尾）…",
   "m.claimAllStopped": "批量领取已停止（{done}/{total}）",
+  "m.claimAllRiskPaused": "风控失败已达 {n} 次：批量暂停，剩余账号稍后自动分批重试",
   "list.bulkFreeze": "批量冻结",
   "list.bulkUnfreeze": "批量解冻",
   "list.toastBulkFrozen": "已冻结 {n} 个账号",

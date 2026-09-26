@@ -91,6 +91,7 @@ export const en = {
   "m.manualUnfrozenDetail": "Probe request passed — account unfrozen as requested",
   "m.claimAllStopping": "Stopping the batch after the current account…",
   "m.claimAllStopped": "Batch claim stopped ({done}/{total})",
+  "m.claimAllRiskPaused": "Risk failures reached {n} — batch paused; remaining accounts retry in batches later",
   "list.bulkFreeze": "Bulk freeze",
   "list.bulkUnfreeze": "Bulk unfreeze",
   "list.toastBulkFrozen": "Froze {n} accounts",

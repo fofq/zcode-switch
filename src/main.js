@@ -51,6 +51,7 @@ function saveAutoFrozen() {
   try { localStorage.setItem(AUTO_FROZEN_KEY, JSON.stringify(autoFrozenAt)); } catch { /* 忽略 */ }
 }
 let autoRiskStreak = {};
+let autoRiskLastAt = {};
 function riskInText(text) {
   return /HTTP \d{3}|unusual activity|blocked/i.test(String(text || ""));
 }
@@ -1418,14 +1419,22 @@ function waitForClaimResult(accountId, timeoutMs = 90000) {
   });
 }
 
-// 手动操作抢占自动领取轮：立即终结进行中的等待、取消挂起领取，
-// 轮次就地收尾（finally 释放 autoClaimRunning）；被抢占账号 90s 后即可重试，
-// 余下账号由后续 tick 接续。手动领取/手动刷新完成后自动恢复。
+// 手动操作抢占自动领取轮：立即终结进行中的等待、取消挂起领取、
+// 唤醒轮内账号间隙睡眠，轮次毫秒级就地收尾（finally 释放 autoClaimRunning）；
+// 被抢占账号 90s 后即可重试，余下账号由后续 tick 接续。手动领取/手动刷新完成后自动恢复。
+let autoGapWake = null;
+function autoClaimGapSleep(ms) {
+  return new Promise((res) => {
+    const t = setTimeout(() => { autoGapWake = null; res(); }, ms);
+    autoGapWake = () => { clearTimeout(t); res(); };
+  });
+}
 function preemptAutoClaim() {
   autoAbortRequested = true;
   autoClaimPaused = true;
   const w = claimWaiter;
   if (w) w.finish({ ok: false, code: "preempted", accountId: w.accountId, accountName: accountName(w.accountId) });
+  autoGapWake?.(); // 立即唤醒账号间隙睡眠，抢占不再等最长 12s+
   return invoke("claim_cancel").catch(() => {});
 }
 async function waitAutoClaimWindDown(timeoutMs = 15000) {
@@ -1751,7 +1760,7 @@ const actions = {
       // 且持久化缓存会把已删除的号一直带下去（下次启动又出现）
       delete acctQuota[id]; delete quotaHist[id]; delete quotaSampleAt[id];
       delete quotaDue[id]; delete quotaFailStreak[id]; delete quotaForceAt[id];
-      delete autoClaimCooldown[id]; delete autoClaimEmptyRounds[id]; delete autoClaimFailRounds[id]; delete autoFrozenAt[id]; delete autoRiskStreak[id]; delete claimable[id];
+      delete autoClaimCooldown[id]; delete autoClaimEmptyRounds[id]; delete autoClaimFailRounds[id]; delete autoFrozenAt[id]; delete autoRiskStreak[id]; delete autoRiskLastAt[id]; delete claimable[id];
       ui.selected.delete(id); ui.expanded.delete(id);
       markQuotaCacheDirty(); flushQuotaCache(true);
       toast(t("m.toastDeleted"));
@@ -2378,6 +2387,7 @@ const actions = {
     claimAllState = { running: true, done: 0, total: ids.length };
     render();
     let stopped = false;
+    let riskFails = 0;
     try {
       for (let i = 0; i < ids.length; i++) {
         if (claimAllAbort) { stopped = true; break; }
@@ -2411,6 +2421,13 @@ const actions = {
           if (claimFailureRisk(r)) {
             autoClaimCooldown[id] = Date.now() + autoClaimGap(3 * 60 * 60 * 1000);
             autoClaimSlowUntil = Date.now() + 5 * 60 * 1000;
+            riskFails++;
+            // 风控失败累积（≥3）：暂停批处理——剩余账号保持冷却，
+            // 由后续自动轮分批重试（一次打完只会加重 IP 画像）
+            if (riskFails >= 3) {
+              toast(t("m.claimAllRiskPaused", { n: riskFails }), "err");
+              break;
+            }
           }
           continue;
         }
@@ -2477,7 +2494,7 @@ const actions = {
       syncSettingsModal();
       if (state.auto_claim) {
         toast(t("m.autoClaimOn"), "ok", t("m.autoClaimOnDetail"));
-        if (Date.now() - (lastAutoRound?.at ?? 0) > REFRESH_CLAIM_COOLDOWN_MS) autoClaimTick();
+        autoClaimTick(); // 开启即检测一轮（轮内冷却/退避自行控速）
       } else {
         lastAutoRound = null;
       }
@@ -2518,6 +2535,10 @@ function claimFailureRisk(r) {
 /** 风控信号记账：连续 2 次 + 仍有额度 → 自动冻结（数小时后随轮次探测恢复） */
 function noteClaimRisk(id) {
   if (isFrozen(id) && !autoFrozenAt[id]) return; // 手动冻结：用户决定，不介入
+  const now = Date.now();
+  // 信号时间窗：超过 24h 的旧信号不累计（隔天的单次风控不应触发冻结）
+  if ((autoRiskLastAt[id] ?? 0) < now - 24 * 3600e3) autoRiskStreak[id] = 0;
+  autoRiskLastAt[id] = now;
   autoRiskStreak[id] = (autoRiskStreak[id] || 0) + 1;
   if (autoRiskStreak[id] < 2) return; // 单次信号不冻，防瞬时抖动误判
   if (autoFrozenAt[id]) { // 已在自动冻结期：顺延探测时间即可
@@ -2664,8 +2685,8 @@ async function autoClaimTick() {
       // 轮内账号间隙 12s±50%（风控信号后 5 分钟内 ×2.5）：一轮 76 账号从 ~6 分钟
       // 摊到 ~15 分钟，领取端点（activation/preview/submit）的顺序扫账号节奏减半
       // ——同 IP 顺序轮询多账号本身即风控信号，间距是最有效的压降手段
-      await new Promise((res) => setTimeout(res,
-        AUTO_CLAIM_ACCT_GAP_MS * (1 + Math.random() * 0.5) * (Date.now() < autoClaimSlowUntil ? 2.5 : 1)));
+      await autoClaimGapSleep(
+        AUTO_CLAIM_ACCT_GAP_MS * (1 + Math.random() * 0.5) * (Date.now() < autoClaimSlowUntil ? 2.5 : 1));
     }
   } finally {
     autoClaimRunning = false; claimActive = false;
