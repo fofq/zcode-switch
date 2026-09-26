@@ -126,27 +126,6 @@ async function copyText(text) {
   }
 }
 
-// 紧凑行展开后，鼠标离开且无交互超过该时长自动收起（悬停期间暂停计时）
-const EXPAND_AUTO_COLLAPSE_MS = 8000;
-const expandAt = new Map();function expandTouch(id) {
-  if (ui.expanded.has(id)) expandAt.set(id, Date.now());
-}
-function autoCollapseTick() {
-  if (!ui.expanded.size) return;
-  const now = Date.now();
-  let changed = false;
-  for (const id of [...ui.expanded]) {
-    const el = $app.querySelector(`.row[data-id="${CSS.escape(id)}"], .card[data-id="${CSS.escape(id)}"]`);
-    if (el && el.matches(":hover")) { expandAt.set(id, now); continue; }
-    if (now - (expandAt.get(id) || 0) >= EXPAND_AUTO_COLLAPSE_MS) {
-      ui.expanded.delete(id);
-      expandAt.delete(id);
-      changed = true;
-    }
-  }
-  if (changed) render();
-}
-
 let quotaSweep = { running: false, phase: "quota", eligibility: false, done: 0, total: 0, cancel: false };
 // 领取资格刷新很重，节流到至少 10 分钟一次，避免触发风控
 const ELIGIBILITY_MIN_GAP_MS = 10 * 60 * 1000;
@@ -1365,6 +1344,12 @@ async function loadAcctQuota(id, opts = {}) {
     // quick（批量刷新/扫库）：后端不因“成功但空”而 sleep 2.5s 重查——
     // 50 个空号就是 +125s，首次刷新会被拖到几分钟；心跳照发，前端按「待激活」短周期复查
     const data = await invoke("get_account_quota", { id, quick: !!opts.quick });
+    // 套餐结构防抖：偶发解析抖动会返回“无 plans 只有裸 items”的降级概览，
+    // 让明细在 完整套餐组/裸池条 之间来回跳变。套餐不会凭空消失（只会带
+    // expired 标记留存），沿用上次的 plans 结构即可。
+    if (cur.data?.plans?.length && data && !data.plans?.length && data.is_empty !== true) {
+      data.plans = cur.data.plans;
+    }
     acctQuota[id] = { data, err: null, code: null, busy: false };
     quotaFailStreak[id] = 0;
     // 采样入队（算烧速/ETA 用）；失败时刻意不刷新样本时间，让“陈旧 → 先刷新”的门禁生效
@@ -1580,7 +1565,6 @@ const actions = {
   setDensity(v) {
     ui.density = v === "detail" ? "detail" : "compact";
     ui.expanded.clear();
-    expandAt.clear();
     savePrefs();
     render();
   },
@@ -1594,13 +1578,8 @@ const actions = {
   toggleRow(ev) {
     const id = ev?.target?.closest?.(".row, .card")?.dataset?.id;
     if (!id) return;
-    if (ui.expanded.has(id)) {
-      ui.expanded.delete(id);
-      expandAt.delete(id);
-    } else {
-      ui.expanded.add(id);
-      expandAt.set(id, Date.now());
-    }
+    if (ui.expanded.has(id)) ui.expanded.delete(id);
+    else ui.expanded.add(id);
     render();
   },
 
@@ -2071,6 +2050,11 @@ const actions = {
     render();
     const name = accountName(id);
     toast(t(isFrozen(id) ? "m.frozenToast" : "m.unfrozenToast", { name }), "ok", t("m.frozenDetail"));
+    // 冻结在用账号 = 明确要求切走：立即触发自动切换（manual 绕过冷却与保护窗）
+    if (isFrozen(id) && state?.auto_switch && state?.accounts?.some((a) => a.id === id && a.is_active)) {
+      noteChanged(t("as.noteFrozenActive"));
+      autoSwitchTick(true);
+    }
   },
 
   acctQuota(id) {
@@ -3799,6 +3783,14 @@ async function autoSwitchTick(manual = false) {
   }
   if (!lg && ap.flowed) cur.flowed = true;
 
+  // 在用账号被手动冻结：用户明确要求切走 → 按硬故障处理，
+  // 旧额度/烧速作废，立即切到最佳非冻结候选（manual 绕过冷却与保护窗）
+  if (isFrozen(active.id)) {
+    cur.hardDown = true;
+    cur.pct = null;
+    cur.tokens = null;
+  }
+
   // 候选：其它账号（关注模型口径优先，流转账号只能做兜底）
   pruneRecentFrom();
   const cands = [];
@@ -4050,12 +4042,6 @@ async function sweepTick() {
     window.addEventListener("pagehide", () => flushQuotaCache(true));
     window.addEventListener("beforeunload", () => flushQuotaCache(true));
     setInterval(autoSwitchTick, AUTO_SWITCH_CHECK_MS);
-    setInterval(autoCollapseTick, 1000);
-    // 行内任何点击都算“有操作”，刷新自动收起倒计时
-    $app.addEventListener("click", (e) => {
-      const row = e.target?.closest?.(".row, .card");
-      if (row?.dataset?.id) expandTouch(row.dataset.id);
-    });
     setTimeout(autoClaimTick, AUTO_CLAIM_FIRST_DELAY_MS);
     // 周期兜底：新号入库/活动发放后最迟 1 分钟进入领取；
     // 全部账号都在冷却中时空转（零请求）

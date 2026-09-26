@@ -203,6 +203,7 @@ export const en = {
   "list.qhUsageNote": "From the ZCode CLI local database (written after each completed request), read-only",
   "list.qhUsageTodaySum": "Today {n} requests · {v}",
   "list.qhUsageWeekSum": "7-day total {v}",
+  "as.noteFrozenActive": "Active account frozen — switching…",
   "as.hotStreak": "{n} hot switches in a row",
   "m.hotStreakToast": "{n} hot switches in a row",
   "m.hotStreakDetail": "The client's device identity (X-Device-Mid) is still from the first account in the hot-switch chain — consider one cold switch to restore per-account isolation",

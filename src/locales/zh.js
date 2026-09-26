@@ -199,6 +199,7 @@ export const zh = {
   "list.qhUsageNote": "数据来自 ZCode CLI 本地数据库（请求完成后落库），只读访问",
   "list.qhUsageTodaySum": "今日 {n} 次请求 · {v}",
   "list.qhUsageWeekSum": "7 天合计 {v}",
+  "as.noteFrozenActive": "在用账号已冻结，正在自动切换…",
   "as.hotStreak": "已连续热切 {n} 次",
   "m.hotStreakToast": "已连续热切 {n} 次",
   "m.hotStreakDetail": "客户端设备身份（X-Device-Mid）仍是热切链最初的账号，多账号共用同一设备标识——建议手动冷切换一次以恢复每号隔离",
