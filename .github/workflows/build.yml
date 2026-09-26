@@ -57,6 +57,9 @@ jobs:
         run: cargo test --lib
 
       - name: Build (前端 + Rust + NSIS)
+        env:
+          # 编译后缀注入：app_version 读取（本地构建无此变量 → 纯版本号）
+          ZSW_BUILD_SHA: ${{ github.sha }}
         run: npm run tauri build -- --bundles ${{ github.event.inputs.bundles || 'nsis' }}
 
       - name: Collect artifacts

@@ -21,9 +21,6 @@ let acctQuota = {};
 let claimable = {};
 let claimAllRunning = false;
 let claimAllState = { running: false, done: 0, total: 0 };
-const REFRESH_CLAIM_COOLDOWN_MS = 60_000;
-let refreshClaim = { running: false, done: 0, total: 0, cooldownUntil: 0 };
-let refreshTicker = null;
 
 const AUTO_CLAIM_INTERVAL_MS = 10 * 60 * 1000;
 // 干净收尾（本轮无可领礼物）后的重查间隔：礼物品只在新号入库/活动发放时出现，
@@ -33,16 +30,18 @@ const AUTO_CLAIM_TICK_MS = 60 * 1000;
 const AUTO_CLAIM_FIRST_DELAY_MS = 2 * 60 * 1000;
 const AUTO_CLAIM_WAIT_MS = 45_000;
 const AUTO_CLAIM_PER_ACCOUNT_CAP = 5;
-const AUTO_CLAIM_ACCT_GAP_MS = 5_000;
+const AUTO_CLAIM_ACCT_GAP_MS = 12_000;
 // 单轮最多处理的账号数：冷启动/冷却对齐时不至于一轮打穿全部账号，
 // 余下的交给下一个 60s tick（autoClaimRunning 串行化）
 const AUTO_CLAIM_ROUND_CAP = 25;
 // 连续空手（无可领礼包）轮数 → 冷却 30min 翻倍至 4h 封顶
 let autoClaimEmptyRounds = {};
+// 连续领取失败轮数 → 失败冷却同样翻倍至 24h 封顶：持续失败的领取多半是
+// 号被标记/资格问题，每 30min 重试只会加固风控画像
+let autoClaimFailRounds = {};
 // 手动操作（单账号领取/手动刷新/一键领取）抢占自动轮时置位：轮次就地收尾，
 // 手动完成后由后续 tick 接续余下账号（tick 开始时复位）
 let autoClaimPaused = false;
-const AUTO_ABORT_WAIT_MS = 90_000;
 let autoClaimRunning = false;
 let autoClaimCooldown = {};
 let autoAbortRequested = false;
@@ -135,22 +134,14 @@ async function copyText(text) {
 }
 
 let quotaSweep = { running: false, phase: "quota", eligibility: false, done: 0, total: 0, cancel: false };
-// 领取资格刷新很重，节流到至少 10 分钟一次，避免触发风控
-const ELIGIBILITY_MIN_GAP_MS = 10 * 60 * 1000;
-let lastEligibilityAt = 0;
-function canRefreshEligibility() {
-  return Date.now() - lastEligibilityAt >= ELIGIBILITY_MIN_GAP_MS
-    && !refreshClaim.running && !claimAllRunning && !autoClaimRunning && !claimActive;
-}
 // 顶部「刷新」按钮当前应显示的提示（资格阶段 / 额度阶段）
 function refreshAllTitle() {
   if (!quotaSweep.running) return t("btn.refreshAllTitle");
-  if (quotaSweep.phase === "elig") return t("btn.refreshAllRunningElig", { done: refreshClaim.done, total: refreshClaim.total });
   return t("btn.refreshAllRunning", { done: quotaSweep.done, total: quotaSweep.total });
 }
 function refreshAllBadge() {
   if (!quotaSweep.running) return "";
-  const n = quotaSweep.phase === "elig" ? refreshClaim.done : quotaSweep.done;
+  const n = quotaSweep.done;
   return n > 0 ? `<span class="tb-badge">${n}</span>` : "";
 }
 
@@ -1661,8 +1652,8 @@ const actions = {
     });
   },
 
-  /** 刷新额度（顺带按节流刷新领取资格）；再点一次 = 停止 */
-  async refreshAll(quotaOnly) {
+  /** 刷新额度（纯额度扫描；领取资格刷新只属于自动领取轮，避免同窗口双倍请求）；再点一次 = 停止 */
+  async refreshAll() {
     if (quotaSweep.running) {
       quotaSweep.cancel = true;
       return;
@@ -1672,16 +1663,10 @@ const actions = {
     // 当前使用中的账号优先刷新：全库刷新一个周期很久，而决定“要不要切”的正是活跃账号
     const act = (state?.accounts || []).find((a) => a.is_active);
     const order = act ? [act.id, ...ids.filter((i) => i !== act.id)] : ids;
-    const withElig = !quotaOnly && canRefreshEligibility();
-    if (withElig) lastEligibilityAt = Date.now();
-    quotaSweep = { running: true, phase: withElig ? "elig" : "quota", eligibility: withElig, done: 0, total: ids.length, cancel: false };
+    quotaSweep = { running: true, done: 0, total: ids.length, cancel: false };
     render();
     let cancelled = false;
     try {
-      if (withElig) {
-        await actions.refreshClaim();
-        quotaSweep.phase = "quota";
-      }
       for (const id of order) {
         if (quotaSweep.cancel) { cancelled = true; break; }
         await loadAcctQuota(id, { quick: true });
@@ -1693,11 +1678,10 @@ const actions = {
       }
     } finally {
       const done = quotaSweep.done;
-      const elig = quotaSweep.eligibility;
       cancelled = cancelled || quotaSweep.cancel;
-      quotaSweep = { running: false, phase: "quota", eligibility: false, done: 0, total: 0, cancel: false };
+      quotaSweep = { running: false, done: 0, total: 0, cancel: false };
       if (cancelled) toast(t("list.toastSweepCancelled", { n: done }));
-      else toast(elig ? t("list.toastRefreshAllBoth", { n: done }) : t("list.toastSweepDone", { n: done }));
+      else toast(t("list.toastSweepDone", { n: done }));
       render();
       // 刷新期间被要求重查的账号（拿不到数据/太旧）：窗口一结束补一轮，不再卡在「陈旧」没人管
       drainStaleWant();
@@ -1729,7 +1713,7 @@ const actions = {
       // 且持久化缓存会把已删除的号一直带下去（下次启动又出现）
       delete acctQuota[id]; delete quotaHist[id]; delete quotaSampleAt[id];
       delete quotaDue[id]; delete quotaFailStreak[id]; delete quotaForceAt[id];
-      delete autoClaimCooldown[id]; delete autoClaimEmptyRounds[id]; delete claimable[id];
+      delete autoClaimCooldown[id]; delete autoClaimEmptyRounds[id]; delete autoClaimFailRounds[id]; delete claimable[id];
       ui.selected.delete(id); ui.expanded.delete(id);
       markQuotaCacheDirty(); flushQuotaCache(true);
       toast(t("m.toastDeleted"));
@@ -2296,7 +2280,7 @@ const actions = {
   async claim(id) {
     // 自动领取轮进行中：允许手动抢占（轮次就地收尾、稍后自动续跑余下账号）；
     // 一键领取批处理与资格刷新仍互斥
-    if (claimAllRunning || refreshClaim.running) { toast(t("m.claimBusy"), "warn"); return; }
+    if (claimAllRunning) { toast(t("m.claimBusy"), "warn"); return; }
     if (claimActive && !autoClaimRunning) return;
     const plans = claimable[id]?.plans || [];
     const plan = plans[0];
@@ -2327,7 +2311,6 @@ const actions = {
       .map((a) => a.id)
       .filter((id) => (claimable[id]?.plans || []).length > 0);
     if (!ids.length) { toast(t("m.noClaimableAccounts"), "warn"); return; }
-    if (refreshClaim.running) return;
     if (claimActive && !autoClaimRunning) return;
     const preemptRound = autoClaimRunning;
     if (preemptRound) {
@@ -2367,58 +2350,6 @@ const actions = {
     }
   },
 
-  async refreshClaim() {
-    const ids = (state?.accounts || []).map((a) => a.id);
-    if (!ids.length) return;
-    const now = Date.now();
-    if (refreshClaim.running || claimAllRunning || (claimActive && !autoClaimRunning)) return;
-    if (now < refreshClaim.cooldownUntil) {
-      toast(t("btn.refreshClaimCooldownTitle", { n: Math.ceil((refreshClaim.cooldownUntil - now) / 1000) }), "warn");
-      return;
-    }
-    refreshClaim = { running: true, done: 0, total: ids.length, cooldownUntil: 0 };
-    startRefreshTicker();
-    if (autoClaimRunning) {
-      // 手动刷新最高优先级：立即抢占自动领取轮（终结等待 + 撤销挂起），毫秒级收尾
-      await preemptAutoClaim();
-      if (!(await waitAutoClaimWindDown())) {
-        refreshClaim.running = false;
-        refreshClaim.cooldownUntil = Date.now() + REFRESH_CLAIM_COOLDOWN_MS;
-        toast(t("m.claimBusy"), "warn");
-        setTimeout(stopRefreshTickerIfIdle, 1100);
-        return;
-      }
-    }
-    let okCount = 0;
-    try {
-      for (let i = 0; i < ids.length; i++) {
-        const id = ids[i];
-        const name = state.accounts.find((a) => a.id === id)?.name || id;
-        refreshClaim.done = i + 1;
-        claimable[id] = { plans: claimable[id]?.plans || [], busy: true };
-        if (!uiLocked()) render();
-        try {
-          const r = await invoke("claim_refresh", { id });
-          claimable[id] = { plans: r.plans || [], err: null, busy: false };
-          if ((r.plans || []).length) okCount++;
-          if (r.activationError) toast(t("m.refreshClaimAcctErr", { name, err: stripErr(r.activationError) }), "warn");
-        } catch (e) {
-          claimable[id] = { plans: claimable[id]?.plans || [], err: String(e), busy: false };
-          toast(t("m.refreshClaimAcctErr", { name, err: stripErr(e) }), "err");
-        }
-        scheduleNext(id);
-        if (!uiLocked()) render();
-        if (i < ids.length - 1) await new Promise((res) => setTimeout(res, 5000));
-      }
-    } finally {
-      refreshClaim.running = false;
-      refreshClaim.cooldownUntil = Date.now() + REFRESH_CLAIM_COOLDOWN_MS;
-      if (!uiLocked()) render();
-      setTimeout(stopRefreshTickerIfIdle, 1100);
-    }
-    toast(t("m.refreshClaimDone", { n: ids.length, k: okCount }), "ok");
-  },
-
   async toggleAutoSwitch() {
     const prev = !!state?.auto_switch;
     const next = !prev;
@@ -2450,7 +2381,7 @@ const actions = {
     if (autoToggleBusy) return;
     const prev = !!state?.auto_claim;
     const next = !prev;
-    if (next && (autoClaimRunning || claimActive || claimAllRunning || refreshClaim.running)) {
+    if (next && (autoClaimRunning || claimActive || claimAllRunning)) {
       toast(t("m.claimBusy"), "warn");
       return;
     }
@@ -2481,20 +2412,6 @@ const actions = {
   },
 };
 
-function startRefreshTicker() {
-  if (refreshTicker) return;
-  refreshTicker = setInterval(() => {
-    if (!uiLocked()) render();
-    stopRefreshTickerIfIdle();
-  }, 1000);
-}
-function stopRefreshTickerIfIdle() {
-  const cooling = Date.now() < refreshClaim.cooldownUntil;
-  if (!refreshClaim.running && !cooling && refreshTicker) {
-    clearInterval(refreshTicker); refreshTicker = null; if (!uiLocked()) render();
-  }
-}
-
 // 冷却去相位：±50% 抖动。76 个账号若在同一轮同时进入冷却，到期会同时对齐，
 // 形成每 10/30 分钟一次的请求风暴（今天日志 12:00 的 54 次/2min 爆发即此形态）
 function autoClaimGap(ms) {
@@ -2514,7 +2431,7 @@ function autoClaimCooldownFor(r) {
 
 async function autoClaimTick() {
   if (!state?.auto_claim || autoClaimRunning) return;
-  if (claimActive || claimAllRunning || refreshClaim.running) return;
+  if (claimActive || claimAllRunning) return;
   const ids = (state.accounts || [])
     .map((a) => a.id)
     .filter((id) => (autoClaimCooldown[id] ?? 0) <= Date.now())
@@ -2574,7 +2491,10 @@ async function autoClaimTick() {
           break;
         }
         if (r.ok === false) {
-          autoClaimCooldown[id] = autoClaimCooldownFor(r);
+          // 失败递增退避：基础冷却（1005 nextAt/30min 下限）与 翻倍退避 取大者
+          const streak = (autoClaimFailRounds[id] = (autoClaimFailRounds[id] || 0) + 1);
+          const escalate = Date.now() + autoClaimGap(AUTO_CLAIM_FAIL_MIN_MS * (2 ** Math.min(streak - 1, 3)));
+          autoClaimCooldown[id] = Math.max(autoClaimCooldownFor(r), escalate);
           failed = true;
           break;
         }
@@ -2586,7 +2506,7 @@ async function autoClaimTick() {
         progressed = true;
         await new Promise((res) => setTimeout(res, 1200));
       }
-      if (gotAny) autoClaimEmptyRounds[id] = 0;
+      if (gotAny) { autoClaimEmptyRounds[id] = 0; autoClaimFailRounds[id] = 0; }
       if (!gotAny && (claimable[id]?.plans || []).length) roundSkipped++;
       // 统一收尾冷却（带去相位抖动）：有失败走失败时已设的冷却；
       // 连续空手的账号渐进退避 30min → 1h → 2h → 4h —— 76 个账号里绝大多数
@@ -2600,7 +2520,10 @@ async function autoClaimTick() {
           autoClaimCooldown[id] = Date.now() + autoClaimGap(AUTO_CLAIM_INTERVAL_MS);
         }
       }
-      await new Promise((res) => setTimeout(res, AUTO_CLAIM_ACCT_GAP_MS));
+      // 轮内账号间隙 12s±50%：一轮 76 账号从 ~6 分钟摊到 ~15 分钟，
+      // 领取端点（activation/preview/submit）的顺序扫账号节奏减半——同 IP 顺序
+      // 轮询多账号本身即风控信号，间距是最有效的压降手段
+      await new Promise((res) => setTimeout(res, AUTO_CLAIM_ACCT_GAP_MS * (1 + Math.random() * 0.5)));
     }
   } finally {
     autoClaimRunning = false; claimActive = false;
@@ -2753,7 +2676,7 @@ function claimMiniBtnHtml(id) {
   const label = planDisplayName(plan.name || plan.plan_id);
   const tip = [label, grants, plan.description].filter(Boolean).join(" · ");
   return `<button class="card-claim" title="${esc(`${t("btn.claim")} · ${tip}`)}" aria-label="${esc(t("btn.claim"))}"
-    click="actions.claim('${id}')" ${claimAllRunning || refreshClaim.running || (claimActive && !autoClaimRunning) ? "disabled" : ""}>${ic("gift", 15)}</button>`;
+    click="actions.claim('${id}')" ${claimAllRunning || (claimActive && !autoClaimRunning) ? "disabled" : ""}>${ic("gift", 15)}</button>`;
 }
 
 function slotRowsHtml(items) {
@@ -2947,11 +2870,11 @@ function renderSignature() {
   ]);
 }
 function renderProgressSig() {
-  return JSON.stringify([quotaSweep, refreshClaim, claimAllState, [...twoUsageMap.entries()]]);
+  return JSON.stringify([quotaSweep, claimAllState, [...twoUsageMap.entries()]]);
 }
 
 function giftBtnHtml(claimableCount) {
-  return `<button class="icon-btn tb-btn tb-gift${claimAllState.running ? " running" : ""}" data-gift-btn click="actions.claimAll()" ${claimAllRunning || refreshClaim.running || (claimActive && !autoClaimRunning) ? "disabled" : ""}
+  return `<button class="icon-btn tb-btn tb-gift${claimAllState.running ? " running" : ""}" data-gift-btn click="actions.claimAll()" ${claimAllRunning || (claimActive && !autoClaimRunning) ? "disabled" : ""}
       aria-label="${t("btn.claimAll")}" title="${claimAllState.running
         ? esc(t("btn.claimAllRunning", { done: claimAllState.done, total: claimAllState.total }))
         : esc(t("btn.claimAllTitle"))}${claimableCount > 1 ? ` (${claimableCount})` : ""}">
@@ -3157,7 +3080,7 @@ function render(force = false) {
       }
     }
     // 批量操作（全量刷新/领取）期间合并重渲染，最多 500ms 一次，避免连续重建掉帧
-    if (quotaSweep?.running || refreshClaim?.running || claimAllRunning || autoClaimRunning) {
+    if (quotaSweep?.running || claimAllRunning || autoClaimRunning) {
       const now = Date.now();
       if (now - lastBulkRender < 500) {
         bulkRenderQueued = true;
@@ -3456,7 +3379,6 @@ if (import.meta.env.DEV) {
     get autoClaimRunning() { return autoClaimRunning; },
     get claimActive() { return claimActive; },
     get claimAllRunning() { return claimAllRunning; },
-    get refreshClaimRunning() { return refreshClaim.running; },
     get autoClaimPaused() { return autoClaimPaused; },
     get autoAbortRequested() { return autoAbortRequested; },
     get cooldowns() { return { ...autoClaimCooldown }; },
@@ -3761,7 +3683,7 @@ function forceRefresh(id) {
  *  且 autoClaim 的循环几乎常驻——把它们算进来会让重活窗口≈永远为真，
  *  直接饿死切换的预校验（09-25 实测 43 次 preflight-fail 全部 tried=0） */
 function heavyWindow() {
-  return !!(quotaSweep.running || refreshClaim.running);
+  return !!quotaSweep.running;
 }
 /** 把重活窗口里记下的「待补刷」账号排进去（限量，避免窗口一结束就一次冲 50 个） */
 function drainStaleWant(max = 3) {

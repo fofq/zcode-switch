@@ -160,7 +160,16 @@ async fn get_state() -> Result<AppState, String> {
 
 #[tauri::command]
 fn app_version(app: AppHandle) -> String {
-    app.package_info().version.to_string()
+    let base = app.package_info().version.to_string();
+    // CI 构建注入 ZSW_BUILD_SHA（build.yml 的 Build 步骤 env）→ 版本带编译后缀
+    // （如 1.6.0+9f3a2b1）；本地 cargo build 无该环境变量 → 保持纯版本号
+    match option_env!("ZSW_BUILD_SHA") {
+        Some(sha) if !sha.is_empty() => {
+            let end = sha.len().min(7);
+            format!("{base}+{}", &sha[..end])
+        }
+        _ => base,
+    }
 }
 
 #[tauri::command]
