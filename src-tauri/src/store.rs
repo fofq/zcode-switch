@@ -1549,6 +1549,27 @@ pub fn free_key_pool(paths: &Paths, max_resolve: usize) -> (Vec<(String, String)
     (out, last_err)
 }
 
+/// 2API 套餐故障切换候选池：全部有 zcode 登录态 JWT 的账号（纯本地，零网络，无铸造副作用）。
+/// 返回 (id, name, JWT, 账号自己的虚拟 device_mid)。激活账号经 effective_snapshot 取 live JWT
+/// （总是轮换后的新令牌），其余账号用快照 JWT（可能已过期——由 2API 侧 401 冷却处理）。
+pub fn jwt_pool(paths: &Paths) -> Result<Vec<(String, String, ApiKeyInfo, Option<String>)>, String> {
+    let accounts = list_accounts(paths)?;
+    let mut out = Vec::new();
+    for a in accounts {
+        let Some(info) = account_jwt_key(paths, &a.id)? else { continue };
+        let mid = a.virtual_device_mid.clone().filter(|m| !m.trim().is_empty());
+        out.push((a.id, a.name, info, mid));
+    }
+    Ok(out)
+}
+
+/// 账号自己的虚拟 device_mid。2API 打上游必须带「这个账号自己的」设备身份：
+/// 服务端按 (user, device_mid) 侧记，带别人/live 的 mid 会错位（同 account_quota 的 3001 教训）。
+pub fn account_virtual_mid(paths: &Paths, id: &str) -> Option<String> {
+    let acc = load_account(paths, id).ok()?;
+    acc.virtual_device_mid.filter(|m| !m.trim().is_empty())
+}
+
 fn ensure_virtual_device_mid_locked(paths: &Paths, id: &str) -> Result<String, String> {
     {
         let acc = load_account(paths, id)?;
