@@ -3539,10 +3539,9 @@ function render(force = false) {
     const q = acctQuota[a.id];
     let meta = "";
     if (!a.has_config) meta += `<span class="meta-chip warn" title="${esc(t("q.noCfg"))}">${esc(t("q.noCfgShort"))}</span>`;
+    // 到期徽章不再放列表行 meta：详细模式明细区每个套餐已自带完整到期时间，
+    // 行级徽章是重复设计；紧凑模式 meta 整行隐藏，快到期仍由下方 expSoon 顶出
     const exp = expireInfo(q?.data?.plan_expire);
-    if (exp) {
-      meta += `<span class="meta-chip${exp.warn ? " warn" : ""}" title="${esc(t("q.validUntil", { date: exp.text }))}">${esc(t("q.validUntilShort", { date: exp.text }))}</span>`;
-    }
     // 名称本身就是邮箱/手机号时不再重复展示
     if (ident && ident.toLowerCase() !== String(a.name || "").trim().toLowerCase()) {
       meta += ui.hideInfo
