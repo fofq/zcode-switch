@@ -2975,13 +2975,16 @@ function fmtTokens(n) {
   return String(Math.round(n));
 }
 function balRowHtml(it) {
-  const rem = it.total != null && it.remaining != null ? `${fmtTokens(it.remaining)}/${fmtTokens(it.total)}` : "";
+  const rem = it.total != null && it.remaining != null
+    // 剩余段带 .rem 钩子（卡片内按健康度着色），总量段保持灰
+    ? `<b class="rem">${esc(fmtTokens(it.remaining))}</b><span class="tot">/${esc(fmtTokens(it.total))}</span>`
+    : "";
   // 对齐官方完整模型名（show_name 本就是 GLM-5.3-Flash 这类全称）
   return `
   <div class="q-win mini">
     <span class="q-win-label" title="${esc(it.name)}">${esc(it.name)}</span>
     ${quotaBarHtml(it.percent_used)}
-    <span class="q-win-reset">${esc(rem)}</span>
+    <span class="q-win-reset">${rem}</span>
   </div>`;
 }
 
@@ -3184,7 +3187,8 @@ function cardQuotaSlotHtml(id) {
   const loading = q?.busy && !q?.data ? `<span class="aq-loading">${t("q.loading")}</span>` : "";
   const body = `${loading}${cardPrimaryPoolHtml(id)}`;
   if (!body) return `<div class="card-quota-empty" data-quota-slot></div>`;
-  return `<div class="row-quota-slot card-quota" data-quota-slot>${body}</div>`;
+  const lv = healthMapOf().get(id)?.level || "unknown";
+  return `<div class="row-quota-slot card-quota lv-${lv}" data-quota-slot>${body}</div>`;
 }
 
 function captureScroll() {
@@ -3649,8 +3653,7 @@ function render(force = false) {
         </div>
         <span class="card-side">
           <span class="rchk" role="checkbox" aria-checked="${checked}" title="${esc(t("list.selectHint"))}" click="actions.toggleSelect('${a.id}')">${ic("check", 11)}</span>
-          <!-- 卡片视图不放健康度圆点：rq-pct 按健康度着色（绿/琥珀/红）更贴文字 -->
-          <span class="card-side-info"><span class="row-info">${quotaChipHtml(a.id, h)}</span></span>
+          <!-- 卡片头部不再放「剩 N%」小条：与下方模型条重复，健康度色落在模型条的数字上 -->
           <button class="card-expand" title="${esc(expanded ? t("list.collapseTitle") : t("list.expandTitle"))}" aria-label="${esc(expanded ? t("list.collapseTitle") : t("list.expandTitle"))}" click="actions.toggleRow(event)">${ic("chevDown", 13)}</button>
         </span>
       </div>

@@ -1592,7 +1592,6 @@ select.two-input { cursor: pointer; }
 .rq.gift .rq-pct { color: #b57f92; }
 .rq.dead .rq-pct { color: var(--red); }
 /* 卡片视图无健康度圆点：ok 态文字用 mint 高亮（low/dead 已有琥珀/红） */
-.card-side-info .rq.ok .rq-pct { color: var(--mint); }
 .rq.auth .rq-pct, .rq.fail .rq-pct, .rq.unknown .rq-pct, .rq.pending .rq-pct { color: var(--ink-mute); }
 
 .row.picked { border-color: var(--amber-deep); background: rgba(var(--accent-rgb), .07); }
@@ -1983,6 +1982,13 @@ select.two-input { cursor: pointer; }
   overflow: hidden;
 }
 .qhp-mtrack i { display: block; height: 100%; }
+/* 卡片模型条右上的剩余/总量数字：剩余段按健康度着色（彩），总量段灰 */
+.q-win-reset .rem { font-weight: 600; color: var(--ink-dim); }
+.q-win-reset .tot { color: #6a7080; }
+.card-quota.lv-ok .q-win-reset .rem { color: var(--mint); }
+.card-quota.lv-low .q-win-reset .rem { color: var(--amber); }
+.card-quota.lv-dead .q-win-reset .rem { color: var(--red); }
+.card-quota.lv-flowed .q-win-reset .rem { color: #6f8fae; }
 /* 段色即语义（无图例）：琥珀=礼物池、绿=常规池（与主列表「剩余=绿」同语）、深底=已消耗 */
 .qhp-mtrack i.gift, .qhp-atrack i.gift { background: #d19a49; }
 .qhp-mtrack i.reg, .qhp-atrack i.reg { background: var(--mint); }
@@ -2247,7 +2253,6 @@ html[data-theme="mono"] {
   gap: 4px;
   flex: none;
 }
-.card-side-info { display: flex; align-items: center; gap: 6px; }
 .card-side .row-info { flex: none; min-width: 0; }
 /* 展开箭头：无边框幽灵按钮，少一个方框 */
 .card-expand {
