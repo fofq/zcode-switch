@@ -103,6 +103,9 @@ const CAPTCHA_WAIT_TIMEOUT: Duration = Duration::from_secs(75);
 /// 并发等待的请求共享一次解题，被上游拒绝时才作废。
 const CAPTCHA_PARAM_TTL: Duration = Duration::from_secs(45);
 static CAPTCHA_CACHE: Mutex<Option<(std::time::Instant, String, Option<String>)>> = Mutex::new(None);
+/// 求解失败冷却：窗口等了 75s 没拿到参数后 20s 内不再反复等
+static CAPTCHA_FAIL_AT: Mutex<Option<std::time::Instant>> = Mutex::new(None);
+const CAPTCHA_FAIL_COOLDOWN: Duration = Duration::from_secs(20);
 
 pub fn set_app_handle(app: tauri::AppHandle) {
     *CAPTCHA_APP.lock().unwrap() = Some(app);
@@ -131,9 +134,15 @@ fn captcha_cache_invalidate() {
 
 /// 拿一个可用的验证参数：45s 内的缓存直接复用（不弹窗），
 /// 过期/被拒后走窗口解题（无感优先、滑块兜底），解出即入缓存。
+/// 求解刚失败过（20s 内）直接放弃，避免降级链里每个候选账号都干等 75s。
 async fn obtain_captcha_param() -> Option<(String, Option<String>)> {
     if let Some(p) = captcha_cache_get() {
         return Some(p);
+    }
+    if let Some(t) = CAPTCHA_FAIL_AT.lock().unwrap().as_ref() {
+        if t.elapsed() < CAPTCHA_FAIL_COOLDOWN {
+            return None;
+        }
     }
     let p = wait_captcha_param().await?;
     captcha_cache_store(&p.0, &p.1);
@@ -174,6 +183,8 @@ async fn wait_captcha_param() -> Option<(String, Option<String>)> {
             return Some(p);
         }
         if std::time::Instant::now() >= deadline {
+            // 求解失败：记冷却，降级链里后续候选账号不再逐个干等
+            *CAPTCHA_FAIL_AT.lock().unwrap() = Some(std::time::Instant::now());
             return None;
         }
         // 窗口提交/新参数到达都会 notify；超时片段醒来后再查队列与截止时间
@@ -806,8 +817,51 @@ fn rendered_body(body: &[u8], body_val: Option<&Value>, path: &str, mid: Option<
     Value::Object(obj).to_string().into_bytes()
 }
 
-/// 单账号一次尝试：首次请求 → 分类处置（429 请求内退避重试一次 /
-/// 3007 验证码桥接重试一次 / 冷却换号 / 如实透传）。
+/// 验证码参数请求头
+fn captcha_headers(param: String, region: Option<String>) -> Vec<(String, String)> {
+    let mut v = vec![("X-Aliyun-Captcha-Verify-Param".to_string(), param)];
+    if let Some(r) = region.filter(|r| !r.trim().is_empty()) {
+        v.push(("X-Aliyun-Captcha-Verify-Region".to_string(), r));
+    }
+    v
+}
+
+/// 带参重试后的非验证码错误：按分类冷却换号，仅 Other 终透传。
+/// （实测教训：验证码参数有效也可能撞 3012 风控——那要换号冷却，不是砸回客户端）
+fn post_captcha_failure(e: PlanErr, st: &Arc<SharedState>, id: &str, mode: &PumpMode) -> AttemptOutcome {
+    match classify_plan_err(e.status, &e.text) {
+        PlanFail::Captcha => {
+            captcha_cache_invalidate();
+            AttemptOutcome::Next("带验证码请求仍被上游拒绝".into())
+        }
+        PlanFail::Risk => {
+            cool_down(st, id, COOL_RISK);
+            AttemptOutcome::Next("带验证码仍被风控拦截（unusual activity）".into())
+        }
+        PlanFail::Invalid => {
+            cool_down(st, id, COOL_INVALID);
+            AttemptOutcome::Next(format!("鉴权失败 HTTP {}", e.status))
+        }
+        PlanFail::Exhausted => {
+            cool_down(st, id, COOL_EXHAUSTED);
+            AttemptOutcome::Next("额度已用完".into())
+        }
+        PlanFail::RateLimited => {
+            cool_down(st, id, COOL_RATE);
+            AttemptOutcome::Next("上游限流 429".into())
+        }
+        PlanFail::NetError => {
+            cool_down(st, id, COOL_NET);
+            AttemptOutcome::Next(format!("上游请求失败: {}", clip(&e.text, 120)))
+        }
+        _ => AttemptOutcome::Done(buffered_error_response(e.status, &e.text, mode)),
+    }
+}
+
+/// 单账号一次尝试：zcode-plan 有验证码墙时**预取**参数随首次请求带上
+/// （官方客户端同款：无感预解。先裸打拿 3007 再补参重放会被 WAF 判成
+/// 异常重放→3012，实测教训）；429 请求内退避重试一次；参数过期被 3007
+/// 拒时作废重解再试一次；其余按分类冷却换号 / 如实透传。
 async fn plan_attempt(
     st: &Arc<SharedState>,
     c: &Candidate,
@@ -832,23 +886,30 @@ async fn plan_attempt(
             c.mid.clone(),
         )
     };
-    let err = match send(Vec::new()).await {
+    // 预取验证码参数（45s 缓存命中 = 零弹窗零等待；无界面环境拿不到就裸打）
+    let mut first_extra: Vec<(String, String)> = Vec::new();
+    if captcha_wall {
+        if let Some((param, region)) = obtain_captcha_param().await {
+            first_extra = captcha_headers(param, region);
+        }
+    }
+    let err = match send(first_extra.clone()).await {
         Ok(ok) => return finish_plan_ok(ok, st, &c.id),
         Err(e) => e,
     };
     match classify_plan_err(err.status, &err.text) {
-        // 429：请求内退避重试一次（尊重 Retry-After，封顶 5s），仍 429 才冷却换号
+        // 429：带同样参数请求内退避重试一次（尊重 Retry-After，封顶 5s），仍 429 才冷却换号
         PlanFail::RateLimited => {
             let wait = err.retry_after.unwrap_or(2).clamp(1, 5);
             tokio::time::sleep(Duration::from_secs(wait)).await;
-            match send(Vec::new()).await {
+            match send(first_extra).await {
                 Ok(ok) => finish_plan_ok(ok, st, &c.id),
                 Err(e2) => {
                     cool_down(st, &c.id, COOL_RATE);
                     if let PlanFail::RateLimited = classify_plan_err(e2.status, &e2.text) {
                         AttemptOutcome::Next("上游限流 429".into())
                     } else {
-                        AttemptOutcome::Done(buffered_error_response(e2.status, &e2.text, mode))
+                        post_captcha_failure(e2, st, &c.id, mode)
                     }
                 }
             }
@@ -857,14 +918,12 @@ async fn plan_attempt(
             if !captcha_wall {
                 return AttemptOutcome::Done(buffered_error_response(err.status, &err.text, mode));
             }
+            // 预取参数过期/被上游吃掉：作废重解一次再试
+            captcha_cache_invalidate();
             let Some((param, region)) = obtain_captcha_param().await else {
                 return AttemptOutcome::Next("验证码求解失败或超时".into());
             };
-            let mut extra = vec![("X-Aliyun-Captcha-Verify-Param".to_string(), param)];
-            if let Some(r) = region.filter(|r| !r.trim().is_empty()) {
-                extra.push(("X-Aliyun-Captcha-Verify-Region".to_string(), r));
-            }
-            match send(extra).await {
+            match send(captcha_headers(param, region)).await {
                 Ok(ok) => finish_plan_ok(ok, st, &c.id),
                 Err(e2) => {
                     if let PlanFail::Captcha = classify_plan_err(e2.status, &e2.text) {
@@ -872,7 +931,7 @@ async fn plan_attempt(
                         captcha_cache_invalidate();
                         AttemptOutcome::Next("带验证码请求仍被上游拒绝".into())
                     } else {
-                        AttemptOutcome::Done(buffered_error_response(e2.status, &e2.text, mode))
+                        post_captcha_failure(e2, st, &c.id, mode)
                     }
                 }
             }
