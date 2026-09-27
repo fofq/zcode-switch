@@ -861,7 +861,18 @@ fn persist_oauth_account(
         .to_string();
     let raw_access = oauth::extract_access_token(provider, raw).unwrap_or_default();
     let access_token = if provider == "zai" && !raw_access.is_empty() {
-        oauth::resolve_zai_business_token(&raw_access).ok_or_else(|| i18n::tr("err.oauth.zai_business"))?
+        match oauth::resolve_zai_business_token_checked(&raw_access) {
+            Ok(t) => t,
+            Err(e) => {
+                // auth/z/login 上游反复抖动（09-25/26 正常、09-27 网络恶劣窗口三连失败，
+                // 同日同代码 8 分钟后又成功）——换取失败不再一票否决入库：
+                // 回退原始 access_token（与 store.rs 的同款兜底一致），铸造 API Key 的
+                // getCustomerInfo 链路对原始令牌同样可用（09-19 取证实测）。
+                // 失败原因（network:/biz: 分型）落 flowlog 供排查。
+                flowlog::log(&flow, "zai_biz_fallback", &format!("auth/z/login 失败（{e}），回退原始令牌"));
+                raw_access.clone()
+            }
+        }
     } else {
         raw_access
     };

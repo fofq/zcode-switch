@@ -676,27 +676,62 @@ pub fn resolve_biz_api_key(base: &str, auth: &str, require_secret: bool) -> Resu
 }
 
 pub fn resolve_zai_business_token(zai_access_token: &str) -> Option<String> {
-    resolve_zai_business_token_at(ZAI_BUSINESS_LOGIN_URL, zai_access_token)
+    resolve_zai_business_token_checked(zai_access_token).ok()
 }
 
-fn resolve_zai_business_token_at(url: &str, zai_access_token: &str) -> Option<String> {
-    let resp = web_agent()
-        .post(url)
-        .set("Content-Type", "application/json")
-        .send_json(json!({ "token": zai_access_token }))
-        .ok()?
-        .into_string()
-        .ok()?;
-    let v: Value = serde_json::from_str(&resp).ok()?;
-    ["access_token", "accessToken"]
-        .iter()
-        .find_map(|k| {
-            v.pointer(&format!("/data/{k}"))
-                .and_then(|x| x.as_str())
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .map(String::from)
-        })
+/// 带诊断的换取：3 次重试（api.z.ai 的 WAF/网络抖动频发，单次必踩坑），
+/// 网络失败与业务拒绝分型返回——调用方据此决定回退或报错，不再把两类失败
+/// 混成一个「请重新登录」误导排查（09-27 实测：网络恶劣窗口三连失败，
+/// 8 分钟后同端点同代码成功；当时独立脚本亦连不通 api.z.ai）。
+pub fn resolve_zai_business_token_checked(zai_access_token: &str) -> Result<String, String> {
+    let url = ZAI_BUSINESS_LOGIN_URL;
+    let ua = format!("ZCode/{}", crate::quota::zcode_app_version());
+    let finish = |resp: Result<ureq::Response, ureq::Error>| -> Result<Value, String> {
+        let resp = resp.map_err(|e| match e {
+            ureq::Error::Status(code, r) => {
+                let body = r.into_string().unwrap_or_default();
+                format!("HTTP {code} {}", body.chars().take(200).collect::<String>())
+            }
+            other => format!("{other}"),
+        })?;
+        let text = resp.into_string().map_err(|e| format!("读响应失败: {e}"))?;
+        serde_json::from_str(&text)
+            .map_err(|e| format!("响应非 JSON: {e}（{}）", text.chars().take(120).collect::<String>()))
+    };
+    let mut last = String::new();
+    for attempt in 0..3 {
+        match finish(
+            web_agent()
+                .post(url)
+                .set("Content-Type", "application/json")
+                .set("User-Agent", &ua)
+                .send_json(json!({ "token": zai_access_token })),
+        ) {
+            Ok(v) => {
+                let tok = ["access_token", "accessToken"]
+                    .iter()
+                    .find_map(|k| {
+                        v.pointer(&format!("/data/{k}"))
+                            .and_then(|x| x.as_str())
+                            .map(str::trim)
+                            .filter(|s| !s.is_empty())
+                            .map(String::from)
+                    });
+                return match tok {
+                    Some(t) => Ok(t),
+                    None => Err(format!(
+                        "biz: {}",
+                        v.get("msg").and_then(|m| m.as_str()).unwrap_or("响应缺少 data/access_token")
+                    )),
+                };
+            }
+            Err(e) => last = format!("network: {e}"),
+        }
+        if attempt + 1 < 3 {
+            std::thread::sleep(Duration::from_millis(800 * (attempt as u64 + 1)));
+        }
+    }
+    Err(last)
 }
 
 pub fn assemble_config(provider: &str, jwt: &str, access_token: &str) -> Value {
