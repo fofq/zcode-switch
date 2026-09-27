@@ -32,8 +32,10 @@ pub async fn resolve_primary(st: &SharedState) -> Result<Primary, String> {
             Ok(Primary { id, info, mid })
         }
         None => {
-            // 激活账号 id 带短缓存：全量解密账号很重，不能每个请求都算一遍
-            let id = match st.active_cache.lock().unwrap().clone() {
+            // 激活账号 id 带短缓存：全量解密账号很重，不能每个请求都算一遍。
+            // 锁必须先出作用域再 match——guard 临时值若留在 scrutinee 里会跨 await 存活（!Send 且易死锁）
+            let cached = st.active_cache.lock().unwrap().clone();
+            let id = match cached {
                 Some((at, Some(id))) if at.elapsed() < ACTIVE_TTL => id,
                 _ => {
                     let id = tauri::async_runtime::spawn_blocking(move || {

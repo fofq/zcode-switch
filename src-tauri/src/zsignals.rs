@@ -254,7 +254,7 @@ fn tail_loop(dir: PathBuf) {
                 }
                 // 套餐首现（新礼物/新一期到账）独立成事件：前端据此触发领取级联
                 let has_fresh = {
-                    let mut st = lock_state();
+                    let st = lock_state();
                     !st.fresh_plan_ids.is_empty()
                 };
                 if has_fresh {

@@ -836,23 +836,23 @@ async fn plan_attempt(
         Ok(ok) => return finish_plan_ok(ok, st, &c.id),
         Err(e) => e,
     };
-    // 429：请求内退避重试一次（尊重 Retry-After，封顶 5s）
-    if let PlanFail::RateLimited = classify_plan_err(err.status, &err.text) {
-        let wait = err.retry_after.unwrap_or(2).clamp(1, 5);
-        tokio::time::sleep(Duration::from_secs(wait)).await;
-        return match send(Vec::new()).await {
-            Ok(ok) => finish_plan_ok(ok, st, &c.id),
-            Err(e2) => {
-                cool_down(st, &c.id, COOL_RATE);
-                if let PlanFail::RateLimited = classify_plan_err(e2.status, &e2.text) {
-                    AttemptOutcome::Next("上游限流 429".into())
-                } else {
-                    AttemptOutcome::Done(buffered_error_response(e2.status, &e2.text, mode))
+    match classify_plan_err(err.status, &err.text) {
+        // 429：请求内退避重试一次（尊重 Retry-After，封顶 5s），仍 429 才冷却换号
+        PlanFail::RateLimited => {
+            let wait = err.retry_after.unwrap_or(2).clamp(1, 5);
+            tokio::time::sleep(Duration::from_secs(wait)).await;
+            match send(Vec::new()).await {
+                Ok(ok) => finish_plan_ok(ok, st, &c.id),
+                Err(e2) => {
+                    cool_down(st, &c.id, COOL_RATE);
+                    if let PlanFail::RateLimited = classify_plan_err(e2.status, &e2.text) {
+                        AttemptOutcome::Next("上游限流 429".into())
+                    } else {
+                        AttemptOutcome::Done(buffered_error_response(e2.status, &e2.text, mode))
+                    }
                 }
             }
-        };
-    }
-    match classify_plan_err(err.status, &err.text) {
+        }
         PlanFail::Captcha => {
             if !captcha_wall {
                 return AttemptOutcome::Done(buffered_error_response(err.status, &err.text, mode));
