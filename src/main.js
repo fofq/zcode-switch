@@ -3388,16 +3388,12 @@ function patchQuotaDom() {
       if (n) dot.replaceWith(n);
     }
     const q = acctQuota[a.id];
-    const exp = expireInfo(q?.data?.plan_expire);
     const slim = !isCard && node.classList.contains("slim");
     const info = node.querySelector(".row-info");
     if (info) {
-      const expSoon = slim && exp?.warn
-        ? `<span class="meta-chip warn" title="${esc(t("q.validUntil", { date: exp.text }))}">${esc(expSoonLabel(exp))}</span>`
-        : "";
-      // 卡片：chip 常驻（收起态的唯一额度指示）；列表：仅紧凑（slim）行显示
+      // 快到期徽章已移入名称行（row-name），此处只刷额度小条
       const showChip = isCard || slim;
-      info.innerHTML = expSoon + (showChip ? quotaChipHtml(a.id, h) : "");
+      info.innerHTML = showChip ? quotaChipHtml(a.id, h) : "";
     }
     const slot = node.querySelector("[data-quota-slot]");
     if (slot) {
@@ -3552,7 +3548,7 @@ function render(force = false) {
     const slim = ui.density === "compact" && !ui.expanded.has(a.id);
     // 额度小条仅紧凑（slim）行显示：详细模式明细区已有完整套餐组，同屏即设计混用
     const showChip = slim;
-    // 紧凑模式隐藏了 meta，这里只把“快到期”单独顶出来，避免漏看
+    // 紧凑模式隐藏了 meta；快到期徽章放进名称行右侧——不再与额度小条同区挤压
     const expSoon = slim && exp?.warn
       ? `<span class="meta-chip warn" title="${esc(t("q.validUntil", { date: exp.text }))}">${esc(expSoonLabel(exp))}</span>`
       : "";
@@ -3570,10 +3566,10 @@ function render(force = false) {
         ${healthDotHtml(h)}
         ${slim ? "" : `<span class="notch" style="background:${notchColor(a.id)}"></span>`}
         <div class="row-main"${ui.density === "compact" ? ` click="actions.toggleRow(event)" title="${esc(slim ? t("list.expandTitle") : t("list.collapseTitle"))}"` : ""}>
-          <div class="row-name">${ui.density === "compact" ? `<span class="row-chev${slim ? "" : " open"}">${ic("chevDown", 12)}</span>` : ""}${tierBadgeFor(a.id)}<span class="rn-text" title="${esc(displayName)}">${giftBadgeFor(a.id)}${esc(displayName)}</span>${a.has_user_info === false ? `<span class="tag-relogin" title="${esc(t("btn.reloginTitle"))}">${t("btn.relogin")}</span>` : ""}</div>
+          <div class="row-name">${ui.density === "compact" ? `<span class="row-chev${slim ? "" : " open"}">${ic("chevDown", 12)}</span>` : ""}${tierBadgeFor(a.id)}<span class="rn-text" title="${esc(displayName)}">${giftBadgeFor(a.id)}${esc(displayName)}</span>${a.has_user_info === false ? `<span class="tag-relogin" title="${esc(t("btn.reloginTitle"))}">${t("btn.relogin")}</span>` : ""}${expSoon}</div>
           <div class="row-meta">${meta}</div>
         </div>
-        <div class="row-info">${expSoon}${showChip ? quotaChipHtml(a.id, h) : ""}</div>
+        <div class="row-info">${showChip ? quotaChipHtml(a.id, h) : ""}</div>
         <div class="row-actions">
           <span class="row-tools">
             <span class="claim-slot" data-claim-slot></span>
