@@ -1910,6 +1910,10 @@ select.two-input { cursor: pointer; }
 }
 @media (max-width: 620px) { .qhp-kpis { grid-template-columns: repeat(2, 1fr); } }
 
+.qhp-sec-h { display: flex; align-items: center; justify-content: space-between; margin: 4px 0 7px; }
+.qhp-sec-h .qhp-sec { margin: 0; }
+.qh-win { display: inline-flex; gap: 4px; }
+.qh-win .qhd-tab { padding: 1px 9px; font-size: 11px; }
 .qhp-sec {
   font-size: 10.5px;
   font-weight: 600;

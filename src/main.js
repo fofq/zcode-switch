@@ -1227,11 +1227,11 @@ const QH_TAB_USAGE = "__usage__";
 // 额度池 Tab 里被展开（看按账号拆分）的模型
 const qhExpanded = new Set();
 
-/** KPI 行：关注模型剩余 / 全模型剩余 / 今日消耗 / 30 天消耗（数字等宽字体，来源不同分色） */
+/** KPI 行：关注模型剩余 / 全模型剩余 / 今日消耗 / N 天消耗（数字等宽字体，来源不同分色） */
 function quotaKpisHtml(tot) {
   const f = tot.focus;
   const u = usageData;
-  const dayAvg = u ? Math.round(u.week_total / 30) : null;
+  const dayAvg = u ? Math.round(u.week_total / usageDays) : null;
   const val = (v) => (v == null ? "…" : esc(fmtTokens(v)));
   const card = (label, value, sub) => `
     <div class="qhp-kpi">
@@ -1243,7 +1243,7 @@ function quotaKpisHtml(tot) {
     ${card(t("list.qhpKpiFocus"), f ? val(f.remaining) : "—", f ? f.name : t("list.qhpKpiFocusNone"))}
     ${card(t("list.qhpKpiAll"), val(tot.all.remaining), t("list.qhpKpiAllSub", { n: tot.models.length }))}
     ${card(t("list.qhpKpiToday"), u ? val(u.today_total) : "…", u ? t("list.qhpKpiTodaySub", { n: u.today_requests }) : t("list.qhUsageLoading"))}
-    ${card(t("list.qhpKpiWeek"), u ? val(u.week_total) : "…", u ? t("list.qhpKpiWeekSub", { v: fmtTokens(dayAvg) }) : t("list.qhUsageLoading"))}
+    ${card(t("list.qhpKpiWin", { n: usageDays }), u ? val(u.week_total) : "…", u ? t("list.qhpKpiWeekSub", { v: fmtTokens(dayAvg) }) : t("list.qhUsageLoading"))}
   </div>`;
 }
 
@@ -1300,13 +1300,13 @@ function niceCeil(v) {
   return 10 * p;
 }
 
-/** 近 30 天用量堆叠柱状图（手绘 SVG，FT/Economist 风格：少网格、直接标注、今天高亮） */
+/** 近 N 天用量堆叠柱状图（手绘 SVG，FT/Economist 风格：少网格、直接标注、今天高亮） */
 function trendChartHtml(daily) {
   if (!Array.isArray(daily) || !daily.length) return `<div class="qh-empty">${esc(t("list.qhpNoDaily"))}</div>`;
   const W = 640, H = 208;
   const padL = 50, padR = 6, padT = 10, padB = 24;
   const iw = W - padL - padR, ih = H - padT - padB;
-  const days = daily.slice(-31);
+  const days = daily.slice(-(usageDays >= 30 ? 31 : 8));
   const totals = days.map((d) => (d.models || []).reduce((s, m) => s + (m.total || 0), 0) || d.total || 0);
   const maxV = niceCeil(Math.max(...totals, 1));
   const y = (v) => padT + ih - (v / maxV) * ih;
@@ -1345,11 +1345,13 @@ function trendChartHtml(daily) {
   return `<svg class="qhp-trend" viewBox="0 0 ${W} ${H}" role="img" aria-label="${esc(t("list.qhpSecTrend"))}">${grid}${axis}${bars}${labels}</svg>`;
 }
 
-/** 用量趋势 Tab：30 天堆叠柱状图 + 模型明细表（今日/近 30 天/占比） */
+/** 用量趋势 Tab：N 天堆叠柱状图 + 模型明细表（今日/近 N 天/占比），窗口 7/30 可切 */
 function usageTabHtml() {
   const u = usageData;
   if (!u) return `<div class="qh-empty">${esc(t("list.qhUsageLoading"))}</div>`;
   if (u.db_missing || (!u.today.length && !u.week.length)) return `<div class="qh-empty">${esc(t("list.qhUsageEmpty"))}</div>`;
+  const win = usageDays;
+  const winTab = (n) => `<button class="qhd-tab${win === n ? " on" : ""}" click="actions.setUsageDays(${n})">${esc(t("list.qhUsageWin", { n }))}</button>`;
   const weekMax = Math.max(...u.week.map((w) => w.total), 1);
   const rows = u.week.map((w) => {
     const t0 = u.today.find((x) => x.model === w.model);
@@ -1362,10 +1364,10 @@ function usageTabHtml() {
     </div>`;
   }).join("");
   return `
-    <div class="qhp-sec">${esc(t("list.qhpSecTrend"))}</div>
+    <div class="qhp-sec-h"><span class="qhp-sec">${esc(t("list.qhpSecTrend"))}</span><span class="qh-win">${winTab(7)}${winTab(30)}</span></div>
     <div class="qhp-trend-wrap">${trendChartHtml(u.daily)}</div>
     <div class="qhp-sec">${esc(t("list.qhpSecModels"))}</div>
-    <div class="qhp-uhead"><span>${esc(t("list.qhUsageModel"))}</span><span>${esc(t("list.qhUsageToday"))}</span><span>${esc(t("list.qhUsageWeek"))}</span><span>${esc(t("list.qhpColShare"))}</span></div>
+    <div class="qhp-uhead"><span>${esc(t("list.qhUsageModel"))}</span><span>${esc(t("list.qhUsageToday"))}</span><span>${esc(t("list.qhUsageWin", { n: win }))}</span><span>${esc(t("list.qhpColShare"))}</span></div>
     ${rows}`;
 }
 
@@ -1488,12 +1490,13 @@ async function loadAcctQuota(id, opts = {}) {
       data.plans = cur.data.plans;
     }
     // 空快照防抖：上游对部分账号的 billing/balance 在「满额」与「成功但空」之间抖动
-    // （套餐可见性跟随激活心跳，服务端间歇性返回空快照）。一次空快照不得推翻
-    // 已见过的真实额度——保留旧数据展示并补一次非 quick 复查（后端非 quick 路径
-    // 会补激活心跳 + 2.5s 重查，可见性即恢复）。快速复查封顶 3 次后转 ~30min 慢复查，
-    // 期间绝不把「曾有过额度」的号判死：76 号 hardDown 误切、重启后新号掉进
-    // 额度耗尽分组，都是这条路径的受害者。
-    const emptySnap = data?.is_empty === true && data?.source === "snapshot_empty";
+    // （套餐可见性跟随激活心跳，服务端间歇性返回空快照）。空概览有三种形态：
+    // source="snapshot_empty"（快照渠道标记）/ source=""（balance 路径）/ 多渠道拼接，
+    // 因此只认 is_empty 这个跨形态稳定的标志。一次空快照不得推翻已见过的真实额度——
+    // 保留旧数据展示并补一次非 quick 复查（后端非 quick 路径会补激活心跳 + 2.5s 重查，
+    // 可见性即恢复）。快速复查封顶 3 次后转 ~30min 慢复查，期间绝不把「曾有过额度」的
+    // 号判死：76 号 hardDown 误切、重启后新号掉进额度耗尽分组，都是这条路径的受害者。
+    const emptySnap = data?.is_empty === true;
     const hasRem = (x) => Number(x?.remaining ?? 0) > 0 || (x?.items || []).some((i) => Number(i.remaining ?? 0) > 0);
     const prevHadQuota = (cur.data?.plans || []).some(hasRem) || hasRem(cur.data);
     if (emptySnap && prevHadQuota) {
@@ -1508,6 +1511,11 @@ async function loadAcctQuota(id, opts = {}) {
       acctQuota[id] = { ...cur, busy: false };
       if (!uiLocked()) render();
       return;
+    }
+    // 恢复反馈：此前数据面是空快照（曾被毒化/抖动）而现在拿到真实额度 → 明确告知
+    if (cur.data?.is_empty === true && !emptySnap && hasRem(data)) {
+      const pct = Math.round(data.percent_used != null ? 100 - data.percent_used : (pctPairOf(id).pct ?? 0));
+      setTimeout(() => toast(t("m.quotaRecovered", { name: accountName(id), pct }), "ok"), 0);
     }
     quotaFlapRetry[id] = 0;
     acctQuota[id] = { data, err: null, code: null, busy: false };
@@ -1674,6 +1682,16 @@ const actions = {
   setQhTab(name) {
     ui.qhTab = name;
     refreshQuotaModal();
+  },
+
+  /** 用量趋势窗口切换（7/30 天）：立即读取中，取回后重渲染 */
+  async setUsageDays(n) {
+    const next = Number(n) >= 30 ? 30 : 7;
+    if (usageDays === next) return;
+    usageDays = next;
+    usageData = null;
+    refreshQuotaModal();
+    await loadUsageStats();
   },
 
   /** 统计页「额度池」：展开/收起某模型的按账号拆分 */
@@ -1859,6 +1877,13 @@ const actions = {
     const act = (state?.accounts || []).find((a) => a.is_active);
     const order = act ? [act.id, ...ids.filter((i) => i !== act.id)] : ids;
     quotaSweep = { running: true, done: 0, total: ids.length, cancel: false };
+    // 恢复计数基线：刷新前数据面为空/无数据的账号，刷新后拿到真实额度即计入「恢复」
+    const wasEmpty = new Set(
+      ids.filter((id) => {
+        const q = acctQuota[id];
+        return !q?.data || q.data.is_empty === true || !!q.err;
+      }),
+    );
     render();
     let cancelled = false;
     try {
@@ -1875,8 +1900,14 @@ const actions = {
       const done = quotaSweep.done;
       cancelled = cancelled || quotaSweep.cancel;
       quotaSweep = { running: false, done: 0, total: 0, cancel: false };
+      // 刷新效果可见：多少个「空数据/判死」的账号这次拿到了真实额度
+      let recovered = 0;
+      for (const id of wasEmpty) {
+        const q = acctQuota[id];
+        if (q?.data && q.data.is_empty !== true) recovered++;
+      }
       if (cancelled) toast(t("list.toastSweepCancelled", { n: done }));
-      else toast(t("list.toastSweepDone", { n: done }));
+      else toast(t("list.toastSweepDone", { n: done }) + (recovered > 0 ? t("list.toastSweepRecovered", { m: recovered }) : ""));
       render();
       // 刷新期间被要求重查的账号（拿不到数据/太旧）：窗口一结束补一轮，不再卡在「陈旧」没人管
       drainStaleWant();
@@ -3227,11 +3258,13 @@ let qhOnKey = null;
 // 真实用量（ZCode CLI 本地库，请求完成后落库）：打开面板时读取
 let usageData = null;
 let usageLoading = false;
+// 用量统计窗口：默认 7 天，面板内可切 30 天（后端 SQLite 索引查询，30 天毫秒级）
+let usageDays = 7;
 async function loadUsageStats() {
   if (usageLoading) return;
   usageLoading = true;
   try {
-    usageData = await invoke("usage_stats", { days: 30 });
+    usageData = await invoke("usage_stats", { days: usageDays });
   } catch { usageData = null; }
   usageLoading = false;
   if (ui.qhOpen) refreshQuotaModal();
@@ -4376,7 +4409,7 @@ async function sweepTick() {
     // 2.5s 重查），不等 dead 分组 5-90 分钟的首刷——这就是「重启后要手动刷新才恢复」的根因
     let flapVerifyIdx = 0;
     for (const [id, q] of Object.entries(acctQuota)) {
-      if (q?.data?.is_empty === true && q?.data?.source === "snapshot_empty") {
+      if (q?.data?.is_empty === true) {
         setTimeout(() => { loadAcctQuota(id, { force: true }).finally(() => scheduleNext(id)); }, 3000 + flapVerifyIdx * 2500);
         flapVerifyIdx++;
       }

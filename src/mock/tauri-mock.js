@@ -59,10 +59,11 @@ const commands = {
 
   async get_account_quota({ id }) {
     await delay(220 + Math.random() * 260);
-    // 空快照抖动模拟：命中一次返回「成功但空」，下次恢复真实数据
+    // 空快照抖动模拟：命中一次返回「成功但空」，下次恢复真实数据。
+    // 故意不带 source——balance 路径的空概览就是这种形态（is_empty=true, source=""）
     if (mockQuotaFlap.has(id)) {
       mockQuotaFlap.delete(id);
-      return { is_empty: true, source: "snapshot_empty", items: [], plans: [], refreshed_at: 0, total: null, used: null, remaining: null, percent_used: null, plan_tier: null };
+      return { is_empty: true, source: "", items: [], plans: [], refreshed_at: 0, total: null, used: null, remaining: null, percent_used: null, plan_tier: null };
     }
     return mockQuota(id);
   },
