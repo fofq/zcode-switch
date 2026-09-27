@@ -46,6 +46,10 @@ window.__MOCK_PUSH_GIFT_INSTANCE__ = (planId, name) => {
   emit("zsignals", { kind: "grant" });
 };
 
+// 空快照抖动：下一次对该号的额度查询返回「成功但空」（验证空快照防抖）
+const mockQuotaFlap = new Set();
+window.__MOCK_SET_QUOTA_FLAP__ = (id) => mockQuotaFlap.add(id);
+
 // 各命令的 mock 实现；返回 null/对象都行，未列出的命令回退为 null 并告警
 const commands = {
   async app_version() { return "1.6.0-preview"; },
@@ -55,6 +59,11 @@ const commands = {
 
   async get_account_quota({ id }) {
     await delay(220 + Math.random() * 260);
+    // 空快照抖动模拟：命中一次返回「成功但空」，下次恢复真实数据
+    if (mockQuotaFlap.has(id)) {
+      mockQuotaFlap.delete(id);
+      return { is_empty: true, source: "snapshot_empty", items: [], plans: [], refreshed_at: 0, total: null, used: null, remaining: null, percent_used: null, plan_tier: null };
+    }
     return mockQuota(id);
   },
 

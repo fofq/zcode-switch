@@ -954,9 +954,13 @@ fn looks_like_dt(s: &str) -> bool {
 }
 
 fn extract_expire(obj: &Value) -> Option<String> {
-    const KEYS: [&str; 12] = [
+    // "ends_at" 必须先于 "period_end"：plan 级 ends_at 是套餐真有效期
+    // （官方 GUI 同源，如 Start Plan 09-29 23:59），而 balance 条目的 period_end
+    // 是每日重置窗口的结束（今天 23:59）——拿它当过期时间会让每日套餐在跨天后
+    // 被 planExpired 误判，整号掉进「额度耗尽」分组
+    const KEYS: [&str; 14] = [
         "nextRenewTime", "expireTime", "expire_time", "endTime", "end_time", "expireAt", "expiredTime", "validEndTime",
-        "expires_at", "expiresAt", "expired_at", "period_end",
+        "expires_at", "expiresAt", "expired_at", "ends_at", "endsAt", "period_end",
     ];
     for k in KEYS {
         let Some(v) = obj.get(k) else { continue };

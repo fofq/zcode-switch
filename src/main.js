@@ -306,6 +306,8 @@ let quotaForceAt = {};
 // 连续额度查询失败计数（成功清零）：无套餐 500 / 鉴权失效这类确定性故障下，
 // 样本永远刷不新，决策不能永远停在「先刷新」——连续失败按硬信号处理
 let quotaFailStreak = {};
+// 空快照抖动计数：上游间歇性返回「成功但空」时，快速非 quick 复查的已试次数
+let quotaFlapRetry = {};
 /** 连续失败 N 次后的重试间隔：6s 起指数退避，上限 30 分钟 */
 function failBackoffMs(streak) {
   const shift = Math.min(Math.max((streak || 1) - 1, 0), 9);
@@ -1225,11 +1227,11 @@ const QH_TAB_USAGE = "__usage__";
 // 额度池 Tab 里被展开（看按账号拆分）的模型
 const qhExpanded = new Set();
 
-/** KPI 行：关注模型剩余 / 全模型剩余 / 今日消耗 / 7 天消耗（数字等宽字体，来源不同分色） */
+/** KPI 行：关注模型剩余 / 全模型剩余 / 今日消耗 / 30 天消耗（数字等宽字体，来源不同分色） */
 function quotaKpisHtml(tot) {
   const f = tot.focus;
   const u = usageData;
-  const dayAvg = u ? Math.round(u.week_total / 7) : null;
+  const dayAvg = u ? Math.round(u.week_total / 30) : null;
   const val = (v) => (v == null ? "…" : esc(fmtTokens(v)));
   const card = (label, value, sub) => `
     <div class="qhp-kpi">
@@ -1298,19 +1300,21 @@ function niceCeil(v) {
   return 10 * p;
 }
 
-/** 近 7 天用量堆叠柱状图（手绘 SVG，FT/Economist 风格：少网格、直接标注、今天高亮） */
+/** 近 30 天用量堆叠柱状图（手绘 SVG，FT/Economist 风格：少网格、直接标注、今天高亮） */
 function trendChartHtml(daily) {
   if (!Array.isArray(daily) || !daily.length) return `<div class="qh-empty">${esc(t("list.qhpNoDaily"))}</div>`;
   const W = 640, H = 208;
   const padL = 50, padR = 6, padT = 10, padB = 24;
   const iw = W - padL - padR, ih = H - padT - padB;
-  const days = daily.slice(-8);
+  const days = daily.slice(-31);
   const totals = days.map((d) => (d.models || []).reduce((s, m) => s + (m.total || 0), 0) || d.total || 0);
   const maxV = niceCeil(Math.max(...totals, 1));
   const y = (v) => padT + ih - (v / maxV) * ih;
   const n = days.length;
   const step = iw / n;
   const bw = Math.min(38, step * 0.52);
+  // 长窗口下 x 轴标签稀疏化：每 5 根 + 今天，避免 30 个日期互相压字
+  const labelEvery = n > 16 ? 5 : 1;
   const grid = [maxV, maxV / 2].map((v) => `
     <line class="grid" x1="${padL}" y1="${y(v)}" x2="${W - padR}" y2="${y(v)}"/>
     <text class="ylab" x="${padL - 6}" y="${y(v) + 3}" text-anchor="end">${esc(fmtTokens(v))}</text>`).join("");
@@ -1334,13 +1338,14 @@ function trendChartHtml(daily) {
       return rect;
     }).join("");
     bars += `<g class="day${isToday ? " today" : ""}">${segs}</g>`;
+    const showLab = isToday || i % labelEvery === 0;
     const lab = d.date.length >= 10 ? d.date.slice(5).replace("-", "/") : d.date;
-    labels += `<text class="xlab${isToday ? " today" : ""}" x="${x + bw / 2}" y="${H - 7}" text-anchor="middle">${esc(lab)}</text>`;
+    if (showLab) labels += `<text class="xlab${isToday ? " today" : ""}" x="${x + bw / 2}" y="${H - 7}" text-anchor="middle">${esc(lab)}</text>`;
   });
   return `<svg class="qhp-trend" viewBox="0 0 ${W} ${H}" role="img" aria-label="${esc(t("list.qhpSecTrend"))}">${grid}${axis}${bars}${labels}</svg>`;
 }
 
-/** 用量趋势 Tab：7 天堆叠柱状图 + 模型明细表（今日/近 7 天/占比） */
+/** 用量趋势 Tab：30 天堆叠柱状图 + 模型明细表（今日/近 30 天/占比） */
 function usageTabHtml() {
   const u = usageData;
   if (!u) return `<div class="qh-empty">${esc(t("list.qhUsageLoading"))}</div>`;
@@ -1482,6 +1487,29 @@ async function loadAcctQuota(id, opts = {}) {
     if (cur.data?.plans?.length && data && !data.plans?.length && data.is_empty !== true) {
       data.plans = cur.data.plans;
     }
+    // 空快照防抖：上游对部分账号的 billing/balance 在「满额」与「成功但空」之间抖动
+    // （套餐可见性跟随激活心跳，服务端间歇性返回空快照）。一次空快照不得推翻
+    // 已见过的真实额度——保留旧数据展示并补一次非 quick 复查（后端非 quick 路径
+    // 会补激活心跳 + 2.5s 重查，可见性即恢复）。快速复查封顶 3 次后转 ~30min 慢复查，
+    // 期间绝不把「曾有过额度」的号判死：76 号 hardDown 误切、重启后新号掉进
+    // 额度耗尽分组，都是这条路径的受害者。
+    const emptySnap = data?.is_empty === true && data?.source === "snapshot_empty";
+    const hasRem = (x) => Number(x?.remaining ?? 0) > 0 || (x?.items || []).some((i) => Number(i.remaining ?? 0) > 0);
+    const prevHadQuota = (cur.data?.plans || []).some(hasRem) || hasRem(cur.data);
+    if (emptySnap && prevHadQuota) {
+      const tries = (quotaFlapRetry[id] = (quotaFlapRetry[id] || 0) + 1);
+      if (tries <= 3) {
+        setTimeout(() => { loadAcctQuota(id, { force: true }).finally(() => scheduleNext(id)); }, 2500 + Math.random() * 3000);
+      } else {
+        quotaDue[id] = Date.now() + 25 * 60e3 + Math.random() * 10 * 60e3;
+      }
+      // 数据面不变：保留旧数据并清掉 entry 时挂上的 busy（否则 20s 内 sweep 全部跳过
+      // 该号）；不更新采样/缓存脏标记（缓存里保留真实额度）
+      acctQuota[id] = { ...cur, busy: false };
+      if (!uiLocked()) render();
+      return;
+    }
+    quotaFlapRetry[id] = 0;
     acctQuota[id] = { data, err: null, code: null, busy: false };
     quotaFailStreak[id] = 0;
     // balance 的 plans（已生效套餐）登记实例：本号刚领到的新期 id 首现 → 级联其他未持有者；
@@ -3203,7 +3231,7 @@ async function loadUsageStats() {
   if (usageLoading) return;
   usageLoading = true;
   try {
-    usageData = await invoke("usage_stats", { days: 7 });
+    usageData = await invoke("usage_stats", { days: 30 });
   } catch { usageData = null; }
   usageLoading = false;
   if (ui.qhOpen) refreshQuotaModal();
@@ -4343,6 +4371,16 @@ async function sweepTick() {
     const seeded = loadQuotaCache();
     enrollAccounts();
     if (seeded > 0) seedStartupDue();
+    // 缓存里以「成功但空」收尾的账号：套餐可见性抖动的受害者（billing/balance 间歇
+    // 返回空快照，等一次激活心跳才恢复）。启动即补非 quick 验证（后端会补心跳 +
+    // 2.5s 重查），不等 dead 分组 5-90 分钟的首刷——这就是「重启后要手动刷新才恢复」的根因
+    let flapVerifyIdx = 0;
+    for (const [id, q] of Object.entries(acctQuota)) {
+      if (q?.data?.is_empty === true && q?.data?.source === "snapshot_empty") {
+        setTimeout(() => { loadAcctQuota(id, { force: true }).finally(() => scheduleNext(id)); }, 3000 + flapVerifyIdx * 2500);
+        flapVerifyIdx++;
+      }
+    }
     render();
     await invoke("reveal_main");
     setTimeout(dismissSplash, 350);
