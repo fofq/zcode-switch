@@ -1086,16 +1086,27 @@ async fn get_pool(st: &Arc<SharedState>) -> (Vec<PoolKey>, Option<String>) {
     })
     .await
     .unwrap_or((Vec::new(), Some("内部任务失败".into())));
-    let pool: Vec<PoolKey> = pairs
+    let mut pool: Vec<PoolKey> = pairs
         .into_iter()
         .map(|(provider, api_key)| PoolKey { api_key, provider })
         .collect();
+    // 平台 key 双网关通用（8-key 实测）：api.z.ai 与 open.bigmodel.cn 都进轮询池。
+    // api.z.ai 的 TLS/限流是一阵一阵的（tls connection init failed 波次），open.bigmodel.cn
+    // 长期稳——传输失败/429 时 free_call 换下一项，自然落到活着的那个网关。
+    let flipped: Vec<PoolKey> = pool
+        .iter()
+        .map(|pk| PoolKey {
+            api_key: pk.api_key.clone(),
+            provider: if pk.provider == "zai" { "bigmodel".to_string() } else { "zai".to_string() },
+        })
+        .collect();
+    pool.extend(flipped);
     let ttl = if pool.is_empty() { Duration::from_secs(20) } else { POOL_TTL };
     *st.pool.lock().unwrap() = Some((std::time::Instant::now(), pool.clone(), ttl));
     (pool, diag)
 }
 
-/// 免费模型统一入口：key 池轮询，401/403/429 自动换下一个 key 重试。
+/// 免费模型统一入口：key 池轮询（双网关池），401/403/429 与传输失败都自动换下一项重试。
 /// url_of / auth_of 决定走 paas/v4（OpenAI 入站）还是 anthropic coding endpoint（anthropic 入站）。
 async fn free_call(
     st: &Arc<SharedState>,
@@ -1116,17 +1127,36 @@ async fn free_call(
     let n = pool.len();
     let start = st.rr.fetch_add(1, Ordering::Relaxed) as usize;
     let mut last: Option<Response> = None;
+    let mut last_net_err: Option<String> = None;
     for k in 0..n {
         let pk = &pool[(start + k) % n];
-        let resp = pump_request(url_of(pk), auth_of(pk), body.clone(), mode.clone()).await;
-        let s = resp.status().as_u16();
-        if matches!(s, 401 | 403 | 429) && k + 1 < n {
-            last = Some(resp);
-            continue;
+        match pump_request(url_of(pk), auth_of(pk), body.clone(), mode.clone()).await {
+            Ok(resp) => {
+                let s = resp.status().as_u16();
+                if matches!(s, 401 | 403 | 429) && k + 1 < n {
+                    last = Some(resp);
+                    continue;
+                }
+                return resp;
+            }
+            // 传输失败（TLS 断连/超时）：换下一个池项——双网关池自然切到活着的网关
+            Err(e) => {
+                last_net_err = Some(e);
+                continue;
+            }
         }
+    }
+    if let Some(resp) = last {
         return resp;
     }
-    last.unwrap_or_else(|| err_json(StatusCode::BAD_GATEWAY, "上游全部失败"))
+    stats().errors.fetch_add(1, Ordering::Relaxed);
+    err_json(
+        StatusCode::BAD_GATEWAY,
+        &format!(
+            "免费池全部失败（api.z.ai 与 open.bigmodel.cn 均不可达）｜最后错误: {}",
+            last_net_err.unwrap_or_else(|| "未知".into())
+        ),
+    )
 }
 
 fn free_url_anthropic(pk: &PoolKey) -> String {
@@ -1142,7 +1172,9 @@ fn free_auth_paas(pk: &PoolKey) -> AuthStyle {
     AuthStyle::Bearer(pk.api_key.clone())
 }
 
-async fn pump_request(url: String, auth: AuthStyle, body: Vec<u8>, mode: PumpMode) -> Response {
+/// 单次免费池请求：Ok = 上游已给出 HTTP 响应（含 4xx/5xx，交上层按状态轮询/透传）；
+/// Err = 传输层失败（TLS/超时/断连），调用方换下一个池项。
+async fn pump_request(url: String, auth: AuthStyle, body: Vec<u8>, mode: PumpMode) -> Result<Response, String> {
     let (meta_tx, meta_rx) = tokio::sync::oneshot::channel::<Result<(u16, String), String>>();
     let (body_tx, body_rx) = tokio::sync::mpsc::channel::<Result<Vec<u8>, std::io::Error>>(32);
     tauri::async_runtime::spawn_blocking(move || {
@@ -1177,11 +1209,8 @@ async fn pump_request(url: String, auth: AuthStyle, body: Vec<u8>, mode: PumpMod
     });
     let (status, ctype) = match meta_rx.await {
         Ok(Ok(x)) => x,
-        Ok(Err(e)) => {
-            stats().errors.fetch_add(1, Ordering::Relaxed);
-            return err_json(StatusCode::BAD_GATEWAY, &e);
-        }
-        Err(_) => return err_json(StatusCode::BAD_GATEWAY, "内部管道错误"),
+        Ok(Err(e)) => return Err(e),
+        Err(_) => return Err("内部管道错误".into()),
     };
     let code = StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY);
     let stream = tokio_stream::wrappers::ReceiverStream::new(body_rx);
@@ -1190,8 +1219,8 @@ async fn pump_request(url: String, auth: AuthStyle, body: Vec<u8>, mode: PumpMod
         .header(header::CONTENT_TYPE, ctype)
         .body(Body::from_stream(stream))
     {
-        Ok(r) => r,
-        Err(e) => err_json(StatusCode::INTERNAL_SERVER_ERROR, &format!("响应构建失败: {e}")),
+        Ok(r) => Ok(r),
+        Err(e) => Err(format!("响应构建失败: {e}")),
     }
 }
 
