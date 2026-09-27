@@ -1015,8 +1015,8 @@ async fn plan_request_once(
             // 缺这些头时同一请求在 billing 通、在 /v1/messages 吃 3012（实测）
             .set("X-Zcode-Session-Type", "main")
             .set("X-Session-Id", session_id())
-            .set("X-Zcode-Trace-Id", uuid::Uuid::new_v4().to_string())
-            .set("X-Query-Id", uuid::Uuid::new_v4().to_string());
+            .set("X-Zcode-Trace-Id", &uuid::Uuid::new_v4().to_string())
+            .set("X-Query-Id", &uuid::Uuid::new_v4().to_string());
         let rb = extra_headers.iter().fold(rb, |acc, (k, v)| acc.set(k, v));
         // 与 pump_request 相同：body 按 UTF-8 字符串发送（上游均为 JSON）
         let body_str = String::from_utf8_lossy(&body);
