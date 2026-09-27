@@ -375,22 +375,35 @@ struct ClaimRefreshResult {
 }
 
 #[tauri::command]
-async fn claim_refresh(id: String) -> Result<ClaimRefreshResult, String> {
+async fn claim_refresh(id: String, urgent: Option<bool>) -> Result<ClaimRefreshResult, String> {
     let paths = Paths::detect();
     let mid = store::ensure_virtual_device_mid(&paths, &id)?;
     let acc = load_account(&paths, &id)?;
+    let urgent = urgent.unwrap_or(false);
     let (activated, activation_error) =
         match claim::telemetry_user_id(&paths.home, &acc.credentials) {
-            // 激活上报走 180s 节流槽（与 spawn 路径共享预算）：
+            // 激活上报节流分档：urgent（入库/切号紧急检查）180s 槽，例行轮询 4h 槽。
             // None = 节流期内跳过，无界面/无请求，spawn 路径会在槽位空出时补报
-            Some(uid) => match claim::activation_report_throttled(&uid, &mid) {
+            Some(uid) => match claim::activation_report_throttled(&uid, &mid, urgent) {
                 Some(Ok(())) => (true, None),
                 Some(Err(e)) => (false, Some(e)),
                 None => (false, None),
             },
             None => (false, None),
         };
-    let plans = claim::preview_plans(&paths.home, &acc.credentials, acc.config.as_ref(), Some(mid))?;
+    let plans = match claim::preview_plans(&paths.home, &acc.credentials, acc.config.as_ref(), Some(mid)) {
+        Ok(p) => p,
+        Err(e) => {
+            crate::flowlog::log("claim", "preview-fail", &format!("acct={} {e}", acc.name));
+            return Err(e);
+        }
+    };
+    let ids: Vec<String> = plans.iter().map(|x| x.plan_id.clone()).collect();
+    crate::flowlog::log(
+        "claim",
+        "preview",
+        &format!("acct={} plans={} {}", acc.name, plans.len(), ids.join(",")),
+    );
     Ok(ClaimRefreshResult { plans, activated, activation_error })
 }
 
@@ -475,12 +488,18 @@ async fn claim_captcha_submit_inner(
             let outcome = claim::ClaimOutcome {
                 account_id: pending.account_id.clone(),
                 account_name: pending.account_name.clone(),
+                plan_id: pending.plan_id.clone(),
                 plan_name: pending.plan_name.clone(),
                 starts_at: ms("starts_at"),
                 ends_at: ms("ends_at"),
                 server_time,
             };
             let p = serde_json::to_value(&outcome).unwrap_or(Value::Null);
+            crate::flowlog::log(
+                "claim",
+                "ok",
+                &format!("acct={} plan={} ({})", pending.account_name, pending.plan_name, pending.plan_id),
+            );
             let _ = app.emit("claim://result", &p);
             p
         }
@@ -490,6 +509,11 @@ async fn claim_captcha_submit_inner(
                 &pending.account_name,
                 &pending.plan_name,
                 &e,
+            );
+            crate::flowlog::log(
+                "claim",
+                "fail",
+                &format!("acct={} plan={} code={} {}", pending.account_name, pending.plan_name, e.code, e.message),
             );
             let _ = app.emit("claim://result", &p);
             return Ok(p);

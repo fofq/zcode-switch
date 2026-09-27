@@ -65,6 +65,121 @@ let claimActive = false;
 let lastAutoRound = null;
 let autoToggleBusy = false;
 
+// ===== 礼物账本与分层（事件驱动领取） =====
+// 实证模型（2026-09-27）：Global Build（1亿/号）每号一生一次，报价未领期间一直挂在
+// preview；周礼（3亿）全员有资格、按期领一次。可领报价只存在于 billing/preview——
+// 客户端日志/余额都看不到，因此快检集合要小而准：当前号+新号快轮询，老号靠空手证词
+// 一次性降级，新实例开闸由「级联」把未持有者错峰排进轮次。
+// 账本：每号每礼物族记录已领实例（led.global=领过即终身免快检；led._inst=见过的实例）
+const CLAIM_LEDGER_KEY = "zsw-claim-ledger-v1";
+let claimLedger = (() => {
+  try { return JSON.parse(localStorage.getItem(CLAIM_LEDGER_KEY) || "{}"); }
+  catch { return {}; }
+})();
+function saveClaimLedger() {
+  try { localStorage.setItem(CLAIM_LEDGER_KEY, JSON.stringify(claimLedger)); } catch { /* 忽略 */ }
+}
+function giftFamilyKey(name) {
+  const n = String(name || "").toLowerCase();
+  if (n.includes("global build")) return "global";
+  if (n.includes("weekend")) return "weekend";
+  if (n.includes("start plan")) return "start";
+  return `other:${String(name || "").trim()}`;
+}
+function markClaimedPlan(id, planName, planId) {
+  if (!id || !planId) return;
+  const fam = giftFamilyKey(planName);
+  const led = (claimLedger[id] = claimLedger[id] || {});
+  if (led[fam] === planId) return;
+  led[fam] = planId;
+  saveClaimLedger();
+}
+// 分层：0=当前账号 1=新号(<48h)/GlobalBuild未证词 2=有额度 3=其余(含用尽)。
+// 有额度与否跟资格无关（满额老号也不可见），但决定请求预算的先后
+const CLAIM_NEW_MS = 48 * 3600e3;
+const CLAIM_T0_POLL_MS = 12 * 60e3;
+const CLAIM_T1_CAP_MS = 30 * 60e3;
+const CLAIM_T2_CAP_MS = 2 * 3600e3;
+function claimTierOf(id) {
+  if (id === state?.active_account_id) return 0;
+  const a = (state?.accounts || []).find((x) => x.id === id);
+  const created = Date.parse(String(a?.created_at || "").replace(" ", "T")) || 0;
+  if (created && Date.now() - created < CLAIM_NEW_MS) return 1;
+  const led = claimLedger[id] || {};
+  if (!led.global && !led.globalEmpty) return 1;
+  const h = healthMapOf().get(id);
+  if (h && (h.level === "ok" || h.level === "low")) return 2;
+  return 3;
+}
+function claimTierCapMs(tier) {
+  if (tier === 0) return CLAIM_T0_POLL_MS;
+  if (tier === 1) return CLAIM_T1_CAP_MS;
+  if (tier === 2) return CLAIM_T2_CAP_MS;
+  return Infinity; // T3 沿用 30min→4h 退避封顶
+}
+// 入库/切号触发的紧急检查：激活上报走 180s 快槽（区别于例行轮询的 4h 槽）
+let claimUrgent = {};
+// 切号/入库后统一入口：清冷却 + 稍后 tick（轮次忙则下个 tick 以 T0 优先接续）
+function armClaimCheck(id) {
+  if (!id) return;
+  claimUrgent[id] = true;
+  autoClaimCooldown[id] = 0;
+  setTimeout(() => autoClaimTick(), 4000);
+}
+// 新实例登记：plan_id 首次出现（preview/balance/客户端日志任一来源）→ 级联一次：
+// 所有未持有该实例的账号错峰排入领取轮。global 族按「领过即出列」、其余族按实例比对；
+// 冻结号不级联（保持探测节奏）。级联只铺冷却，顺序/限速仍由分层轮次统一控制。
+// 过期/非生效实例只登记不级联（否则每次余额刷新都会重复触发）
+function notePlanInstances(list) {
+  const inst = (claimLedger._inst = claimLedger._inst || {});
+  let added = null;
+  for (const it of list || []) {
+    const pid = String(it?.planId || it?.plan_id || "").trim();
+    if (!pid || inst[pid]) continue;
+    inst[pid] = Date.now();
+    const live = it.expired != null ? !it.expired
+      : it.status != null && it.status !== "" ? String(it.status).toLowerCase() === "active"
+        : true;
+    (added ||= []).push([pid, it.name || "", live]);
+  }
+  if (added?.length) {
+    saveClaimLedger();
+    for (const [pid, pname, live] of added) {
+      if (live) scheduleGiftCascade(pid, pname);
+    }
+  }
+}
+let pendingCascade = null;
+// 自动领取关闭期间登记的新实例：开启（或启动加载完配置）后补一次级联
+function flushPendingCascade() {
+  if (pendingCascade && state?.auto_claim) {
+    const p = pendingCascade;
+    pendingCascade = null;
+    scheduleGiftCascade(p.planId, p.planName);
+  }
+}
+function scheduleGiftCascade(planId, planName) {
+  const fam = giftFamilyKey(planName);
+  if (fam === "start") return; // 基础套餐不是「礼物期」：新号由入库钩子负责
+  if (!state?.auto_claim) { pendingCascade = { planId, planName }; return; }
+  const now = Date.now();
+  let n = 0;
+  for (const a of state?.accounts || []) {
+    const id = a.id;
+    const led = claimLedger[id] || {};
+    if (fam === "global" ? led.global : led[fam] === planId) continue;
+    if (isFrozen(id)) continue;
+    // 错峰铺开（20s×序号±抖动）：级联只让账号「变为可调」，不做对齐风暴
+    const stagger = n * 20_000 + Math.round(Math.random() * 20_000);
+    autoClaimCooldown[id] = Math.min(autoClaimCooldown[id] ?? Infinity, now + stagger);
+    n++;
+  }
+  if (n > 0) {
+    toast(t("m.cascadeStart", { name: planDisplayName(planName || planId), n }), "ok");
+    setTimeout(() => autoClaimTick(), 3000);
+  }
+}
+
 const NOTCH_COLORS = ["var(--notch-1)", "var(--notch-2)", "var(--notch-3)", "var(--notch-4)", "var(--notch-5)", "var(--notch-6)"];
 function notchColor(id) {
   let h = 0;
@@ -1330,6 +1445,7 @@ function listHeadHtml(s, sum, visible) {
 async function refresh() {
   state = await invoke("get_state");
   if (state?.language) init(state.language);
+  flushPendingCascade();
 }
 
 function uiLocked() {
@@ -1368,6 +1484,11 @@ async function loadAcctQuota(id, opts = {}) {
     }
     acctQuota[id] = { data, err: null, code: null, busy: false };
     quotaFailStreak[id] = 0;
+    // balance 的 plans（已生效套餐）登记实例：本号刚领到的新期 id 首现 → 级联其他未持有者；
+    // 过期历史实例只登记不级联
+    if (data?.plans?.length) {
+      notePlanInstances(data.plans.filter((p) => p.pid).map((p) => ({ planId: p.pid, name: p.name || "", expired: !!p.expired })));
+    }
     // 采样入队（算烧速/ETA 用）；失败时刻意不刷新样本时间，让“陈旧 → 先刷新”的门禁生效
     quotaSampleAt[id] = Date.now();
     const st = apiStats(id);
@@ -1483,9 +1604,8 @@ const actions = {
       // 新账号入库：稍等 ZCode 落盘凭据后立刻拉额度（立即拉可能与写盘竞争）
       setTimeout(() => loadAcctQuota(r.id), 1500);
       // 新号上游还没有任何套餐（Start Plan 余额行跟着首次领取事件一起发放），
-      // 清冷却尽快进入自动领取，领完才有额度可查
-      autoClaimCooldown[r.id] = 0;
-      setTimeout(() => autoClaimTick(), 4000);
+      // urgent 检查尽快进入自动领取（激活走 180s 快槽），领完才有额度可查
+      armClaimCheck(r.id);
     });
   },
 
@@ -1821,6 +1941,8 @@ const actions = {
       resetHotStreak();
       ui.expanded.delete(id);
       await refresh();
+      pokeAccount(id);
+      armClaimCheck(id); // 冷切同样是「切换完成」事件：新当前账号立即检查领取
       if (!uiLocked()) render();
     });
   },
@@ -1850,6 +1972,8 @@ const actions = {
       ui.expanded.delete(id);
       await refresh(); render();
       pokeAccount(id);
+      // 当前使用中的账号优先：切到谁就立刻给谁做一次领取检查（T0 层语义）
+      armClaimCheck(id);
       if (r?.hot) scheduleHotFollowUp(id);
     });
   },
@@ -2373,7 +2497,7 @@ const actions = {
       (state?.accounts || [])
         .map((a) => a.id)
         .filter((id) => (claimable[id]?.plans || []).length > 0),
-    );
+    ).sort((x, y) => claimTierOf(x) - claimTierOf(y)); // 同自动轮：当前号优先，同层内新号优先
     if (!ids.length) { toast(t("m.noClaimableAccounts"), "warn"); return; }
     if (claimActive && !autoClaimRunning) return;
     const preemptRound = autoClaimRunning;
@@ -2494,6 +2618,7 @@ const actions = {
       syncSettingsModal();
       if (state.auto_claim) {
         toast(t("m.autoClaimOn"), "ok", t("m.autoClaimOnDetail"));
+        flushPendingCascade(); // 关闭期间登记的新礼物期：开启即补级联
         autoClaimTick(); // 开启即检测一轮（轮内冷却/退避自行控速）
       } else {
         lastAutoRound = null;
@@ -2581,11 +2706,13 @@ function autoClaimCooldownFor(r) {
 async function autoClaimTick() {
   if (!state?.auto_claim || autoClaimRunning) return;
   if (claimActive || claimAllRunning) return;
+  // 分层优先（0当前 → 1新号/GlobalBuild未证词 → 2有额度 → 3其余）：排序稳定，
+  // 同层内保持新号优先；由于轮询决定「谁先发现礼物」，资格顺序必须盖过冷却到期顺序
   const ids = accountsNewFirst(
     (state.accounts || [])
       .map((a) => a.id)
       .filter((id) => (autoClaimCooldown[id] ?? 0) <= Date.now()),
-  ).slice(0, AUTO_CLAIM_ROUND_CAP);
+  ).sort((x, y) => claimTierOf(x) - claimTierOf(y)).slice(0, AUTO_CLAIM_ROUND_CAP);
   if (!ids.length) {
     if ((state.accounts || []).some((a) => (claimable[a.id]?.plans || []).length > 0)) {
       lastAutoRound = { at: Date.now(), claimed: 0, skipped: 0, cooldownAll: true };
@@ -2602,13 +2729,17 @@ async function autoClaimTick() {
       let gotAny = false;
       let failed = false;
       claimable[id] = { ...(claimable[id] || {}), busy: true };
+      const urgent = !!claimUrgent[id];
+      delete claimUrgent[id];
       try {
-        const r = await invoke("claim_refresh", { id });
+        const r = await invoke("claim_refresh", { id, urgent });
         claimable[id] = { plans: r.plans || [], err: null, busy: false };
         // 事件上报（activation POST）的风控响应同样实时记账：
         // 上游在 event/report 上返回拒绝码/HTTP 错误 = 该号已被风控盯上，
         // 与领取失败共用同一套双信号冻结判定
         if (r.activationError && riskInText(stripErr(r.activationError))) noteClaimRisk(id);
+        // preview 结果喂给实例登记：新 plan_id 首现 → 级联未持有者
+        notePlanInstances((r.plans || []).map((p) => ({ planId: p.plan_id, name: p.name })));
       } catch (e) {
         claimable[id] = { plans: claimable[id]?.plans || [], err: String(e), busy: false };
         if (riskInText(stripErr(e))) noteClaimRisk(id);
@@ -2671,13 +2802,27 @@ async function autoClaimTick() {
       if (gotAny) { autoClaimEmptyRounds[id] = 0; autoClaimFailRounds[id] = 0; }
       if (!gotAny && (claimable[id]?.plans || []).length) roundSkipped++;
       // 统一收尾冷却（带去相位抖动）：有失败走失败时已设的冷却；
-      // 连续空手的账号渐进退避 30min → 1h → 2h → 4h —— 76 个账号里绝大多数
-      // 从来没有礼包，不该以固定 30min 的频率轮询领奖接口（今天 654 次激活上报的根源）
+      // 连续空手的账号按层封顶渐进退避——T0 当前号 12min（在用号随时可能上架新礼物）、
+      // T1 新号 30min、T2 有额度 2h、T3 其余 30min→4h 原样。快检集合恒小：
+      // 绝大多数老号空手一次就拿到「无资格/已领」证词，从快检层永久退出
       if (!failed) {
         const remaining = (claimable[id]?.plans || []).length;
         if (remaining === 0) {
           const streak = (autoClaimEmptyRounds[id] = (autoClaimEmptyRounds[id] || 0) + 1);
-          autoClaimCooldown[id] = Date.now() + autoClaimGap(AUTO_CLAIM_RECHECK_MS * (2 ** Math.min(streak - 1, 3)));
+          const cap = claimTierCapMs(claimTierOf(id));
+          autoClaimCooldown[id] = Date.now() + Math.min(
+            autoClaimGap(AUTO_CLAIM_RECHECK_MS * (2 ** Math.min(streak - 1, 3))),
+            autoClaimGap(cap),
+          );
+          // 空手证词：非当前、非新号、未领过 Global Build 的账号首次空手 → 记账降级。
+          // 资格规则若变，级联/安全网仍会重新覆盖到它
+          const a = (state?.accounts || []).find((x) => x.id === id);
+          const created = Date.parse(String(a?.created_at || "").replace(" ", "T")) || 0;
+          const isNew = created && Date.now() - created < CLAIM_NEW_MS;
+          if (id !== state?.active_account_id && !isNew && !claimLedger[id]?.global) {
+            claimLedger[id] = { ...(claimLedger[id] || {}), globalEmpty: Date.now() };
+            saveClaimLedger();
+          }
         } else {
           autoClaimCooldown[id] = Date.now() + autoClaimGap(AUTO_CLAIM_INTERVAL_MS);
         }
@@ -3591,6 +3736,8 @@ listen("claim://result", (ev) => {
   } else {
     autoRiskStreak[p.accountId] = 0; // 领取成功：风控怀疑清零
     if (isFrozen(p.accountId)) autoUnfreeze(p.accountId); // 探测通过 → 解冻（手动/自动一视同仁）
+    // 礼物账本：领到的实例记账（global 族终身免快检；weekend 族按期比对）
+    markClaimedPlan(p.accountId, p.planName, p.planId);
     const bits = [];
     const now = p.serverTime || Date.now();
     if (p.startsAt && p.startsAt > now) bits.push(t("m.claimStartsAt", { time: new Date(p.startsAt).toLocaleString(localeTag(), { hour12: false }) }));
@@ -3641,11 +3788,20 @@ listen("state-changed", () => {
 // 后端 1s 一次跟随客户端日志，解析到新余额/计划状态/请求边界就推事件；没推到也能兜底拉起决策。
 let signalsPoolsAt = 0;
 let signalsModelAt = 0;
+let signalsPlansAt = 0;
 function applySignals(sig) {
   if (!sig || typeof sig !== "object") return false;
   liveSignals = sig;
   const at = Number(sig.pools_at_ms) || 0;
   const mAt = Number(sig.model_at_ms) || 0;
+  // 余额载荷的 plans（已生效套餐）：plan_id 首现 = 新礼物到账/新一期开闸 → 实例登记触发级联
+  const pAt = Number(sig.plans_at_ms) || 0;
+  if (pAt !== signalsPlansAt) {
+    signalsPlansAt = pAt;
+    if (Array.isArray(sig.plans)) {
+      notePlanInstances(sig.plans.map((p) => ({ planId: p.plan_id, name: p.name, status: p.status })));
+    }
+  }
   if (at === signalsPoolsAt && mAt === signalsModelAt) return false;
   signalsPoolsAt = at;
   signalsModelAt = mAt;
@@ -4109,6 +4265,7 @@ async function doAutoSwitch(d, active, cur, lg) {
       });
       await refresh();
       pokeAccount(best.id);
+      armClaimCheck(best.id); // 自动切换同样触发新当前账号的领取检查（T0 优先）
       if (r?.hot) { scheduleHotFollowUp(best.id); noteHotSwitch(); }
     } catch (e) {
       // 失败也计一次冷却：只当“抑制器”（否则 ETA 触发会每轮重试），不阻塞后续成功路径

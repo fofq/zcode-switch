@@ -104,6 +104,7 @@ export const en = {
   "m.claimNextAt": " — available again after {time}",
   "m.refreshClaimDone": "Refreshed {n} accounts — {k} with claimable plans",
   "m.refreshClaimAcctErr": "\"{name}\" refresh failed: {err}",
+  "m.cascadeStart": "New gift period \"{name}\" detected: {n} accounts queued (staggered)",
   "m.autoClaimOn": "Auto claim enabled",
   "m.autoClaimOnDetail": "Checks immediately once enabled, then every 10 minutes",
   "m.autoClaimInteractive": "\"{name}\" needs manual verification — auto claim skipped",

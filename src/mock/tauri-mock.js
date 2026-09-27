@@ -35,6 +35,17 @@ window.__MOCK_SET_ACTIVATION_RISK__ = (id) => mockActivationRisk.add(id);
 window.__MOCK_CLEAR_ACTIVATION_RISK__ = () => mockActivationRisk.clear();
 window.__MOCK_HAS_ACTIVATION_RISK__ = (id) => mockActivationRisk.has(id);
 
+// 客户端日志侧的已生效套餐（live_signals.plans）；__MOCK_PUSH_GIFT_INSTANCE__ 模拟
+// 「新礼物期在客户端日志里首现」→ 走 notePlanInstances → 级联的真实链路
+let mockLivePlans = [
+  { plan_id: "zcode-v3-start-plan-0817", name: "ZCode Start Plan", status: "active" },
+  { plan_id: "zcode-v3-start-plan-0924-wk-2", name: "ZCode Weekend Build", status: "active" },
+];
+window.__MOCK_PUSH_GIFT_INSTANCE__ = (planId, name) => {
+  mockLivePlans = [...mockLivePlans, { plan_id: planId, name, status: "active" }];
+  emit("zsignals", { kind: "grant" });
+};
+
 // 各命令的 mock 实现；返回 null/对象都行，未列出的命令回退为 null 并告警
 const commands = {
   async app_version() { return "1.6.0-preview"; },
@@ -67,7 +78,7 @@ const commands = {
       if (plan) applyClaimedGift(id);
       emit("claim://result", {
         ok: true, accountId: id, accountName: acc?.name || id,
-        planName: plan?.name || "Start Plan", serverTime: Date.now(),
+        planId: plan?.plan_id || "start-trial", planName: plan?.name || "Start Plan", serverTime: Date.now(),
       });
     }, 1600);
     return null;
@@ -184,6 +195,8 @@ const commands = {
       pools, pools_at_ms: at, prev_pools: pools.map((p) => ({ ...p, remaining: p.remaining + 900_000 })), prev_at_ms: prevAt,
       plan_available: true, plan_at_ms: at, model: "GLM-5.3-Flash", model_at_ms: at, provider: "zai",
       last_request_at_ms: Date.now() - 4_000, last_applied_at_ms: null, requests: 233, parse_errors: 0,
+      // balance 载荷的 plans（已生效套餐）：新 plan_id 首现 = 礼物到账/新一期开闸
+      plans: mockLivePlans.map((p) => ({ ...p })), plans_at_ms: Date.now() - 8_000,
     };
   },
 

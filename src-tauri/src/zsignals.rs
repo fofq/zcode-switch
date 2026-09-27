@@ -46,6 +46,15 @@ pub struct Pool {
     pub expires_at: Option<i64>,
 }
 
+/// 余额载荷里的一个套餐（balance 的 plans 只含已生效计划）。
+/// plan_id 首次出现 = 当前账号收到新套餐/新一期礼物（claim 到账或服务端发放）。
+#[derive(Clone, Debug, Default, Serialize, PartialEq)]
+pub struct PlanSeen {
+    pub plan_id: String,
+    pub name: String,
+    pub status: String,
+}
+
 /// 对外快照（同时被 Tauri 命令与 CLI 用）
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct Snapshot {
@@ -62,6 +71,9 @@ pub struct Snapshot {
     /// 客户端自己的「计划可用」判定（false = 官方客户端认为当前账号不可用）
     pub plan_available: Option<bool>,
     pub plan_at_ms: i64,
+    /// 最近一次余额载荷的套餐列表（balance 的 plans 只含已生效计划）
+    pub plans: Vec<PlanSeen>,
+    pub plans_at_ms: i64,
     /// 正在使用的模型（最近一次 provider runtime headers 请求）
     pub model: Option<String>,
     pub model_at_ms: i64,
@@ -70,6 +82,13 @@ pub struct Snapshot {
     pub last_applied_at_ms: i64,
     pub requests: u64,
     pub parse_errors: u64,
+    /// 已出现过的 plan_id 全集（进程内）。前端用持久账本二次去重，
+    /// 因此重启后的重复「首现」事件无副作用
+    #[serde(skip)]
+    pub seen_plan_ids: std::collections::HashSet<String>,
+    /// 本次解析发现的「首次出现」plan_id：tail_loop 消费后推 grant 事件并清空
+    #[serde(skip)]
+    pub fresh_plan_ids: Vec<String>,
 }
 
 static STATE: OnceLock<Mutex<Snapshot>> = OnceLock::new();
@@ -233,8 +252,20 @@ fn tail_loop(dir: PathBuf) {
                         seen.push(k);
                     }
                 }
+                // 套餐首现（新礼物/新一期到账）独立成事件：前端据此触发领取级联
+                let has_fresh = {
+                    let mut st = lock_state();
+                    !st.fresh_plan_ids.is_empty()
+                };
+                if has_fresh {
+                    seen.push("grant");
+                }
                 for k in seen {
                     notify(k);
+                }
+                if has_fresh {
+                    let mut st = lock_state();
+                    st.fresh_plan_ids.clear();
                 }
             }
         }
@@ -272,6 +303,17 @@ fn apply_line_in(st: &mut Snapshot, line: &str) -> Option<&'static str> {
                 st.plan_at_ms = at;
                 if kind.is_none() {
                     kind = Some("plan");
+                }
+            }
+        }
+        // plans 数组（仅含已生效计划）：维护快照 + 记录「首次出现」的 plan_id。
+        // 首现 = 当前账号收到新套餐（claim 到账/服务端发放/新一期礼物激活）
+        if let Some(list) = extract_plans(&v) {
+            st.plans = list;
+            st.plans_at_ms = at;
+            for p in &st.plans {
+                if st.seen_plan_ids.insert(p.plan_id.clone()) {
+                    st.fresh_plan_ids.push(p.plan_id.clone());
                 }
             }
         }
@@ -365,6 +407,36 @@ fn balances_of(v: &Value) -> Option<&Vec<Value>> {
     None
 }
 
+/// 从任意已知层级里找 plans 数组（balance 载荷；空数组也要应用=明确无生效套餐）
+fn extract_plans(v: &Value) -> Option<Vec<PlanSeen>> {
+    let arr = [
+        v.get("plans"),
+        v.pointer("/payload/data/plans"),
+        v.pointer("/payload/plans"),
+        v.pointer("/data/plans"),
+    ]
+    .into_iter()
+    .find_map(|cand| cand.and_then(|x| x.as_array()))?;
+    let mut out = Vec::new();
+    for p in arr {
+        let id = p
+            .get("plan_id")
+            .or_else(|| p.get("planId"))
+            .and_then(|x| x.as_str())
+            .unwrap_or("")
+            .to_string();
+        if id.is_empty() {
+            continue;
+        }
+        out.push(PlanSeen {
+            plan_id: id,
+            name: p.get("name").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+            status: p.get("status").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+        });
+    }
+    Some(out)
+}
+
 fn num(v: &Value, key: &str) -> Option<f64> {
     let n = v.get(key)?;
     n.as_f64().or_else(|| n.as_str().and_then(|s| s.parse::<f64>().ok()))
@@ -438,6 +510,31 @@ mod tests {
         assert_eq!(st.pools.len(), 1);
         assert!((st.pools[0].remaining - 4999900.0).abs() < 0.5);
         assert_eq!(st.pools[0].expires_at, Some(1789919999));
+    }
+
+    #[test]
+    fn parses_plans_and_flags_first_seen_once() {
+        let mut st = Snapshot::default();
+        apply_line_in(&mut st, PLAN_LINE);
+        assert_eq!(st.plans.len(), 1);
+        assert_eq!(st.plans[0].plan_id, "zcode-v3-start-plan-0817");
+        assert_eq!(st.plans[0].status, "active");
+        assert_eq!(st.fresh_plan_ids, vec!["zcode-v3-start-plan-0817".to_string()]);
+        // 同一 plan_id 再次出现（新快照/同一行重放）不再算首现
+        apply_line_in(&mut st, &PLAN_LINE.replace("1789866273", "1789866299"));
+        assert!(st.fresh_plan_ids.is_empty());
+        assert_eq!(st.plans.len(), 1);
+    }
+
+    #[test]
+    fn empty_plans_payload_clears_list() {
+        let mut st = Snapshot::default();
+        apply_line_in(&mut st, PLAN_LINE);
+        assert_eq!(st.plans.len(), 1);
+        let empty = r#"[2026-09-20 18:00:05.000] [info] [main] [host-log] [coding-plan-availability] billing/balance 请求完成 {"hasActiveStartPlan":false,"payload":{"code":0,"data":{"server_time":1789347700,"plans":[],"balances":[]}}}"#;
+        apply_line_in(&mut st, empty);
+        assert!(st.plans.is_empty());
+        assert!(st.plans_at_ms > 1_700_000_000_000);
     }
 
     #[test]

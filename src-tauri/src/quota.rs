@@ -238,7 +238,8 @@ pub struct QuotaItem {
 
 #[derive(Debug, Clone, serde::Serialize, Default)]
 pub struct PlanSlot {
-    #[serde(skip_serializing)]
+    /// plan_id：礼物实例追踪用（balance 的 plans 只含已生效计划，前端据新 plan_id 触发级联）
+    #[serde(skip_serializing_if = "String::is_empty")]
     pub pid: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tier: Option<String>,

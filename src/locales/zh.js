@@ -100,6 +100,7 @@ export const zh = {
   "m.claimNextAt": "，{time} 后可再领",
   "m.refreshClaimDone": "已刷新 {n} 个账号，{k} 个有可领套餐",
   "m.refreshClaimAcctErr": "「{name}」刷新失败：{err}",
+  "m.cascadeStart": "检测到新礼物期「{name}」：{n} 个账号已错峰排入领取队列",
   "m.autoClaimOn": "已开启自动领取",
   "m.autoClaimOnDetail": "开启后立即检测一次，此后每 10 分钟一次",
   "m.autoClaimInteractive": "「{name}」需人工验证，已跳过自动领取",

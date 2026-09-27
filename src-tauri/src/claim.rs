@@ -45,6 +45,8 @@ pub struct CaptchaConfig {
 pub struct ClaimOutcome {
     pub account_id: String,
     pub account_name: String,
+    /// 领取成功的 plan_id：前端礼物账本以此记账（领过的实例不再快检/级联）
+    pub plan_id: String,
     pub plan_name: String,
     pub starts_at: Option<i64>,
     pub ends_at: Option<i64>,
@@ -276,13 +278,15 @@ pub fn spawn_activation_report(home: &Path, creds: &Value, device_mid: &str) {
     });
 }
 
-/// claim_refresh 的激活上报走与 spawn_activation_report 相同的 180s 节流槽——
-/// 此前 claim_refresh 直连上报、绕过节流：76 账号 × 每 10-30min 一轮 = 全天
-/// 数百次激活 POST（2026-09-26 单日实测 654 次），是风控画像的主要来源之一。
+/// claim_refresh 的激活上报：与 spawn 路径共享同一节流槽（key = user_id|device_mid）。
+/// urgent（入库/切号触发的紧急检查）沿用 180s 槽；例行领取轮询放大到 4h——
+/// 新的分层节奏下快检号每天被轮询上百次，若每次都捎带激活 POST 会重建
+/// 654 次/天（2026-09-26 实测）的风控画像。空号心跳由 quota 路径独立负责，不受此影响。
 /// 返回 None = 节流期内跳过本次上报（spawn 路径会在槽位空出时补报）。
-pub fn activation_report_throttled(user_id: &str, device_mid: &str) -> Option<Result<(), String>> {
+pub fn activation_report_throttled(user_id: &str, device_mid: &str, urgent: bool) -> Option<Result<(), String>> {
     let key = format!("{user_id}|{device_mid}");
-    if !activation_slot_free(&key, Duration::from_secs(180)) {
+    let gap = if urgent { Duration::from_secs(180) } else { Duration::from_secs(4 * 3600) };
+    if !activation_slot_free(&key, gap) {
         return None;
     }
     let r = report_activation_events(user_id, device_mid);
