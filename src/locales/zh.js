@@ -154,7 +154,7 @@ export const zh = {
   "grp.card": "卡片",
   "grp.grouped": "分组",
   "grp.viewLabel": "账号列表视图",
-    "grp.health.frozen": "❄ 已冻结",
+    "grp.health.frozen": "已冻结",
   "btn.freeze": "冻结（不参与自动切换）",
   "btn.unfreeze": "解冻",
   "btn.frozenTag": "冻结",

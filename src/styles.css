@@ -1184,7 +1184,8 @@ select.two-input { cursor: pointer; }
 .pw-actions .pw-go { flex: none; padding: 8px 18px; }
 
 .hdot.frozen { background: #7d92b0; }
-.chip.frozen { color: #8fa2b8; border-color: #46525f; background: rgba(125, 146, 176, .12); }
+/* 冻结筛选 chip 与其他未选中 chip 同底色（不再常驻蓝灰）；雪花图标纯白 */
+.chip .snow-ic { display: inline-flex; color: #fff; }
 .tag-frozen { font-size: 11px; font-weight: 600; color: #8fa2b8; border: 1px solid #46525f; background: rgba(125,146,176,.10); border-radius: 3px; padding: 0 5px; line-height: 18px; flex: none; }
 
 .cm-mask {

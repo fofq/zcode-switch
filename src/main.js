@@ -1135,7 +1135,9 @@ function chipsHtml(sum) {
       const n = lv === "all" ? (state?.accounts || []).length : sum.counts[lv];
       const giftChip = GIFT_CHIPS.find(([k]) => k === lv);
       const label = lv === "all" ? t("list.filterAll") : giftChip ? t(giftChip[1]) : healthLabel(lv);
-      return `<button class="chip${lv === "all" ? "" : " " + lv}${on ? " on" : ""}" aria-pressed="${on}" click="actions.setHealth('${lv}')">${esc(label)}<span class="chip-n">${n}</span></button>`;
+      // 冻结筛选的雪花用白色 SVG 图标（与礼物的 🎁 同为「符号先行」，但纯白）
+      const icon = lv === "frozen" ? `<span class="snow-ic">${ic("snow", 12)}</span>` : "";
+      return `<button class="chip${lv === "all" ? "" : " " + lv}${on ? " on" : ""}" aria-pressed="${on}" click="actions.setHealth('${lv}')">${icon}${esc(label)}<span class="chip-n">${n}</span></button>`;
     }).join("") + `</div>`;
 }
 

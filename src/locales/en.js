@@ -158,7 +158,7 @@ export const en = {
   "grp.card": "Card",
   "grp.grouped": "Groups",
   "grp.viewLabel": "Account list view",
-    "grp.health.frozen": "❄ Frozen",
+    "grp.health.frozen": "Frozen",
   "btn.freeze": "Freeze (excluded from auto-switch)",
   "btn.unfreeze": "Unfreeze",
   "btn.frozenTag": "Frozen",
