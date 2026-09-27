@@ -1936,10 +1936,7 @@ select.two-input { cursor: pointer; }
   vertical-align: -2px;
 }
 /* 三种池状态用明显不同的视觉：斜纹中灰 / 实色浅灰 / 深色轨道 */
-.qhp-legend i.sw-gift {
-  background-color: #c9cdd6;
-  background-image: repeating-linear-gradient(135deg, transparent 0 2px, #23252c 2px 4px);
-}
+.qhp-legend i.sw-gift { background-color: #c9cdd6; opacity: .5; }
 .qhp-legend i.sw-reg { background-color: #c9cdd6; }
 .qhp-legend i.sw-used { background-color: #3a3d45; }
 .qhp-mrow { border-bottom: 1px solid rgba(255, 255, 255, .05); }
@@ -1987,10 +1984,8 @@ select.two-input { cursor: pointer; }
   overflow: hidden;
 }
 .qhp-mtrack i { display: block; height: 100%; }
-/* 礼物池 = 斜纹填充（FT/Economist 的 forecast 惯例）：任何色相下都与实色常规池无歧义 */
-.qhp-mtrack i.gift, .qhp-atrack i.gift {
-  background-image: repeating-linear-gradient(135deg, transparent 0 3px, rgba(16, 17, 20, .55) 3px 6px);
-}
+/* 礼物池 = 半透明模型色：6-10px 条高下斜纹不可读，透明度差在任何色相下都与实色常规池无歧义 */
+.qhp-mtrack i.gift, .qhp-atrack i.gift { opacity: .5; }
 .qhp-mtrack i.gift + i.reg, .qhp-atrack i.gift + i.reg { box-shadow: inset 2px 0 0 rgba(0, 0, 0, .3); }
 .qhp-mval {
   font-family: var(--mono);

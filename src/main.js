@@ -3623,11 +3623,11 @@ function render(force = false) {
       .filter((x) => x.toLowerCase() !== nm)[0] || "";
     const q = acctQuota[a.id];
     // meta 行固定一行：档位/礼物徽标 + 状态徽标在前，身份信息殿后（溢出省略）
+    // 到期徽章不放这里——卡片头部一行放不下会被截断，挪到 card-foot-info 槽
     let meta = `${tierBadgeFor(a.id)}`;
     if (a.has_user_info === false) meta += `<span class="tag-relogin" title="${esc(t("btn.reloginTitle"))}">${t("btn.relogin")}</span>`;
     if (!a.has_config) meta += `<span class="meta-chip warn" title="${esc(t("q.noCfg"))}">${esc(t("q.noCfgShort"))}</span>`;
     const exp = expireInfo(q?.data?.plan_expire);
-    if (exp) meta += `<span class="meta-chip${exp.warn ? " warn" : ""}" title="${esc(t("q.validUntil", { date: exp.text }))}">${esc(t("q.validUntilShort", { date: exp.text }))}</span>`;
     if (ident && ident.toLowerCase() !== nm) {
       meta += ui.hideInfo
         ? `<span class="meta-id masked">${esc(t("list.hidden"))}</span>`
@@ -3658,7 +3658,7 @@ function render(force = false) {
       </div>
       ${cardQuotaSlotHtml(a.id)}
       <div class="card-foot">
-        <span class="card-foot-info"></span>
+        <span class="card-foot-info">${exp ? `<span class="meta-chip${exp.warn ? " warn" : ""}" title="${esc(t("q.validUntil", { date: exp.text }))}">${esc(t("q.validUntilShort", { date: exp.text }))}</span>` : ""}</span>
         <span class="claim-slot" data-claim-slot></span>
         <span class="card-tools" click="actions.noop()">
           <button class="icon-btn sm" title="${t("btn.copyKey")}" aria-label="${t("btn.copyKey")}" click="actions.copyApiKey('${a.id}')">${ic("copy", 14)}</button>

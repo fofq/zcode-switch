@@ -65,6 +65,10 @@ const commands = {
       mockQuotaFlap.delete(id);
       return { is_empty: true, source: "", items: [], plans: [], refreshed_at: 0, total: null, used: null, remaining: null, percent_used: null, plan_tier: null };
     }
+    const ov = mockQuota(id);
+    // 对齐真实后端：plan_expire = 主套餐槽的 expire（卡片底部到期徽章的数据源）
+    if (ov && ov.plan_expire == null) ov.plan_expire = ov.plans?.[0]?.expire ?? null;
+    return ov;
     return mockQuota(id);
   },
 
