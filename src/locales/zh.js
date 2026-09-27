@@ -328,6 +328,9 @@ export const zh = {
   "btn.refreshAllRunningElig": "正在刷新领取资格 {done}/{total} · 再点停止",
   "list.toastRefreshAllBoth": "已刷新 {n} 个账号的额度，并刷新了领取资格",
   "list.toastSweepRecovered": "，{m} 个恢复额度",
+  "m.quotaRefreshed": "「{name}」已刷新：剩 {pct}%",
+  "m.quotaRefreshEmpty": "「{name}」暂无套餐数据（若异常会自动复查）",
+  "m.quotaRefreshFail": "「{name}」刷新失败：{err}",
   "m.quotaRecovered": "「{name}」额度已恢复：剩 {pct}%",
   "list.toastSweepDone": "已刷新 {n} 个账号的额度",
 

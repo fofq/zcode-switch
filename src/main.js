@@ -1512,13 +1512,14 @@ async function loadAcctQuota(id, opts = {}) {
       if (!uiLocked()) render();
       return;
     }
-    // 恢复反馈：此前数据面是空快照（曾被毒化/抖动）而现在拿到真实额度 → 明确告知
-    if (cur.data?.is_empty === true && !emptySnap && hasRem(data)) {
-      const pct = Math.round(data.percent_used != null ? 100 - data.percent_used : (pctPairOf(id).pct ?? 0));
-      setTimeout(() => toast(t("m.quotaRecovered", { name: accountName(id), pct }), "ok"), 0);
-    }
     quotaFlapRetry[id] = 0;
     acctQuota[id] = { data, err: null, code: null, busy: false };
+    // 恢复反馈：此前数据面是空快照（曾被毒化/抖动，多为启动恢复场景）而现在拿到
+    // 真实额度 → 明确告知。百分比在数据落位后取口径值
+    if (cur.data?.is_empty === true && hasRem(data)) {
+      const pct = Math.round(pctPairOf(id).pct ?? 0);
+      setTimeout(() => toast(t("m.quotaRecovered", { name: accountName(id), pct }), "ok"), 0);
+    }
     quotaFailStreak[id] = 0;
     // balance 的 plans（已生效套餐）登记实例：本号刚领到的新期 id 首现 → 级联其他未持有者；
     // 过期历史实例只登记不级联
@@ -2309,12 +2310,22 @@ const actions = {
 
   acctQuota(id) {
     const dueAt = quotaDue[id];
+    // 恢复场景（此前数据面是空快照）由 loadAcctQuota 里的 m.quotaRecovered 提示，这里不重复
+    const wasEmpty = acctQuota[id]?.data?.is_empty === true;
     loadAcctQuota(id).then(() => {
       if (quotaDue[id] === dueAt) scheduleNext(id);
       // 手动刷新的是当前账号且额度已低于阈值 → 立即尝试切换
       if (state?.auto_switch && state?.accounts?.some((a) => a.id === id && a.is_active)) {
         autoSwitchTick(true);
       }
+      // 手动刷新必须有反馈：成功报口径剩余、空数据/失败单独说明
+      //（sweep 周期刷新走 loadAcctQuota，不经过这里，不会刷屏）
+      const q = acctQuota[id];
+      if (q?.err) { toast(t("m.quotaRefreshFail", { name: accountName(id), err: stripErr(q.err) }), "warn"); return; }
+      if (wasEmpty) return;
+      if (q?.data?.is_empty === true) { toast(t("m.quotaRefreshEmpty", { name: accountName(id) }), "warn"); return; }
+      const pct = pctPairOf(id).pct;
+      if (pct != null) toast(t("m.quotaRefreshed", { name: accountName(id), pct: Math.round(pct) }), "ok");
     });
   },
 

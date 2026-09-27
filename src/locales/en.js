@@ -332,6 +332,9 @@ export const en = {
   "btn.refreshAllRunningElig": "Refreshing claim eligibility {done}/{total} · click to stop",
   "list.toastRefreshAllBoth": "Refreshed quota for {n} accounts and refreshed claim eligibility",
   "list.toastSweepRecovered": ", {m} recovered",
+  "m.quotaRefreshed": "\"{name}\" refreshed: {pct}% left",
+  "m.quotaRefreshEmpty": "\"{name}\" has no plan data (auto-recheck if abnormal)",
+  "m.quotaRefreshFail": "\"{name}\" refresh failed: {err}",
   "m.quotaRecovered": "\"{name}\" quota recovered: {pct}% left",
   "list.toastSweepDone": "Refreshed quota for {n} accounts",
 
