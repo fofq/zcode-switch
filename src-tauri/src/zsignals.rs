@@ -520,7 +520,9 @@ mod tests {
         assert_eq!(st.plans[0].plan_id, "zcode-v3-start-plan-0817");
         assert_eq!(st.plans[0].status, "active");
         assert_eq!(st.fresh_plan_ids, vec!["zcode-v3-start-plan-0817".to_string()]);
-        // 同一 plan_id 再次出现（新快照/同一行重放）不再算首现
+        // 同一 plan_id 再次出现（新快照/同一行重放）不再算首现：
+        // 先模拟 tail_loop 消费清空，再重放
+        st.fresh_plan_ids.clear();
         apply_line_in(&mut st, &PLAN_LINE.replace("1789866273", "1789866299"));
         assert!(st.fresh_plan_ids.is_empty());
         assert_eq!(st.plans.len(), 1);
