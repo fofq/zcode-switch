@@ -1010,7 +1010,13 @@ async fn plan_request_once(
             .set("content-type", "application/json")
             .set("anthropic-version", &version)
             .set("accept", accept)
-            .set("X-ZCode-Agent", "glm");
+            .set("X-ZCode-Agent", "glm")
+            // 官方 start-plan 聊天请求的归因头（zcode.cjs kLs）——风控按会话信誉打分，
+            // 缺这些头时同一请求在 billing 通、在 /v1/messages 吃 3012（实测）
+            .set("X-Zcode-Session-Type", "main")
+            .set("X-Session-Id", session_id())
+            .set("X-Zcode-Trace-Id", uuid::Uuid::new_v4().to_string())
+            .set("X-Query-Id", uuid::Uuid::new_v4().to_string());
         let rb = extra_headers.iter().fold(rb, |acc, (k, v)| acc.set(k, v));
         // 与 pump_request 相同：body 按 UTF-8 字符串发送（上游均为 JSON）
         let body_str = String::from_utf8_lossy(&body);
