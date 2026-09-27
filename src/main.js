@@ -1264,13 +1264,22 @@ function poolsTabHtml(tot) {
     const open = qhExpanded.has(m.name);
     const srcs = m.sources.map((src) => {
       const pct = src.total > 0 ? Math.max(0, Math.min(100, (src.remaining / src.total) * 100)) : 0;
+      // 与模型行同一套视觉语言：斜纹=礼物池、实色=常规池、深底=已消耗
+      //（礼物/常规拆分数值聚合时已带在 src 上）
+      const giftPct = src.remaining > 0 && src.giftRemaining > 0
+        ? Math.max(0, Math.min(pct, (src.giftRemaining / src.total) * 100)) : 0;
+      const regPct = Math.max(0, pct - giftPct);
+      const segs = [
+        giftPct > 0 ? `<i class="gift" style="width:${giftPct}%;background:${color}"></i>` : "",
+        regPct > 0 ? `<i class="reg" style="width:${regPct}%;background:${color}"></i>` : "",
+      ].join("");
       const detail = []
         .concat(src.giftTotal > 0 ? [`${t("list.qhGift")} ${fmtTokens(src.giftRemaining)}/${fmtTokens(src.giftTotal)}`] : [])
         .concat(src.regTotal > 0 ? [`${t("list.qhReg")} ${fmtTokens(src.regRemaining)}/${fmtTokens(src.regTotal)}`] : [])
         .join(" · ");
       return `<div class="qhp-arow" title="${esc(detail)}">
         <span class="qhp-aname">${esc(src.account)}</span>
-        <span class="qhp-atrack"><i style="width:${pct}%;background:${color}"></i></span>
+        <span class="qhp-atrack">${segs}</span>
         <span class="qhp-aval">${esc(fmtTokens(src.remaining))}<span class="of">/${esc(fmtTokens(src.total))}</span></span>
       </div>`;
     }).join("");
