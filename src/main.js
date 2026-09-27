@@ -1247,31 +1247,28 @@ function quotaKpisHtml(tot) {
   </div>`;
 }
 
-/** 额度池 Tab：每模型一行「礼/常堆叠」水平条 + 直接标注（点击行展开按账号拆分） */
+/** 额度池 Tab：每模型一行「礼/常堆叠」水平条 + 直接标注（点击行展开按账号拆分）。
+ *  无图例设计：段色即语义——琥珀=礼物池、绿=常规池（与主列表「剩余=绿」同语）、
+ *  深底=已消耗；模型名文本仍按模型着色保持身份识别 */
 function poolsTabHtml(tot) {
   if (!tot.models.length) return `<div class="qh-empty">${esc(t("list.qhEmpty"))}</div>`;
-  const legend = `<div class="qhp-legend">
-    <span><i class="sw-gift"></i>${esc(t("list.qhpLegendGift"))}</span>
-    <span><i class="sw-reg"></i>${esc(t("list.qhpLegendReg"))}</span>
-    <span><i class="sw-used"></i>${esc(t("list.qhpLegendUsed"))}</span>
-  </div>`;
   const rows = tot.models.map((m) => {
     const color = modelColor(m.name);
     const remPct = m.total > 0 ? Math.max(0, Math.min(100, (m.remaining / m.total) * 100)) : 0;
-    // 剩余内部再按 礼物/常规 拆两段（同色系，礼物为半透明）
+    // 剩余内部再按 礼物/常规 拆两段（琥珀=礼物、绿=常规，色即语义无需图例）
     const giftPct = m.remaining > 0 ? Math.max(0, Math.min(remPct, (m.giftRemaining / m.total) * 100)) : 0;
     const regPct = Math.max(0, remPct - giftPct);
     const open = qhExpanded.has(m.name);
     const srcs = m.sources.map((src) => {
       const pct = src.total > 0 ? Math.max(0, Math.min(100, (src.remaining / src.total) * 100)) : 0;
-      // 与模型行同一套视觉语言：斜纹=礼物池、实色=常规池、深底=已消耗
+      // 与模型行同一套视觉语言：琥珀=礼物池、绿=常规池、深底=已消耗
       //（礼物/常规拆分数值聚合时已带在 src 上）
       const giftPct = src.remaining > 0 && src.giftRemaining > 0
         ? Math.max(0, Math.min(pct, (src.giftRemaining / src.total) * 100)) : 0;
       const regPct = Math.max(0, pct - giftPct);
       const segs = [
-        giftPct > 0 ? `<i class="gift" style="width:${giftPct}%;background:${color}"></i>` : "",
-        regPct > 0 ? `<i class="reg" style="width:${regPct}%;background:${color}"></i>` : "",
+        giftPct > 0 ? `<i class="gift" style="width:${giftPct}%"></i>` : "",
+        regPct > 0 ? `<i class="reg" style="width:${regPct}%"></i>` : "",
       ].join("");
       const detail = []
         .concat(src.giftTotal > 0 ? [`${t("list.qhGift")} ${fmtTokens(src.giftRemaining)}/${fmtTokens(src.giftTotal)}`] : [])
@@ -1287,8 +1284,8 @@ function poolsTabHtml(tot) {
       <button class="qhp-mhead" aria-expanded="${open}" click="actions.toggleQhModel('${esc(m.name)}')">
         <span class="qhp-mname" style="color:${color}">${esc(m.name)}<span class="qhp-chev">${ic("chevDown", 11)}</span></span>
         <span class="qhp-mtrack">
-          ${giftPct > 0 ? `<i class="gift" style="width:${giftPct}%;background:${color}"></i>` : ""}
-          ${regPct > 0 ? `<i class="reg" style="width:${regPct}%;background:${color}"></i>` : ""}
+          ${giftPct > 0 ? `<i class="gift" style="width:${giftPct}%"></i>` : ""}
+          ${regPct > 0 ? `<i class="reg" style="width:${regPct}%"></i>` : ""}
         </span>
         <span class="qhp-mval">${esc(fmtTokens(m.remaining))}<span class="of">/${esc(fmtTokens(m.total))}</span></span>
         <span class="qhp-mpct">${Math.round(remPct)}%</span>
@@ -1296,7 +1293,7 @@ function poolsTabHtml(tot) {
       ${open && srcs ? `<div class="qhp-arows">${srcs}</div>` : ""}
     </div>`;
   }).join("");
-  return `<div class="qhp-sec">${esc(t("list.qhpSecPools"))}</div>${legend}${rows}`;
+  return `<div class="qhp-sec">${esc(t("list.qhpSecPools"))}</div>${rows}`;
 }
 
 /** y 轴取整到「好看」的刻度（1/1.2/1.5/2/2.5/3/4/5/6/8/10 × 10^k） */
@@ -3652,7 +3649,8 @@ function render(force = false) {
         </div>
         <span class="card-side">
           <span class="rchk" role="checkbox" aria-checked="${checked}" title="${esc(t("list.selectHint"))}" click="actions.toggleSelect('${a.id}')">${ic("check", 11)}</span>
-          <span class="card-side-info">${healthDotHtml(h)}<span class="row-info">${quotaChipHtml(a.id, h)}</span></span>
+          <!-- 卡片视图不放健康度圆点：rq-pct 按健康度着色（绿/琥珀/红）更贴文字 -->
+          <span class="card-side-info"><span class="row-info">${quotaChipHtml(a.id, h)}</span></span>
           <button class="card-expand" title="${esc(expanded ? t("list.collapseTitle") : t("list.expandTitle"))}" aria-label="${esc(expanded ? t("list.collapseTitle") : t("list.expandTitle"))}" click="actions.toggleRow(event)">${ic("chevDown", 13)}</button>
         </span>
       </div>

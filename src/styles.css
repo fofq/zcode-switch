@@ -1591,6 +1591,8 @@ select.two-input { cursor: pointer; }
 .rq.flowed .rq-pct { color: #6f8fae; }
 .rq.gift .rq-pct { color: #b57f92; }
 .rq.dead .rq-pct { color: var(--red); }
+/* 卡片视图无健康度圆点：ok 态文字用 mint 高亮（low/dead 已有琥珀/红） */
+.card-side-info .rq.ok .rq-pct { color: var(--mint); }
 .rq.auth .rq-pct, .rq.fail .rq-pct, .rq.unknown .rq-pct, .rq.pending .rq-pct { color: var(--ink-mute); }
 
 .row.picked { border-color: var(--amber-deep); background: rgba(var(--accent-rgb), .07); }
@@ -1936,9 +1938,6 @@ select.two-input { cursor: pointer; }
   vertical-align: -2px;
 }
 /* 三种池状态用明显不同的视觉：斜纹中灰 / 实色浅灰 / 深色轨道 */
-.qhp-legend i.sw-gift { background-color: #c9cdd6; opacity: .5; }
-.qhp-legend i.sw-reg { background-color: #c9cdd6; }
-.qhp-legend i.sw-used { background-color: #3a3d45; }
 .qhp-mrow { border-bottom: 1px solid rgba(255, 255, 255, .05); }
 .qhp-mrow:last-child { border-bottom: none; }
 .qhp-mhead {
@@ -1984,8 +1983,9 @@ select.two-input { cursor: pointer; }
   overflow: hidden;
 }
 .qhp-mtrack i { display: block; height: 100%; }
-/* 礼物池 = 半透明模型色：6-10px 条高下斜纹不可读，透明度差在任何色相下都与实色常规池无歧义 */
-.qhp-mtrack i.gift, .qhp-atrack i.gift { opacity: .5; }
+/* 段色即语义（无图例）：琥珀=礼物池、绿=常规池（与主列表「剩余=绿」同语）、深底=已消耗 */
+.qhp-mtrack i.gift, .qhp-atrack i.gift { background: #d19a49; }
+.qhp-mtrack i.reg, .qhp-atrack i.reg { background: var(--mint); }
 .qhp-mtrack i.gift + i.reg, .qhp-atrack i.gift + i.reg { box-shadow: inset 2px 0 0 rgba(0, 0, 0, .3); }
 .qhp-mval {
   font-family: var(--mono);
