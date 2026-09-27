@@ -3562,8 +3562,8 @@ function render(force = false) {
     const seqBadge = seq != null ? `<span class="row-seq" title="${esc(t("list.seqTitle"))}">${seq}</span>` : "";
     return `
     <div class="row${isActive ? " active" : ""}${checked ? " picked" : ""}${slim ? " slim" : ""}" data-id="${a.id}">
-      ${seqBadge}
       <div class="row-top">
+        ${seqBadge}
         <span class="rchk" role="checkbox" aria-checked="${checked}" title="${esc(t("list.selectHint"))}" click="actions.toggleSelect('${a.id}')">${ic("check", 11)}</span>
         ${healthDotHtml(h)}
         ${slim ? "" : `<span class="notch" style="background:${notchColor(a.id)}"></span>`}
