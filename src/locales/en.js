@@ -337,6 +337,7 @@ export const en = {
   "m.quotaRefreshed": "\"{name}\" refreshed: {pct}% left",
   "m.quotaRefreshEmpty": "\"{name}\" has no plan data (auto-recheck if abnormal)",
   "m.quotaRefreshFail": "\"{name}\" refresh failed: {err}",
+  "m.refreshInFlight": "\"{name}\" is already refreshing — one moment…",
   "m.quotaRecovered": "\"{name}\" quota recovered: {pct}% left",
   "list.toastSweepDone": "Refreshed quota for {n} accounts",
 

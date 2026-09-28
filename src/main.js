@@ -2343,6 +2343,12 @@ const actions = {
     const dueAt = quotaDue[id];
     // 恢复场景（此前数据面是空快照）由 loadAcctQuota 里的 m.quotaRecovered 提示，这里不重复
     const wasEmpty = acctQuota[id]?.data?.is_empty === true;
+    // 刷新泵正在刷同号（busy 保护窗内）：点击必须给反馈，且不得继续往下走——
+    // 否则 loadAcctQuota 静默返回后，下面的提示会把旧数据当「已刷新」报出来
+    if (acctQuota[id]?.busy && Date.now() - (acctQuota[id].busyAt || 0) < 20000) {
+      toast(t("m.refreshInFlight", { name: accountName(id) }));
+      return;
+    }
     loadAcctQuota(id).then(() => {
       if (quotaDue[id] === dueAt) scheduleNext(id);
       // 手动刷新的是当前账号且额度已低于阈值 → 立即尝试切换
@@ -2352,6 +2358,7 @@ const actions = {
       // 手动刷新必须有反馈：成功报口径剩余、空数据/失败单独说明
       //（sweep 周期刷新走 loadAcctQuota，不经过这里，不会刷屏）
       const q = acctQuota[id];
+      if (!q || q.busy) return; // 请求被吞/又有新请求在飞：不拿旧数据冒充结果
       if (q?.err) { toast(t("m.quotaRefreshFail", { name: accountName(id), err: stripErr(q.err) }), "warn"); return; }
       if (wasEmpty) return;
       if (q?.data?.is_empty === true) { toast(t("m.quotaRefreshEmpty", { name: accountName(id) }), "warn"); return; }
@@ -3650,7 +3657,7 @@ function render(force = false) {
             <span class="claim-slot" data-claim-slot></span>
             <button class="icon-btn" title="${t("btn.copyKey")}" aria-label="${t("btn.copyKey")}" click="actions.copyApiKey('${a.id}')">${ic("copy", 15)}</button>
             <button class="icon-btn${isFrozen(a.id) ? " on" : ""}" title="${isFrozen(a.id) ? t("btn.unfreeze") : t("btn.freeze")}" aria-label="${isFrozen(a.id) ? t("btn.unfreeze") : t("btn.freeze")}" click="actions.toggleFreeze('${a.id}')">${ic("snow", 15)}</button>
-            <button class="icon-btn" title="${t("btn.refreshQuota")}" aria-label="${t("btn.refreshQuota")}" click="actions.acctQuota('${a.id}')">${ic("refresh", 15)}</button>
+            <button class="icon-btn${acctQuota[a.id]?.busy ? " spinning" : ""}" title="${t("btn.refreshQuota")}" aria-label="${t("btn.refreshQuota")}" click="actions.acctQuota('${a.id}')">${ic("refresh", 15)}</button>
             <button class="icon-btn" title="${t("btn.rename")}" aria-label="${t("btn.rename")}" click="actions.rename('${a.id}')">${ic("pen", 15)}</button>
             <button class="icon-btn" title="${t("btn.export")}" aria-label="${t("btn.export")}" click="actions.exportOne('${a.id}')">${ic("export", 15)}</button>
             <button class="icon-btn${isActive ? " on" : ""}" title="${t("btn.coldSwitch")}" aria-label="${t("btn.coldSwitch")}" click="actions.askColdSwitch('${a.id}')">${ic("power", 15)}</button>
@@ -3734,7 +3741,7 @@ function render(force = false) {
         <span class="card-tools" click="actions.noop()">
           <button class="icon-btn sm" title="${t("btn.copyKey")}" aria-label="${t("btn.copyKey")}" click="actions.copyApiKey('${a.id}')">${ic("copy", 14)}</button>
           <button class="icon-btn sm${isFrozen(a.id) ? " on" : ""}" title="${isFrozen(a.id) ? t("btn.unfreeze") : t("btn.freeze")}" aria-label="${isFrozen(a.id) ? t("btn.unfreeze") : t("btn.freeze")}" click="actions.toggleFreeze('${a.id}')">${ic("snow", 14)}</button>
-          <button class="icon-btn sm" title="${t("btn.refreshQuota")}" aria-label="${t("btn.refreshQuota")}" click="actions.acctQuota('${a.id}')">${ic("refresh", 14)}</button>
+          <button class="icon-btn sm${acctQuota[a.id]?.busy ? " spinning" : ""}" title="${t("btn.refreshQuota")}" aria-label="${t("btn.refreshQuota")}" click="actions.acctQuota('${a.id}')">${ic("refresh", 14)}</button>
           <button class="icon-btn sm" title="${t("btn.rename")}" aria-label="${t("btn.rename")}" click="actions.rename('${a.id}')">${ic("pen", 14)}</button>
           <button class="icon-btn sm" title="${t("btn.export")}" aria-label="${t("btn.export")}" click="actions.exportOne('${a.id}')">${ic("export", 14)}</button>
           <button class="icon-btn sm${isActive ? " on" : ""}" title="${t("btn.coldSwitch")}" aria-label="${t("btn.coldSwitch")}" click="actions.askColdSwitch('${a.id}')">${ic("power", 14)}</button>

@@ -333,6 +333,7 @@ export const zh = {
   "m.quotaRefreshed": "「{name}」已刷新：剩 {pct}%",
   "m.quotaRefreshEmpty": "「{name}」暂无套餐数据（若异常会自动复查）",
   "m.quotaRefreshFail": "「{name}」刷新失败：{err}",
+  "m.refreshInFlight": "「{name}」正在刷新中，请稍候…",
   "m.quotaRecovered": "「{name}」额度已恢复：剩 {pct}%",
   "list.toastSweepDone": "已刷新 {n} 个账号的额度",
 

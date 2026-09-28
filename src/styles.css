@@ -613,6 +613,10 @@ select.two-input { cursor: pointer; }
 }
 .icon-btn:hover { color: var(--ink); border-color: var(--hairline); background: var(--panel-2); }
 .icon-btn.danger:hover { color: var(--red); border-color: var(--red-dim); background: rgba(196, 118, 111, .08); }
+/* 刷新进行中（含刷新泵在刷该号）：按钮转圈，给出明确的「正在刷新」视觉态 */
+@keyframes ic-spin { to { transform: rotate(360deg); } }
+.icon-btn.spinning { color: var(--amber); }
+.icon-btn.spinning svg { animation: ic-spin .9s linear infinite; }
 
 .btn-switch {
   border: 1px solid var(--amber-deep);
