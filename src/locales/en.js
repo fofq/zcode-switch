@@ -88,6 +88,7 @@ export const en = {
   "m.autoFrozenDetail": "Account has quota but requests are blocked by risk control: excluded from auto-switching, probed automatically in a few hours",
   "m.autoUnfrozenToast": "\"{name}\" risk control lifted",
   "m.autoUnfrozenDetail": "Risk control lifted (probe passed or quota recovered) — account restored for auto-switching",
+  "m.autoUnfrozenExhausted": "Quota is exhausted — freeze lifted automatically (freezing only matters for accounts with quota; the account returns to normal rotation and recovers when new gifts land)",
   "m.manualUnfrozenDetail": "Probe request passed — account unfrozen as requested",
   "m.claimAllStopping": "Stopping the batch after the current account…",
   "m.claimAllStopped": "Batch claim stopped ({done}/{total})",

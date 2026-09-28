@@ -3,7 +3,7 @@ import { listen } from "@tauri-apps/api/event";
 import { esc, toast, openPwModal, openConfirmModal, openProviderModal, installDelegation, dismissSplash } from "./ui.js";
 import { ic } from "./icons.js";
 import { init, t, has, lang, localeTag, stripErr, errCode } from "./i18n.js";
-import { HEALTH_ORDER, healthOf, filterAccounts, sortAccounts, bucketAccounts, summarize, modelKeyMatch, quotaBarParts, planExpired, planIsGift, PENDING_WINDOW_MS, entitlementGiftMap } from "./list.js";
+import { HEALTH_ORDER, healthOf, filterAccounts, sortAccounts, bucketAccounts, summarize, modelKeyMatch, quotaBarParts, planExpired, planIsGift, PENDING_WINDOW_MS, quotaRemainingPct, entitlementGiftMap } from "./list.js";
 import { AS_DEFAULTS, poolStats, poolStatsFromSignals, poolsRate, sampleFrom, pushSample, etaOf, evaluate, fmtEta, giftFirstBasis } from "./autoswitch.js";
 
 // 纯浏览器预览：无 Tauri 后端（普通浏览器开 dev server）时注入 mock IPC 再继续启动；
@@ -638,8 +638,11 @@ function healthMapOf() {
         h = { ...h, remainingPct: pct, level: levelOf(pct, opts.threshold), modelMatched: true, modelName: lg.worstName || h.modelName, fromLog: true };
       }
     }
-    // 手动冻结的账号单独成组（即使有额度也不参与自动切换候选），组内仍显示真实额度
-    if (isFrozen(a.id)) h = { ...h, level: "frozen" };
+    // 冻结叠加只遮「有额度/状态未定」的号：底层已判死（耗尽）的号回归真实分组——
+    // 冻结语义是「有额度但被停靠」，对没额度的号没有意义，遮住只会造成
+    // 「明明没额度却永远挂在冻结组」的吸收态（自动冻结标记由 noteFrozenQuotaSeen
+    // 解除；手动冻结标记保留，仅显示归位到额度耗尽组）
+    if (isFrozen(a.id) && h.level !== "dead") h = { ...h, level: "frozen" };
     map.set(a.id, h);
   }
   return map;
@@ -1524,8 +1527,8 @@ async function loadAcctQuota(id, opts = {}) {
     }
     quotaFlapRetry[id] = 0;
     acctQuota[id] = { data, err: null, code: null, busy: false };
-    // 自动冻结号的恢复证据：额度数据面连续健康 → 计数解冻（见 noteFrozenQuotaHealthy）
-    noteFrozenQuotaHealthy(id, data);
+    // 自动冻结号的解冻证据记账：确定耗尽立即解除 / 健康与空数据双计数（见 noteFrozenQuotaSeen）
+    noteFrozenQuotaSeen(id, data);
     // 恢复反馈：此前数据面是空快照（曾被毒化/抖动，多为启动恢复场景）而现在拿到
     // 真实额度 → 明确告知。百分比在数据落位后取口径值
     if (cur.data?.is_empty === true && hasRem(data)) {
@@ -1556,8 +1559,8 @@ async function loadAcctQuota(id, opts = {}) {
     // 失败时也保留旧数据展示，错误信息进明细区；没旧数据才回落到错误态
     acctQuota[id] = { data: cur.data || null, err: stripErr(e), code: errCode(e), busy: false };
     quotaFailStreak[id] = (quotaFailStreak[id] || 0) + 1;
-    // 恢复证据要求「连续」健康刷新：失败一次就重新计数
-    if (autoFrozenAt[id]) autoUnfreezeHits[id] = 0;
+    // 解冻证据要求「连续」刷新：失败一次就双计数清零
+    if (autoFrozenAt[id]) { autoUnfreezeHits[id] = 0; autoUnfreezeEmpty[id] = 0; }
     // 拉取失败（429/3012/网络）→ 指数退避（6s → 12s → 24s → …上限 30 分钟；成功清零），
     // 持续失败的账号不再以 6s 频率轰炸接口；活跃号 hardDown 只需连续 2 次失败，仍可在 ~20s 内触发
     quotaDue[id] = Date.now() + failBackoffMs(quotaFailStreak[id]);
@@ -1858,6 +1861,7 @@ const actions = {
         autoRiskStreak[id] = 0;
         delete autoClaimCooldown[id];
         delete autoUnfreezeHits[id];
+        delete autoUnfreezeEmpty[id];
       }
     }
     if (ids.length) { saveFrozen(); saveAutoFrozen(); }
@@ -1955,7 +1959,7 @@ const actions = {
       // 且持久化缓存会把已删除的号一直带下去（下次启动又出现）
       delete acctQuota[id]; delete quotaHist[id]; delete quotaSampleAt[id];
       delete quotaDue[id]; delete quotaFailStreak[id]; delete quotaForceAt[id];
-      delete autoClaimCooldown[id]; delete autoClaimEmptyRounds[id]; delete autoClaimFailRounds[id]; delete autoFrozenAt[id]; delete autoRiskStreak[id]; delete autoRiskLastAt[id]; delete autoUnfreezeHits[id]; delete claimable[id];
+      delete autoClaimCooldown[id]; delete autoClaimEmptyRounds[id]; delete autoClaimFailRounds[id]; delete autoFrozenAt[id]; delete autoRiskStreak[id]; delete autoRiskLastAt[id]; delete autoUnfreezeHits[id]; delete autoUnfreezeEmpty[id]; delete claimable[id];
       // 冻结集合是 localStorage 持久化的：不删会让已删号的 id 永久残留
       frozenIds.delete(id); saveFrozen();
       ui.selected.delete(id); ui.expanded.delete(id);
@@ -2314,6 +2318,7 @@ const actions = {
       autoRiskStreak[id] = 0;
       delete autoClaimCooldown[id];
       delete autoUnfreezeHits[id];
+      delete autoUnfreezeEmpty[id];
       saveAutoFrozen();
     }
     render();
@@ -2769,29 +2774,37 @@ function noteClaimRisk(id) {
   render();
 }
 
-/** 探测通过（提交成功）→ 自动解冻恢复 */
-function autoUnfreeze(id) {
+/** 探测通过（提交成功 / 额度恢复 / 额度耗尽坐实）→ 自动解冻恢复 */
+function autoUnfreeze(id, reason = "probe") {
   if (!isFrozen(id)) return;
   const wasAuto = !!autoFrozenAt[id];
   delete autoFrozenAt[id];
   autoRiskStreak[id] = 0;
   delete autoUnfreezeHits[id];
+  delete autoUnfreezeEmpty[id];
   frozenIds.delete(id);
   saveFrozen(); saveAutoFrozen();
   toast(t("m.autoUnfrozenToast", { name: accountName(id) }), "ok",
-    wasAuto ? t("m.autoUnfrozenDetail") : t("m.manualUnfrozenDetail"));
+    wasAuto ? t(reason === "exhausted" ? "m.autoUnfrozenExhausted" : "m.autoUnfrozenDetail") : t("m.manualUnfrozenDetail"));
   pokeAccount(id);
   render();
 }
 
-// 自动冻结的额度恢复解冻：此前解冻只认「领取提交成功」一种证据，礼物真空期的
-// 冻结号（无可领礼物 → 永远走不到提交成功）会永久滞留已冻结分组。额度端点不吃
-// 风控拦截，冻结满 2h 后连续 3 次成功刷新都带可用额度 = 风控已解除的旁证 →
-// 自动解冻回池（5min 刷新节奏下 ≈ 冻结后 2h15m，兑现「数小时后自动探测，恢复即解冻」）。
-// 手动冻结不在此列（用户决定，永不自动解冻）。
+// 自动冻结的解冻证据（状态机不允许吸收态：任何冻结号都必须有出路）——
+// a) 领取提交成功（claim://result，原有的探测通过路径）；
+// b) 额度恢复：冻结满 2h 后连续 3 次成功刷新都带可用额度（风控解除的旁证；
+//    5min 刷新节奏下 ≈ 冻结后 2h15m，兑现「数小时后自动探测，恢复即解冻」）；
+// c) 额度耗尽坐实：数据面确定判死（空快照/全过期/剩余 0，服务器确定性结论，
+//    单次即可信）→ 立即解除；或冻结满 6h 且连续 3 次刷新都无可用额度（65 号这类
+//    查不出有效额度数据的退化号）→ 坐实没额度解除。冻结语义是「有额度但被风控
+//    停靠」，对没额度的号毫无意义——它们本就不参与自动切换，解冻后回归真实分组
+//    （额度耗尽/待查询），按耗尽号节奏（60-120min）刷新，新礼物到账正常级联恢复。
+// 手动冻结不受 c) 影响（用户决定停靠，标记保留），仅分组显示归位（见 healthMapOf）。
 const AUTO_UNFREEZE_MIN_MS = 2 * 60 * 60 * 1000;
+const AUTO_UNFREEZE_EMPTY_MS = 6 * 60 * 60 * 1000;
 const AUTO_UNFREEZE_HITS = 3;
 let autoUnfreezeHits = {};
+let autoUnfreezeEmpty = {};
 function hasLiveQuota(data) {
   if (!data || data.is_empty === true) return false;
   const plans = (data.plans || []).filter((p) => !planExpired(p));
@@ -2799,11 +2812,25 @@ function hasLiveQuota(data) {
   const pools = plans.length ? plans.flatMap((p) => p.items || []) : (data.items || []);
   return pools.some((it) => Number(it?.remaining ?? 0) > 0);
 }
-function noteFrozenQuotaHealthy(id, data) {
+/** 数据面确定判死：与 healthOf 的 dead 判定同口径（空快照 / 全部过期 / 剩余 0） */
+function definiteDeadData(data) {
+  if (!data) return false;
+  if (data.is_empty === true) return true;
+  const plans = data.plans || [];
+  if (plans.length && plans.every((p) => planExpired(p))) return true;
+  const pct = quotaRemainingPct({ data });
+  return pct != null && pct <= 0;
+}
+function noteFrozenQuotaSeen(id, data) {
   if (!autoFrozenAt[id]) return; // 手动冻结/未冻结：不介入
-  if (Date.now() - autoFrozenAt[id] < AUTO_UNFREEZE_MIN_MS) return;
-  const hits = (autoUnfreezeHits[id] = hasLiveQuota(data) ? (autoUnfreezeHits[id] || 0) + 1 : 0);
-  if (hits >= AUTO_UNFREEZE_HITS) autoUnfreeze(id);
+  // 确定耗尽：冻结立刻失去意义，立即解除（「额度恢复」的否定面坐实）
+  if (definiteDeadData(data)) { autoUnfreeze(id, "exhausted"); return; }
+  const live = hasLiveQuota(data);
+  const healthy = (autoUnfreezeHits[id] = live ? (autoUnfreezeHits[id] || 0) + 1 : 0);
+  const empty = (autoUnfreezeEmpty[id] = live ? 0 : (autoUnfreezeEmpty[id] || 0) + 1);
+  const frozenFor = Date.now() - autoFrozenAt[id];
+  if (healthy >= AUTO_UNFREEZE_HITS && frozenFor >= AUTO_UNFREEZE_MIN_MS) { autoUnfreeze(id); return; }
+  if (empty >= AUTO_UNFREEZE_HITS && frozenFor >= AUTO_UNFREEZE_EMPTY_MS) autoUnfreeze(id, "exhausted");
 }
 function autoClaimCooldownFor(r) {
   const now = Date.now();

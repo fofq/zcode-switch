@@ -84,6 +84,7 @@ export const zh = {
   "m.autoFrozenDetail": "账号有额度但请求被风控拦截：冻结期间不参与自动切换，数小时后自动探测，恢复即解冻",
   "m.autoUnfrozenToast": "「{name}」风控解除",
   "m.autoUnfrozenDetail": "风控已解除（探测通过或额度恢复），账号重新参与自动切换",
+  "m.autoUnfrozenExhausted": "账号额度已耗尽，冻结自动解除——冻结只对有额度的号有意义，耗尽号回归正常轮换，新礼物到账后自动恢复",
   "m.manualUnfrozenDetail": "探测请求已通过，账号按你的要求解冻恢复",
   "m.claimAllStopping": "正在停止批量领取（完成当前账号后收尾）…",
   "m.claimAllStopped": "批量领取已停止（{done}/{total}）",
