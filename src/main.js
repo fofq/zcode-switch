@@ -83,6 +83,7 @@ function giftFamilyKey(name) {
   const n = String(name || "").toLowerCase();
   if (n.includes("global build")) return "global";
   if (n.includes("weekend")) return "weekend";
+  if (n.includes("trust build")) return "trust";
   if (n.includes("start plan")) return "start";
   return `other:${String(name || "").trim()}`;
 }
@@ -128,7 +129,8 @@ function armClaimCheck(id) {
 }
 // 新实例登记：plan_id 首次出现（preview/balance/客户端日志任一来源）→ 级联一次：
 // 所有未持有该实例的账号错峰排入领取轮。global 族按「领过即出列」、其余族按实例比对；
-// 冻结号不级联（保持探测节奏）。级联只铺冷却，顺序/限速仍由分层轮次统一控制。
+// 手动冻结号不级联（用户决定停靠）；自动冻结号参与——新礼物到账正是它的恢复路径，
+// 节奏仍由领取冷却/风控顺延统一节流。级联只铺冷却，顺序/限速仍由分层轮次统一控制。
 // 过期/非生效实例只登记不级联（否则每次余额刷新都会重复触发）
 function notePlanInstances(list) {
   const inst = (claimLedger._inst = claimLedger._inst || {});
@@ -168,7 +170,7 @@ function scheduleGiftCascade(planId, planName) {
     const id = a.id;
     const led = claimLedger[id] || {};
     if (fam === "global" ? led.global : led[fam] === planId) continue;
-    if (isFrozen(id)) continue;
+    if (isFrozen(id) && !autoFrozenAt[id]) continue;
     // 错峰铺开（20s×序号±抖动）：级联只让账号「变为可调」，不做对齐风暴
     const stagger = n * 20_000 + Math.round(Math.random() * 20_000);
     autoClaimCooldown[id] = Math.min(autoClaimCooldown[id] ?? Infinity, now + stagger);
@@ -1123,7 +1125,7 @@ function groupedListHtml(accounts, rowHtml, healthMap) {
   }).join("");
 }
 
-const GIFT_CHIPS = [["gift:weekend", "grp.health.giftWeekend"], ["gift:global", "grp.health.giftGlobal"]];
+const GIFT_CHIPS = [["gift:weekend", "grp.health.giftWeekend"], ["gift:global", "grp.health.giftGlobal"], ["gift:trust", "grp.health.giftTrust"]];
 
 function chipsHtml(sum) {
   // 礼物是正交筛选维度，按活动细分（Weekend/Global Build），永远排在最前
@@ -1522,6 +1524,8 @@ async function loadAcctQuota(id, opts = {}) {
     }
     quotaFlapRetry[id] = 0;
     acctQuota[id] = { data, err: null, code: null, busy: false };
+    // 自动冻结号的恢复证据：额度数据面连续健康 → 计数解冻（见 noteFrozenQuotaHealthy）
+    noteFrozenQuotaHealthy(id, data);
     // 恢复反馈：此前数据面是空快照（曾被毒化/抖动，多为启动恢复场景）而现在拿到
     // 真实额度 → 明确告知。百分比在数据落位后取口径值
     if (cur.data?.is_empty === true && hasRem(data)) {
@@ -1552,6 +1556,8 @@ async function loadAcctQuota(id, opts = {}) {
     // 失败时也保留旧数据展示，错误信息进明细区；没旧数据才回落到错误态
     acctQuota[id] = { data: cur.data || null, err: stripErr(e), code: errCode(e), busy: false };
     quotaFailStreak[id] = (quotaFailStreak[id] || 0) + 1;
+    // 恢复证据要求「连续」健康刷新：失败一次就重新计数
+    if (autoFrozenAt[id]) autoUnfreezeHits[id] = 0;
     // 拉取失败（429/3012/网络）→ 指数退避（6s → 12s → 24s → …上限 30 分钟；成功清零），
     // 持续失败的账号不再以 6s 频率轰炸接口；活跃号 hardDown 只需连续 2 次失败，仍可在 ~20s 内触发
     quotaDue[id] = Date.now() + failBackoffMs(quotaFailStreak[id]);
@@ -1851,6 +1857,7 @@ const actions = {
         delete autoFrozenAt[id];
         autoRiskStreak[id] = 0;
         delete autoClaimCooldown[id];
+        delete autoUnfreezeHits[id];
       }
     }
     if (ids.length) { saveFrozen(); saveAutoFrozen(); }
@@ -1948,7 +1955,9 @@ const actions = {
       // 且持久化缓存会把已删除的号一直带下去（下次启动又出现）
       delete acctQuota[id]; delete quotaHist[id]; delete quotaSampleAt[id];
       delete quotaDue[id]; delete quotaFailStreak[id]; delete quotaForceAt[id];
-      delete autoClaimCooldown[id]; delete autoClaimEmptyRounds[id]; delete autoClaimFailRounds[id]; delete autoFrozenAt[id]; delete autoRiskStreak[id]; delete autoRiskLastAt[id]; delete claimable[id];
+      delete autoClaimCooldown[id]; delete autoClaimEmptyRounds[id]; delete autoClaimFailRounds[id]; delete autoFrozenAt[id]; delete autoRiskStreak[id]; delete autoRiskLastAt[id]; delete autoUnfreezeHits[id]; delete claimable[id];
+      // 冻结集合是 localStorage 持久化的：不删会让已删号的 id 永久残留
+      frozenIds.delete(id); saveFrozen();
       ui.selected.delete(id); ui.expanded.delete(id);
       markQuotaCacheDirty(); flushQuotaCache(true);
       toast(t("m.toastDeleted"));
@@ -2304,6 +2313,7 @@ const actions = {
       delete autoFrozenAt[id];
       autoRiskStreak[id] = 0;
       delete autoClaimCooldown[id];
+      delete autoUnfreezeHits[id];
       saveAutoFrozen();
     }
     render();
@@ -2744,8 +2754,9 @@ function noteClaimRisk(id) {
   autoRiskLastAt[id] = now;
   autoRiskStreak[id] = (autoRiskStreak[id] || 0) + 1;
   if (autoRiskStreak[id] < 2) return; // 单次信号不冻，防瞬时抖动误判
-  if (autoFrozenAt[id]) { // 已在自动冻结期：顺延探测时间即可
-    autoClaimCooldown[id] = Date.now() + autoClaimGap(3 * 60 * 60 * 1000);
+  if (autoFrozenAt[id]) { // 已在自动冻结期：顺延探测时间（封顶 24h——信号反复时也不能无限顺延成「永不恢复」）
+    const cap = Date.now() + 24 * 60 * 60 * 1000;
+    autoClaimCooldown[id] = Math.min(Math.max(autoClaimCooldown[id] ?? 0, Date.now() + autoClaimGap(3 * 60 * 60 * 1000)), cap);
     return;
   }
   const h = healthMapOf().get(id);
@@ -2764,12 +2775,35 @@ function autoUnfreeze(id) {
   const wasAuto = !!autoFrozenAt[id];
   delete autoFrozenAt[id];
   autoRiskStreak[id] = 0;
+  delete autoUnfreezeHits[id];
   frozenIds.delete(id);
   saveFrozen(); saveAutoFrozen();
   toast(t("m.autoUnfrozenToast", { name: accountName(id) }), "ok",
     wasAuto ? t("m.autoUnfrozenDetail") : t("m.manualUnfrozenDetail"));
   pokeAccount(id);
   render();
+}
+
+// 自动冻结的额度恢复解冻：此前解冻只认「领取提交成功」一种证据，礼物真空期的
+// 冻结号（无可领礼物 → 永远走不到提交成功）会永久滞留已冻结分组。额度端点不吃
+// 风控拦截，冻结满 2h 后连续 3 次成功刷新都带可用额度 = 风控已解除的旁证 →
+// 自动解冻回池（5min 刷新节奏下 ≈ 冻结后 2h15m，兑现「数小时后自动探测，恢复即解冻」）。
+// 手动冻结不在此列（用户决定，永不自动解冻）。
+const AUTO_UNFREEZE_MIN_MS = 2 * 60 * 60 * 1000;
+const AUTO_UNFREEZE_HITS = 3;
+let autoUnfreezeHits = {};
+function hasLiveQuota(data) {
+  if (!data || data.is_empty === true) return false;
+  const plans = (data.plans || []).filter((p) => !planExpired(p));
+  if (plans.some((p) => Number(p.remaining ?? 0) > 0)) return true;
+  const pools = plans.length ? plans.flatMap((p) => p.items || []) : (data.items || []);
+  return pools.some((it) => Number(it?.remaining ?? 0) > 0);
+}
+function noteFrozenQuotaHealthy(id, data) {
+  if (!autoFrozenAt[id]) return; // 手动冻结/未冻结：不介入
+  if (Date.now() - autoFrozenAt[id] < AUTO_UNFREEZE_MIN_MS) return;
+  const hits = (autoUnfreezeHits[id] = hasLiveQuota(data) ? (autoUnfreezeHits[id] || 0) + 1 : 0);
+  if (hits >= AUTO_UNFREEZE_HITS) autoUnfreeze(id);
 }
 function autoClaimCooldownFor(r) {
   const now = Date.now();
@@ -2990,17 +3024,18 @@ function balRowHtml(it) {
   </div>`;
 }
 
-const TIER_RANK = { max: 0, pro: 1, lite: 2, start: 3, trial: 4, other: 9 };
+const TIER_RANK = { max: 0, pro: 1, lite: 2, start: 3, trial: 4, trust: 5, other: 9 };
 
 /** 套餐等级归一：有 tier_code 时以它为准，否则回退到名称文本 */
 function tierKind(tier, code) {
   const c = String(code || "").trim().toLowerCase();
-  if (c === "max" || c === "pro" || c === "lite" || c === "start" || c === "trial") return c;
+  if (c === "max" || c === "pro" || c === "lite" || c === "start" || c === "trial" || c === "trust") return c;
   const s = String(tier || "").toLowerCase();
   if (s.includes("max")) return "max";
   if (s.includes("pro")) return "pro";
   if (s.includes("lite")) return "lite";
   if (s.includes("start")) return "start";
+  if (s.includes("trust")) return "trust";
   if (s.includes("trial") || String(tier || "").includes("体验")) return "trial";
   return "other";
 }
@@ -3011,9 +3046,10 @@ function tierChipHtml(tier, code) {
     : kind === "pro" ? "Pro"
       : kind === "lite" ? "Lite"
         : kind === "start" ? "Start"
-          : kind === "trial" ? t("q.trial")
-            : (tier || t("q.other"));
-  const cls = kind === "other" ? "other" : kind === "start" ? "trial" : kind;
+          : kind === "trust" ? "Trust Build"
+            : kind === "trial" ? t("q.trial")
+              : (tier || t("q.other"));
+  const cls = kind === "other" ? "other" : kind === "start" || kind === "trust" ? "trial" : kind;
   return `<span class="tier-b ${cls}">${esc(label)}</span>`;
 }
 
@@ -3105,7 +3141,7 @@ function planGroupHtml(p, omitTier = false) {
   const expiredTag = planExpired(p) ? `<span class="plan-expired">${esc(t("list.planExpired"))}</span>` : "";
   const exp = expireInfo(p.expire);
   return `
-  <div class="plan-grp">
+  <div class="plan-grp${planExpired(p) ? " expired" : ""}">
     <div class="pg-head">
       ${p.tier && !omitTier ? tierChipHtml(p.tier, p.tier_code) : ""}
       <span class="pg-name" title="${esc(label)}">${esc(label)}</span>${expiredTag}

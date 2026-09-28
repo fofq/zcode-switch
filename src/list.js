@@ -14,6 +14,13 @@ export const LOW_THRESHOLD = 20;
 export const PENDING_WINDOW_MS = 30 * 60 * 1000;
 
 /**
+ * 旧数据的保鲜期：刷新持续失败时，最后一次成功刷新（data.refreshed_at）距今
+ * 超过该窗口的旧百分比不再作为健康分组依据（见 healthOf 的保鲜门）。
+ * 取 15min ≈ 覆盖 ok 组 5min 周期的 3 轮失败，瞬时抖动不会把账号闪进失败分组。
+ */
+export const STALE_FAIL_MS = 15 * 60 * 1000;
+
+/**
  * 从 QuotaOverview 计算"剩余额度百分比"（0-100，100 = 完全没用）。
  * 多套餐 / 多窗口时取"最好的那个"（只要有一份还能用，账号就还能用）。
  */
@@ -111,7 +118,7 @@ export function planIsGift(p) {
   const name = String(p?.name || "").toLowerCase();
   if (["max", "pro", "lite", "start"].includes(tier)) return false;
   if (tier === "trial") return true;
-  return /gift|promo|weekend|taste|experience|activity|体验|礼包|global build/.test(name);
+  return /gift|promo|weekend|taste|experience|activity|体验|礼包|global build|trust build/.test(name);
 }
 
 /** 按套餐类别计算关注模型剩余：wantGift=true 只看礼物/赠送类套餐 */
@@ -181,6 +188,7 @@ export function giftKindOfPlan(p) {
   const n = String(p?.name || "").toLowerCase();
   if (n.includes("weekend")) return "weekend";
   if (n.includes("global")) return "global";
+  if (n.includes("trust")) return "trust";
   return "gift";
 }
 
@@ -307,8 +315,14 @@ export function healthOf(acct, quota, isAuthErr, model, opts = {}) {
     return { level: "dead", remainingPct: 0, modelMatched: mp != null, modelName, fallback, hasGift: false, giftKinds: [], focusPct: 0 };
   }
   if (pct != null) {
+    // 保鲜门：刷新持续失败且旧数据超过保鲜期时，旧百分比不再报「额度充足/紧张」，
+    // 落「额度查询失败」让调度和切换都停用该号；旧数值仍随卡片展示（保留 stale
+    // 数据做展示是既定约定，这里只隔离分组判定）。已判死（0 剩余/全过期/明确空
+    // 快照）是服务器确定性结论，不因刷新失败翻回「查询失败」。
+    const refreshedAt = Number(quota?.data?.refreshed_at ?? 0);
+    const staleFail = !!quota?.err && pct > 0 && refreshedAt > 0 && Date.now() - refreshedAt > STALE_FAIL_MS;
     // 流转账号单独一档：关注模型已耗尽但其它模型仍可用，组名直接表达主状态
-    const lv = fallback ? "flowed" : pct <= 0 ? "dead" : pct <= thr ? "low" : "ok";
+    const lv = pct <= 0 ? "dead" : staleFail ? "fail" : fallback ? "flowed" : pct <= thr ? "low" : "ok";
     return { level: lv, remainingPct: pct <= 0 ? 0 : pct, modelMatched: mp != null, modelName, fallback, hasGift, giftKinds, focusPct };
   }
   // 没有任何额度数据时才用错误/回退信号（避免刷新失败把账号闪进失败分组）
@@ -431,7 +445,7 @@ export function bucketAccounts(accounts, { localeTag = "zh-CN", healthLabel = ()
  * 合计：各健康度计数 + 平均剩余额度百分比（仅统计已拿到额度的账号，单位无关）。
  */
 export function summarize(accounts, healthMap) {
-  const counts = { "gift:weekend": 0, "gift:global": 0, frozen: 0, ok: 0, low: 0, flowed: 0, dead: 0, pending: 0, auth: 0, fail: 0, unknown: 0 };
+  const counts = { "gift:weekend": 0, "gift:global": 0, "gift:trust": 0, frozen: 0, ok: 0, low: 0, flowed: 0, dead: 0, pending: 0, auth: 0, fail: 0, unknown: 0 };
   let pctSum = 0;
   let pctCount = 0;
   for (const a of accounts || []) {

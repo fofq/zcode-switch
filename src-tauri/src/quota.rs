@@ -255,6 +255,10 @@ pub struct PlanSlot {
     /// 套餐已过期（status != active，或 active 但 ends_at 已过服务器时间）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub expired: Option<bool>,
+    /// 套餐 entitlements 的 id 集合：部分套餐（Trust Build 等新礼物）的 balances 行
+    /// 只带 entitlement_id 不带 plan_id，余额归属匹配靠它兜底
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub ent_ids: Vec<String>,
     pub total: Option<f64>,
     pub used: Option<f64>,
     pub remaining: Option<f64>,
@@ -1274,6 +1278,8 @@ pub fn extract_plan_tier(current_data: &Value) -> Option<String> {
         Some("Lite".into())
     } else if matches(&["start-plan", "start plan", "start"]) {
         Some("Start Plan".into())
+    } else if matches(&["trust build", "trust"]) {
+        Some("Trust Build".into())
     } else {
         None
     }
@@ -1293,6 +1299,8 @@ fn plan_tier_from_id(plan_id: &str, name: Option<&str>) -> (String, String) {
         ("Lite".into(), "lite".into())
     } else if hay.contains("start") {
         ("Start Plan".into(), "start".into())
+    } else if hay.contains("trust") {
+        ("Trust Build".into(), "trust".into())
     } else if ["trial", "taste", "experience", "gift", "weekend", "promo", "activity", "体验"]
         .iter()
         .any(|k| hay.contains(k))
@@ -1313,6 +1321,8 @@ fn tier_code_from_display(tier: &str) -> String {
         "lite".into()
     } else if t.contains("start") {
         "start".into()
+    } else if t.contains("trust") {
+        "trust".into()
     } else if t.contains("trial") || tier.contains("体验") {
         "trial".into()
     } else {
@@ -1323,7 +1333,7 @@ fn tier_code_from_display(tier: &str) -> String {
 /// 套餐名兜底判断是否礼物/赠送类（无 entitlements period 信息时使用）
 fn is_gift_plan_name(name: &str) -> bool {
     let n = name.to_lowercase();
-    ["gift", "promo", "weekend", "trial", "taste", "experience", "activity", "global build", "体验", "礼包", "赠送", "活动"]
+    ["gift", "promo", "weekend", "trial", "taste", "experience", "activity", "global build", "trust build", "体验", "礼包", "赠送", "活动"]
         .iter()
         .any(|k| n.contains(k))
 }
@@ -1334,6 +1344,7 @@ fn tier_rank(code: Option<&str>) -> u8 {
         "pro" => 4,
         "lite" => 3,
         "start" => 2,
+        "trust" => 2,
         "trial" => 1,
         _ => 0,
     }
@@ -1362,15 +1373,32 @@ fn normalize_balance(balance_data: &Value) -> QuotaOverview {
                     let pid = pl.get("plan_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
                     let pname = pl.get("name").and_then(|v| v.as_str()).map(str::to_string);
                     let (tier, tier_code) = plan_tier_from_id(&pid, pname.as_deref());
-                    // 礼物/赠送类套餐：entitlements 全部为一次性发放（one_time），
-                    // 常规订阅是 daily/monthly 周期刷新。名字关键词作兜底。
                     let ents = pl.get("entitlements").and_then(|e| e.as_array());
+                    // 礼物/赠送类套餐：entitlements 带 period 信息时按「全部 one_time」
+                    // 判定（常规订阅是 daily/monthly 周期刷新）；完全不带 period（部分
+                    // 新礼物 payload 即此形态）时回退套餐名启发式，否则关键词命中
+                    // （trust build）也会因缺 period 被误判成常规套餐
                     let gift = match ents {
-                        Some(list) if !list.is_empty() => list.iter().all(|e| {
-                            e.get("period").and_then(|v| v.as_str()).map(|s| s.eq_ignore_ascii_case("one_time")).unwrap_or(false)
-                        }),
+                        Some(list) if !list.is_empty() => {
+                            let one_time = |e: &Value| {
+                                e.get("period").and_then(|v| v.as_str()).map(|s| s.eq_ignore_ascii_case("one_time"))
+                            };
+                            let periods: Vec<Option<bool>> = list.iter().map(one_time).collect();
+                            if periods.iter().any(|p| p.is_some()) {
+                                periods.iter().all(|p| p.unwrap_or(false))
+                            } else {
+                                pname.as_deref().map(|n| is_gift_plan_name(n)).unwrap_or(false)
+                            }
+                        }
                         _ => pname.as_deref().map(|n| is_gift_plan_name(n)).unwrap_or(false),
                     };
+                    let ent_ids: Vec<String> = ents
+                        .map(|list| {
+                            list.iter()
+                                .filter_map(|e| e.get("entitlement_id").and_then(|v| v.as_str()).map(str::to_string))
+                                .collect()
+                        })
+                        .unwrap_or_default();
                     let status_active = pl
                         .get("status")
                         .and_then(|s| s.as_str())
@@ -1387,6 +1415,7 @@ fn normalize_balance(balance_data: &Value) -> QuotaOverview {
                         expire: extract_expire(pl),
                         gift: Some(gift),
                         expired: expired.then_some(true),
+                        ent_ids,
                         ..Default::default()
                     }
                 })
@@ -1437,12 +1466,20 @@ fn normalize_balance(balance_data: &Value) -> QuotaOverview {
                 period_end: ["period_end", "expires_at"].iter().find_map(|k| item.get(k).and_then(expiry_field)),
                 ..Default::default()
             };
-            let bpid = ["plan_id", "planId", "entitlement_id"]
+            let bpid = ["plan_id", "planId"]
                 .iter()
                 .find_map(|k| item.get(k).and_then(Value::as_str))
                 .unwrap_or("");
+            let bent = item
+                .get("entitlement_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
             let target = if !bpid.is_empty() {
                 slots.iter_mut().find(|s| s.pid == bpid)
+            } else if !bent.is_empty() {
+                // 余额行不带 plan_id 时按 entitlement_id 归属到套餐槽（Trust Build 等
+                // 新礼物的 balances 即此形态），匹配不上才落「其他额度」孤儿槽
+                slots.iter_mut().find(|s| s.ent_ids.iter().any(|e| e.as_str() == bent))
             } else if slots.len() == 1 && !any_pid {
                 slots.first_mut()
             } else {
@@ -1679,5 +1716,41 @@ mod no_plan_tests {
             ov.items.iter().any(|i| i.entitlement_id.as_deref() == Some("ent1")),
             "顶层 items 应携带 entitlement_id"
         );
+    }
+
+    /// Trust Build 等新礼物：balances 行只带 entitlement_id 不带 plan_id 时，
+    /// 余额必须按套餐 entitlements 归属挂回套餐槽，不得落「其他额度」孤儿槽；
+    /// plan_id/name 含 trust → tier=trust；one_time entitlements → 判定为礼物。
+    #[test]
+    fn trust_build_rows_attach_by_entitlement_id() {
+        let balance = json!({
+            "code": 0, "data": {
+                "server_time": 1789910000,
+                "plans": [
+                    { "plan_id": "zcode-v3-start-plan-0817", "name": "ZCode Start Plan", "status": "active",
+                      "entitlements": [ { "entitlement_id": "ent-start", "show_name": "GLM-5.3-Flash", "meter": "model_usage", "period": "monthly", "grant_units": 100 } ] },
+                    { "plan_id": "zcode-v3-trust-build-0928", "name": "ZCode Trust Build", "status": "active",
+                      "entitlements": [ { "entitlement_id": "ent-trust", "show_name": "GLM-5.3", "meter": "model_usage", "period": "one_time", "grant_units": 100000000 } ] }
+                ],
+                "balances": [
+                    { "entitlement_id": "ent-start", "show_name": "GLM-5.3-Flash", "total_units": 100, "used_units": 0, "remaining_units": 100 },
+                    { "entitlement_id": "ent-trust", "show_name": "GLM-5.3", "total_units": 100000000, "used_units": 0, "remaining_units": 100000000 }
+                ]
+            }
+        });
+        let ov = normalize_balance(&balance);
+        assert!(
+            ov.plans.iter().all(|s| s.name.as_deref() != Some("其他额度")),
+            "可按 entitlement_id 归属的余额不得落「其他额度」，实际: {:?}", ov.plans
+        );
+        let trust = ov.plans.iter().find(|s| s.pid == "zcode-v3-trust-build-0928").expect("trust 槽应存在");
+        assert_eq!(trust.tier_code.as_deref(), Some("trust"));
+        assert_eq!(trust.tier.as_deref(), Some("Trust Build"));
+        assert_eq!(trust.gift, Some(true), "one_time entitlements 应判为礼物");
+        assert_eq!(trust.items.len(), 1, "trust 余额应挂进 trust 槽");
+        assert_eq!(trust.items[0].entitlement_id.as_deref(), Some("ent-trust"));
+        let start = ov.plans.iter().find(|s| s.pid == "zcode-v3-start-plan-0817").expect("start 槽应存在");
+        assert_eq!(start.items.len(), 1, "start 余额应挂进 start 槽");
+        assert_eq!(start.gift, Some(false), "monthly 周期不是礼物");
     }
 }

@@ -1131,6 +1131,8 @@ select.two-input { cursor: pointer; }
 .tier-b.free, .tier-b.other { color: var(--ink-mute); border: 1px solid var(--hairline); background: var(--bg-2); }
 
 .plan-grp + .plan-grp { margin-top: 7px; padding-top: 6px; border-top: 1px dashed var(--hairline-soft); }
+/* 过期套餐是留档：整组置灰，避免「已过期」tag 旁边还挂着满血绿条误导（冻结号看起来像有额度） */
+.plan-grp.expired { opacity: .5; }
 .pg-head { display: flex; align-items: center; gap: 7px; margin-bottom: 3px; min-width: 0; }
 .plan-expired { font-family: var(--mono); font-size: 10px; color: #c4766f; border: 1px solid rgba(224,86,106,.45); border-radius: 4px; padding: 1px 5px; margin-left: 6px; }
 .pg-name {
