@@ -2849,6 +2849,36 @@ function noteFrozenQuotaSeen(id, data) {
   if (healthy >= AUTO_UNFREEZE_HITS && frozenFor >= AUTO_UNFREEZE_MIN_MS) { autoUnfreeze(id); return; }
   if (empty >= AUTO_UNFREEZE_HITS && frozenFor >= AUTO_UNFREEZE_EMPTY_MS) autoUnfreeze(id, "exhausted");
 }
+
+// 全局领取熔断：405「unusual activity」是上游 WAF 对 billing/claim 提交端点的
+// 常态化形态（实测按时间窗放行——0928 实例全天 11 成/60 败，成功集中在
+// 01/12/14 点的 5 连发；与共享 Agent 无关，改前构建同败法）。窗口关闭期间
+// 逐号撞墙只会白烧验证码、加固 IP 画像，还会让账号吃满 2 次信号被自动冻结。
+// 15 分钟窗内累计 ≥4 次风控失败 → 整轮暂停（15/30/60min 指数拉长），
+// 暂停期间 autoClaimTick 不起轮；任意一次领取成功即复位。
+const CLAIM_RISK_BURST_WINDOW = 15 * 60 * 1000;
+const CLAIM_RISK_BURST_N = 4;
+let claimRiskBurst = 0;
+let claimRiskBurstAt = 0;
+let claimPauseStreak = 0;
+let claimPauseUntil = 0;
+function noteFleetRiskFail() {
+  const now = Date.now();
+  if (now - claimRiskBurstAt > CLAIM_RISK_BURST_WINDOW) claimRiskBurst = 0;
+  claimRiskBurstAt = now;
+  claimRiskBurst++;
+  if (claimRiskBurst >= CLAIM_RISK_BURST_N) {
+    claimPauseStreak++;
+    const pause = Math.min(CLAIM_RISK_BURST_WINDOW * 2 ** Math.min(claimPauseStreak - 1, 2), 60 * 60 * 1000);
+    claimPauseUntil = Math.max(claimPauseUntil, now + pause);
+    claimRiskBurst = 0;
+    toast(t("m.claimRiskPaused", { min: Math.round(pause / 60e3) }), "warn", t("m.claimRiskPausedDetail"));
+  }
+}
+function noteFleetRiskOk() {
+  claimRiskBurst = 0;
+  claimPauseStreak = 0;
+}
 function autoClaimCooldownFor(r) {
   const now = Date.now();
   if (r.code === 1005 && r.nextAt) return Math.max(r.nextAt, now + AUTO_CLAIM_FAIL_MIN_MS);
@@ -2862,6 +2892,8 @@ function autoClaimCooldownFor(r) {
 async function autoClaimTick() {
   if (!state?.auto_claim || autoClaimRunning) return;
   if (claimActive || claimAllRunning) return;
+  // 风控熔断期：不起轮（报价未领期间一直挂在 preview，暂停不丢单）
+  if (Date.now() < claimPauseUntil) return;
   // 分层优先（0当前 → 1新号/GlobalBuild未证词 → 2有额度 → 3其余）：排序稳定，
   // 同层内保持新号优先；由于轮询决定「谁先发现礼物」，资格顺序必须盖过冷却到期顺序
   const ids = accountsNewFirst(
@@ -2893,12 +2925,12 @@ async function autoClaimTick() {
         // 事件上报（activation POST）的风控响应同样实时记账：
         // 上游在 event/report 上返回拒绝码/HTTP 错误 = 该号已被风控盯上，
         // 与领取失败共用同一套双信号冻结判定
-        if (r.activationError && riskInText(stripErr(r.activationError))) noteClaimRisk(id);
+        if (r.activationError && riskInText(stripErr(r.activationError))) { noteClaimRisk(id); noteFleetRiskFail(); }
         // preview 结果喂给实例登记：新 plan_id 首现 → 级联未持有者
         notePlanInstances((r.plans || []).map((p) => ({ planId: p.plan_id, name: p.name })));
       } catch (e) {
         claimable[id] = { plans: claimable[id]?.plans || [], err: String(e), busy: false };
-        if (riskInText(stripErr(e))) noteClaimRisk(id);
+        if (riskInText(stripErr(e))) { noteClaimRisk(id); noteFleetRiskFail(); }
         autoClaimCooldown[id] = Date.now() + autoClaimGap(AUTO_CLAIM_INTERVAL_MS);
         roundSkipped++;
         continue;
@@ -2920,9 +2952,15 @@ async function autoClaimTick() {
             break;
           }
         } catch (e) {
-          if (riskInText(stripErr(e))) noteClaimRisk(id);
+          if (riskInText(stripErr(e))) { noteClaimRisk(id); noteFleetRiskFail(); }
           await invoke("claim_cancel").catch(() => {});
-          autoClaimCooldown[id] = Date.now() + autoClaimGap(AUTO_CLAIM_INTERVAL_MS);
+          // 抛错（405 风控拦截等）与提交失败同谱升级：30min→2^n 封顶 4h，
+          // 写死 10min 会让被拦账号反复撞墙、两轮就吃满风控信号被冻结
+          const streak = (autoClaimFailRounds[id] = (autoClaimFailRounds[id] || 0) + 1);
+          autoClaimCooldown[id] = Math.max(
+            Date.now() + autoClaimGap(AUTO_CLAIM_INTERVAL_MS),
+            Date.now() + autoClaimGap(AUTO_CLAIM_FAIL_MIN_MS * (2 ** Math.min(streak - 1, 3))),
+          );
           failed = true;
           break;
         }
@@ -2943,11 +2981,13 @@ async function autoClaimTick() {
           if (claimFailureRisk(r)) {
             autoClaimCooldown[id] = Date.now() + autoClaimGap(3 * 60 * 60 * 1000);
             autoClaimSlowUntil = Date.now() + 5 * 60 * 1000;
+            noteFleetRiskFail();
           }
           failed = true;
           break;
         }
         gotAny = true; roundClaimed++;
+        noteFleetRiskOk();
         // 领取成功：上游需要几分钟发放套餐余额，主动触发额度刷新能最早看到数据
         pokeAccount(id);
         await awaitClaimPreviewFresh(id);
@@ -3891,8 +3931,9 @@ listen("claim://result", (ev) => {
       msg += t("m.claimNextAt", { time: new Date(p.nextAt).toLocaleString(localeTag(), { hour12: false }) });
     }
     toast(t("m.claimFailed", { name: p.accountName, msg }), "err");
-    if (claimFailureRisk(p)) noteClaimRisk(p.accountId); // 风控信号记账（双信号确认后自动冻结）
+    if (claimFailureRisk(p)) { noteClaimRisk(p.accountId); noteFleetRiskFail(); } // 风控信号记账（双信号确认后自动冻结）
   } else {
+    noteFleetRiskOk();
     autoRiskStreak[p.accountId] = 0; // 领取成功：风控怀疑清零
     if (isFrozen(p.accountId)) autoUnfreeze(p.accountId); // 探测通过 → 解冻（手动/自动一视同仁）
     // 礼物账本：领到的实例记账（global 族终身免快检；weekend 族按期比对）

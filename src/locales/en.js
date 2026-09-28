@@ -338,6 +338,8 @@ export const en = {
   "m.quotaRefreshEmpty": "\"{name}\" has no plan data (auto-recheck if abnormal)",
   "m.quotaRefreshFail": "\"{name}\" refresh failed: {err}",
   "m.refreshInFlight": "\"{name}\" is already refreshing — one moment…",
+  "m.claimRiskPaused": "Claims blocked by risk control repeatedly — round paused for {min} min",
+  "m.claimRiskPausedDetail": "The upstream WAF rejects all submissions during closed windows (unclaimed quotes stay visible in preview — nothing is lost). The round resumes automatically, usually landing inside an open window.",
   "m.quotaRecovered": "\"{name}\" quota recovered: {pct}% left",
   "list.toastSweepDone": "Refreshed quota for {n} accounts",
 
