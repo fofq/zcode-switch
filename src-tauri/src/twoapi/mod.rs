@@ -464,9 +464,9 @@ pub struct TestResult {
 }
 
 fn upstream_agent() -> ureq::Agent {
-    ureq::AgentBuilder::new()
-        .timeout_connect(Duration::from_secs(10))
-        .build()
+    // 共享全局 Agent（连接池按 host 复用）；不设总超时：chat 转发是长流式响应，
+    // 挂起保护由 connect 超时 + 客户端断连兜底
+    crate::http_agent().clone()
 }
 
 /// 测试专用：带总超时，避免上游挂起时测试一直不返回

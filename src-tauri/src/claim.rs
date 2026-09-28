@@ -125,10 +125,7 @@ fn decrypt_credential(v: &str, secret: &str) -> Option<String> {
 }
 
 fn agent() -> ureq::Agent {
-    ureq::AgentBuilder::new()
-        .timeout_connect(Duration::from_secs(10))
-        .timeout(Duration::from_secs(CLAIM_TIMEOUT_SECS))
-        .build()
+    crate::http_agent().clone()
 }
 
 pub const EVENT_REPORT_URL: &str = "https://zcode.z.ai/api/v1/event/report";
@@ -189,10 +186,7 @@ fn device_os_category() -> &'static str {
 }
 
 pub fn report_activation_events(user_id: &str, device_mid: &str) -> Result<(), String> {
-    let agent = ureq::AgentBuilder::new()
-        .timeout_connect(Duration::from_secs(10))
-        .timeout(Duration::from_secs(ACTIVATION_TIMEOUT_SECS))
-        .build();
+    let agent = crate::http_agent();
     for element in ACTIVATION_EVENTS {
         let body = activation_event_body(
             element,
@@ -202,6 +196,7 @@ pub fn report_activation_events(user_id: &str, device_mid: &str) -> Result<(), S
         );
         let resp = agent
             .post(EVENT_REPORT_URL)
+            .timeout(Duration::from_secs(ACTIVATION_TIMEOUT_SECS))
             .set("Content-Type", "application/json")
             .send_json(body)
             .map_err(|e| {
@@ -331,7 +326,7 @@ fn http_err(prefix: &str, e: ureq::Error) -> String {
 }
 
 fn preview_once(url: &str, token: &str, mid: Option<String>) -> Result<Vec<ClaimPlan>, String> {
-    let mut req = agent().get(url);
+    let mut req = agent().get(url).timeout(Duration::from_secs(CLAIM_TIMEOUT_SECS));
     for (k, v) in quota::zai_billing_headers_with_mid(token, mid) {
         req = req.set(&k, &v);
     }
@@ -369,7 +364,7 @@ pub fn submit_claim(
     }
     let secret = zcrypto::default_secret(home);
     let token = claim_token(creds, config, &secret)?;
-    let mut req = agent().post(BILLING_CLAIM_URL);
+    let mut req = agent().post(BILLING_CLAIM_URL).timeout(Duration::from_secs(CLAIM_TIMEOUT_SECS));
     for (k, v) in quota::zai_billing_headers_with_mid(&token, device_mid) {
         req = req.set(&k, &v);
     }
@@ -399,7 +394,7 @@ pub fn submit_claim(
 }
 
 pub fn fetch_captcha_config() -> Result<CaptchaConfig, String> {
-    let mut req = agent().get(CLIENT_CONFIGS_URL);
+    let mut req = agent().get(CLIENT_CONFIGS_URL).timeout(Duration::from_secs(CLAIM_TIMEOUT_SECS));
     for (k, v) in quota::zai_billing_headers("") {
         req = req.set(&k, &v);
     }

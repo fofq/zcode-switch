@@ -11,6 +11,22 @@ mod store;
 mod zcrypto;
 mod zsignals;
 
+/// 全局共享 HTTP Agent：ureq 的连接池随 Agent 生存，此前 quota/claim/2api 转发
+/// 都是每请求新建 Agent——零复用，每个请求都完整走一遍 TCP+TLS 握手（Clash 等
+/// 代理日志里表现为一分钟十几条新建连接）。共享后同 host 请求复用 keep-alive
+/// 连接，建连数塌缩；克隆 Agent 共享同一个连接池。总超时统一不设在 Agent 上
+/// （2api 聊天转发是长流式响应），由各调用点按请求用 .timeout() 覆盖。
+pub(crate) fn http_agent() -> &'static ureq::Agent {
+    static AGENT: std::sync::OnceLock<ureq::Agent> = std::sync::OnceLock::new();
+    AGENT.get_or_init(|| {
+        ureq::AgentBuilder::new()
+            .timeout_connect(std::time::Duration::from_secs(10))
+            // 与额度刷新泵并发（4）一致：每 host 常备 4 条空闲连接，泵稳态全走复用
+            .max_idle_connections_per_host(4)
+            .build()
+    })
+}
+
 use serde_json::{json, Value};
 use std::sync::Mutex;
 use store::*;

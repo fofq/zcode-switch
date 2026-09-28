@@ -389,15 +389,12 @@ fn billing_headers(url: &str, token: &str, mid: Option<&str>) -> Vec<(String, St
 
 fn http_get_json(url: &str, token: &str, mid: Option<&str>, retry_429: bool) -> Result<Value, String> {
     let retry_delays = [500u64, 1500, 4000];
-    let agent = ureq::AgentBuilder::new()
-        .timeout_connect(Duration::from_secs(10))
-        .timeout(Duration::from_secs(20))
-        .build();
+    let agent = crate::http_agent();
     let headers = billing_headers(url, token, mid);
     let mut last_err: Option<String> = None;
     let mut backoff: std::slice::Iter<'_, u64> = if retry_429 { retry_delays.iter() } else { [].iter() };
     loop {
-        let mut req = agent.get(url);
+        let mut req = agent.get(url).timeout(Duration::from_secs(20));
         for (k, v) in &headers {
             req = req.set(k, v);
         }
