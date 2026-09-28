@@ -1854,8 +1854,16 @@ const actions = {
     const ids = selectedIds();
     if (!ids.length) return;
     for (const id of ids) {
-      if (freeze) frozenIds.add(id);
-      else {
+      if (freeze) {
+        // 显式批量冻结把自动冻结「提升」为手动冻结：用户拍板的停靠必须由用户解除，
+        // 不得被自动解冻路径（额度恢复/耗尽坐实）绕过
+        if (autoFrozenAt[id]) {
+          delete autoFrozenAt[id];
+          delete autoUnfreezeHits[id];
+          delete autoUnfreezeEmpty[id];
+        }
+        frozenIds.add(id);
+      } else {
         frozenIds.delete(id);
         delete autoFrozenAt[id];
         autoRiskStreak[id] = 0;
@@ -2799,6 +2807,8 @@ function autoUnfreeze(id, reason = "probe") {
 //    查不出有效额度数据的退化号）→ 坐实没额度解除。冻结语义是「有额度但被风控
 //    停靠」，对没额度的号毫无意义——它们本就不参与自动切换，解冻后回归真实分组
 //    （额度耗尽/待查询），按耗尽号节奏（60-120min）刷新，新礼物到账正常级联恢复。
+//    解冻刻意不清领取冷却：冷却必到期且级联可用 min() 下拉，不是吸收态；
+//    风控证据未必完全洗白，保留领取端节流更稳。
 // 手动冻结不受 c) 影响（用户决定停靠，标记保留），仅分组显示归位（见 healthMapOf）。
 const AUTO_UNFREEZE_MIN_MS = 2 * 60 * 60 * 1000;
 const AUTO_UNFREEZE_EMPTY_MS = 6 * 60 * 60 * 1000;
