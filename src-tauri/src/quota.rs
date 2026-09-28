@@ -1153,6 +1153,7 @@ fn normalize_quota_limit(limit_resp: &Value, sub_resp: Option<&Value>) -> QuotaO
             expire: plan_expire.clone(),
             gift: None,
             expired: None,
+            ent_ids: Vec::new(),
             total,
             used,
             remaining,
