@@ -174,7 +174,7 @@ const state = {
   auth_proxy_on: false,
   auth_proxy_url: null,
   language: "zh",
-  two_api_on: true,
+  two_api_on: false,
   two_api_port: 8117,
   two_api_account: null,
   two_api_token: "zsw-mock-token-0123456789abcdef",
