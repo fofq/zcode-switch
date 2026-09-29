@@ -100,9 +100,18 @@ function itemKindOf(it) {
   return "raw";
 }
 
-/** 套餐是否已过期（后端 expired 标记：status != active 或 ends_at 已过服务器时间） */
+/** 套餐是否已过期：后端 expired 标记（status != active 或 ends_at 已过服务器时间），
+ *  或本地时钟复核——expire 是套餐真有效期（ends_at，已对齐官方 GUI）。数据可能是
+ *  套餐失效前拉的：失效后服务端回空快照，空快照防抖会一直保留旧数据展示（不判死），
+ *  只认拉取时刻的标志会让死号顶着「100% 额度充足」永不腐烂（69 号 09-30 实证） */
 export function planExpired(p) {
-  return p?.expired === true;
+  if (p?.expired === true) return true;
+  const txt = String(p?.expire || "");
+  if (!txt) return false;
+  // 与 expireInfo 同口径：带时间用完整时刻，纯日期按当天 23:59
+  const hasTime = txt.length >= 16;
+  const ms = new Date(hasTime ? txt.replace(" ", "T") : txt + "T23:59:59").getTime();
+  return Number.isFinite(ms) && ms < Date.now();
 }
 
 /** 账号在用的套餐：排除过期套餐（过期桶只是留档，额度不可用） */

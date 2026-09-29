@@ -231,3 +231,16 @@ export function applyClaimedGift(id) {
   if (q.plans.some((p) => p.gift && !p.expired)) return;
   q.plans.push(giftPlan("Weekend Build 礼包", "weekend", 2, [pool(F, 12_000_000, 0)]));
 }
+
+/** 复现「套餐已过期但数据未刷新」的陈旧形态（69 号 09-30 实证）：
+ *  主套餐 expire 拨到 3 天前，expired 标志保持 false（拉取时刻未过期），
+ *  额度保持满格——planExpired 的本地时钟复核应将其判死 */
+export function makePlanStale(id) {
+  const q = quotas[id];
+  const p = q?.plans?.find((x) => !x.gift);
+  if (p) {
+    p.expire = timeStr(now - 3 * DAY);
+    p.expired = false;
+  }
+  return p ? { id, expire: p.expire } : null;
+}
