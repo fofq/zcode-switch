@@ -34,3 +34,16 @@ __pycache__/
 
 # 本地诊断脚本/流程文档（永不推送）
 .tmpdiag/
+
+# 临时参考项目源码（本地分析用，永不入库）
+.temp-sources/
+
+# 本地 CI 追踪工具与其临时产物（永不入库，见 scripts/ci-watch.local.sh 头注释）
+scripts/ci-watch.local.sh
+.arts.json
+.arts.txt
+.run.json
+.runs.json
+
+# 本地工具会话状态
+.omo/
