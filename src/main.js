@@ -786,7 +786,7 @@ function settingsFormHtml() {
         <div class="st-lab" title="${esc(t("st.autoArchiveDeadDesc"))}">${t("st.autoArchiveDead")}</div>
         <div class="st-ctl">
           <div class="lang-seg" role="radiogroup" aria-label="${esc(t("st.autoArchiveDead"))}">
-            ${[["0", "st.aaOff"], ["24", "st.aa24h"], ["72", "st.aa3d"], ["168", "st.aa7d"]].map(([v, k]) =>
+            ${[["0", "st.aaOff"], ["1", "st.aa1h"], ["24", "st.aa24h"], ["72", "st.aa3d"]].map(([v, k]) =>
               `<button class="lang-opt${Number(s.auto_archive_dead_hours ?? 0) === Number(v) ? " on" : ""}" role="radio" aria-checked="${Number(s.auto_archive_dead_hours ?? 0) === Number(v)}" click="actions.stAutoArchive('dead', '${v}')">${esc(t(k))}</button>`).join("")}
           </div>
         </div>
@@ -795,7 +795,7 @@ function settingsFormHtml() {
         <div class="st-lab" title="${esc(t("st.autoArchiveAgeDesc"))}">${t("st.autoArchiveAge")}</div>
         <div class="st-ctl">
           <div class="lang-seg" role="radiogroup" aria-label="${esc(t("st.autoArchiveAge"))}">
-            ${[["0", "st.aaOff"], ["30", "st.aa30d"], ["90", "st.aa90d"], ["365", "st.aa365d"]].map(([v, k]) =>
+            ${[["0", "st.aaOff"], ["5", "st.aa5d"], ["7", "st.aa7d"], ["10", "st.aa10d"]].map(([v, k]) =>
               `<button class="lang-opt${Number(s.auto_archive_age_days ?? 0) === Number(v) ? " on" : ""}" role="radio" aria-checked="${Number(s.auto_archive_age_days ?? 0) === Number(v)}" click="actions.stAutoArchive('age', '${v}')">${esc(t(k))}</button>`).join("")}
           </div>
         </div>
