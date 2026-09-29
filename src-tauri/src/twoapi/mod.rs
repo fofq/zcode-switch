@@ -4,7 +4,8 @@
 //!   OpenAI 入站打 paas/v4、Anthropic 入站打 coding endpoint，纯透传（免费不耗额度，有速率限制靠轮询摊平）。
 //! - 套餐模型（glm-5.3 系）→ 登录态 JWT（Bearer）打 zcode-plan 端点。
 //!   实测套餐额度只挂在 zcode-plan 体系下，平台 key 在 api.z.ai 花不了它（1113 无资源包），
-//!   故套餐路由一律 JWT；该端点有阿里云验证码墙（3007），见下方验证码桥接。
+//!   故套餐路由一律 JWT；该端点的阿里云验证码墙（3007）自官方 v3.14.4 起可被服务端
+//!   远程关闭（skip_model_request），见下方验证码桥接。
 //!   套餐路由是多账号降级链（参考 .temp-zcode-proxy relay.go）：主候选（锁定/跟随账号）
 //!   失败后按需拉全账号 JWT 池继续试（≤5 个），按错误分类冷却：
 //!   401/403→600s、429（Retry-After 退避后）→30s、402/额度词→1800s、3012 风控与 WAF
@@ -83,11 +84,13 @@ fn stats() -> &'static Arc<Stats> {
 }
 
 // ===== start-plan 验证码桥接 =====
-// zcode-plan/anthropic 对 start-plan JWT 有阿里云验证码墙（HTTP 400 code=3007），
-// 无验证码参数一律拒绝（带全套官方头也一样）。官方客户端由渲染端阿里云 SDK 生成
-// captchaVerifyParam（优先无感通过）。我们复用 claim 的验证码窗口：套餐路由收到 3007 时
-// 打开窗口（无感优先、滑块兜底），拿到的参数进队列，等待中的请求取出后带
-// X-Aliyun-Captcha-Verify-Param 重试一次。参数单次有效，同一窗口可能需要反复解。
+// 官方 v3.14.4 起验证码墙可由服务端关闭：/api/v1/client/configs 下发
+// configs.captcha.skip_model_request=true 时，官方客户端模型请求直接空 header
+// 发送、不再跑阿里云无感验证码（当前实测该标记已开启）。我们探测同一端点
+// （无需鉴权）对齐：开关开启 = 裸发；关闭/探测失败 = 维持下方旧链路——
+// 复用 claim 的验证码窗口预取参数随首次请求带上（先裸打拿 3007 再补参重放
+// 会被 WAF 判成异常重放→3012，实测教训），收到 3007 时开窗（无感优先、滑块
+// 兜底）重试一次。参数单次有效，同一窗口可能需要反复解。
 
 fn captcha_params() -> &'static Mutex<VecDeque<(String, Option<String>)>> {
     static P: OnceLock<Mutex<VecDeque<(String, Option<String>)>>> = OnceLock::new();
@@ -858,10 +861,54 @@ fn post_captcha_failure(e: PlanErr, st: &Arc<SharedState>, id: &str, mode: &Pump
     }
 }
 
-/// 单账号一次尝试：zcode-plan 有验证码墙时**预取**参数随首次请求带上
-/// （官方客户端同款：无感预解。先裸打拿 3007 再补参重放会被 WAF 判成
-/// 异常重放→3012，实测教训）；429 请求内退避重试一次；参数过期被 3007
-/// 拒时作废重解再试一次；其余按分类冷却换号 / 如实透传。
+/// 模型请求验证码远程开关：true = 服务端已关闭免费套餐模型请求验证码
+/// （configs.captcha.enabled=false 或 skip_model_request=true）。1h 缓存与官方
+/// clientConfigSnapshotExpiresAt 一致；探测失败按未关闭处理，保留旧链路。
+static MODEL_CAPTCHA_SKIP: Mutex<Option<(std::time::Instant, bool)>> = Mutex::new(None);
+const MODEL_CAPTCHA_SKIP_TTL: Duration = Duration::from_secs(3600);
+
+fn fetch_model_captcha_skip() -> bool {
+    let url = format!(
+        "{}?app_version={}&platform={}",
+        crate::claim::CLIENT_CONFIGS_URL,
+        crate::quota::zcode_app_version(),
+        crate::quota::client_platform(),
+    );
+    let resp = match upstream_agent().get(&url).timeout(Duration::from_secs(10)).call() {
+        Ok(r) => r,
+        Err(_) => return false,
+    };
+    let Ok(text) = resp.into_string() else { return false };
+    let Ok(v) = serde_json::from_str::<Value>(&text) else { return false };
+    if v.get("code").and_then(|c| c.as_i64()) != Some(0) {
+        return false;
+    }
+    let cap = match v.pointer("/data/configs/captcha") {
+        Some(c) => c,
+        None => return false,
+    };
+    cap.get("skip_model_request").and_then(|x| x.as_bool()).unwrap_or(false)
+        || !cap.get("enabled").and_then(|x| x.as_bool()).unwrap_or(true)
+}
+
+async fn model_captcha_skipped() -> bool {
+    if let Some((at, skip)) = MODEL_CAPTCHA_SKIP.lock().unwrap().as_ref() {
+        if at.elapsed() < MODEL_CAPTCHA_SKIP_TTL {
+            return *skip;
+        }
+    }
+    let skip = tauri::async_runtime::spawn_blocking(fetch_model_captcha_skip)
+        .await
+        .ok()
+        .unwrap_or(false);
+    *MODEL_CAPTCHA_SKIP.lock().unwrap() = Some((std::time::Instant::now(), skip));
+    skip
+}
+
+/// 单账号一次尝试：验证码墙未关闭时**预取**参数随首次请求带上（官方旧版
+/// 同款：无感预解）；已关闭（skip_model_request）则裸发。429 请求内退避
+/// 重试一次；参数过期被 3007 拒时作废重解再试一次；其余按分类冷却换号 /
+/// 如实透传。
 async fn plan_attempt(
     st: &Arc<SharedState>,
     c: &Candidate,
@@ -886,9 +933,10 @@ async fn plan_attempt(
             c.mid.clone(),
         )
     };
-    // 预取验证码参数（45s 缓存命中 = 零弹窗零等待；无界面环境拿不到就裸打）
+    // 预取验证码参数（45s 缓存命中 = 零弹窗零等待；无界面环境拿不到就裸打）。
+    // 服务端已关闭模型请求验证码时跳过预取，直接裸发。
     let mut first_extra: Vec<(String, String)> = Vec::new();
-    if captcha_wall {
+    if captcha_wall && !model_captcha_skipped().await {
         if let Some((param, region)) = obtain_captcha_param().await {
             first_extra = captcha_headers(param, region);
         }
