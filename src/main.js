@@ -236,6 +236,8 @@ const ui = {
   qhTab: "",
   modelCustom: false,
   selected: new Set(),
+  // Shift 范围选择的锚点（上一次普通点选的行）；会话内有效，不持久化
+  lastCheckedId: null,
   expanded: new Set(),
   collapsedSections: new Set(),
 };
@@ -1849,9 +1851,27 @@ const actions = {
     render();
   },
 
-  toggleSelect(id) {
+  toggleSelect(id, event) {
+    // Shift 联动：以上一次点选的行（锚点）为起点，把可见列表中的区间统一成本行的目标状态；
+    // shift 点击不移动锚点。锚点失效（筛选/视图变化后不在可见列表）时退化为普通点选
+    const shift = !!event?.shiftKey;
+    if (shift && ui.lastCheckedId && ui.lastCheckedId !== id) {
+      const visible = visibleAccounts().list.map((a) => a.id);
+      const i1 = visible.indexOf(ui.lastCheckedId);
+      const i2 = visible.indexOf(id);
+      if (i1 >= 0 && i2 >= 0) {
+        const setTo = !ui.selected.has(id);
+        for (let i = Math.min(i1, i2); i <= Math.max(i1, i2); i++) {
+          if (setTo) ui.selected.add(visible[i]);
+          else ui.selected.delete(visible[i]);
+        }
+        render();
+        return;
+      }
+    }
     if (ui.selected.has(id)) ui.selected.delete(id);
     else ui.selected.add(id);
+    ui.lastCheckedId = id;
     render();
   },
 
@@ -1922,7 +1942,9 @@ const actions = {
   },
 
   /** 批量归档/取消归档：与单个归档同语义（不自动刷新/领取/切换，手动保留）。
-   *  批量归档含在用号时同样触发立即切换；取消归档清领取冷却让其尽快回轮 */
+   *  批量归档含在用号时同样触发立即切换；取消归档清领取冷却让其尽快回轮。
+   *  操作后清空选中集：归档/取消归档都会让账号离开当前视图，残留选中会让
+   *  「归档/取消归档」按钮翻转成反向操作，看着像误触发 */
   doBulkArchive(archive) {
     const ids = selectedIds();
     if (!ids.length) return;
@@ -1933,7 +1955,9 @@ const actions = {
         delete autoClaimCooldown[id];
       }
     }
-    if (ids.length) saveArchived();
+    saveArchived();
+    ui.selected.clear();
+    ui.lastCheckedId = null;
     toast(t(archive ? "list.toastBulkArchived" : "list.toastBulkUnarchived", { n: ids.length }), "ok",
       t(archive ? "m.archivedDetail" : "m.unarchivedDetail"));
     render();
@@ -2450,6 +2474,10 @@ const actions = {
       // 取消归档 = 重新入轮：立刻安排一次额度刷新，领取冷却清零让轮次尽快接续
       pokeAccount(id);
       delete autoClaimCooldown[id];
+    } else {
+      // 归档后账号离开当前视图：同步清掉选中与锚点，避免残留选中翻转批量按钮
+      ui.selected.delete(id);
+      if (ui.lastCheckedId === id) ui.lastCheckedId = null;
     }
     render();
     const name = accountName(id);
@@ -3831,7 +3859,7 @@ function render(force = false) {
     <div class="row${isActive ? " active" : ""}${checked ? " picked" : ""}${slim ? " slim" : ""}${isArchived(a.id) ? " archived" : ""}" data-id="${a.id}">
       <div class="row-top">
         ${seqBadge}
-        <span class="rchk" role="checkbox" aria-checked="${checked}" title="${esc(t("list.selectHint"))}" click="actions.toggleSelect('${a.id}')">${ic("check", 11)}</span>
+        <span class="rchk" role="checkbox" aria-checked="${checked}" title="${esc(t("list.selectHint"))}" click="actions.toggleSelect('${a.id}', event)">${ic("check", 11)}</span>
         ${healthDotHtml(h)}
         ${slim ? "" : `<span class="notch" style="background:${notchColor(a.id)}"></span>`}
         <div class="row-main"${ui.density === "compact" ? ` click="actions.toggleRow(event)" title="${esc(slim ? t("list.expandTitle") : t("list.collapseTitle"))}"` : ""}>
@@ -3917,7 +3945,7 @@ function render(force = false) {
           <div class="row-meta">${meta}</div>
         </div>
         <span class="card-side">
-          <span class="rchk" role="checkbox" aria-checked="${checked}" title="${esc(t("list.selectHint"))}" click="actions.toggleSelect('${a.id}')">${ic("check", 11)}</span>
+          <span class="rchk" role="checkbox" aria-checked="${checked}" title="${esc(t("list.selectHint"))}" click="actions.toggleSelect('${a.id}', event)">${ic("check", 11)}</span>
           <!-- 卡片头部不再放「剩 N%」小条：与下方模型条重复，健康度色落在模型条的数字上 -->
           <button class="card-expand" title="${esc(expanded ? t("list.collapseTitle") : t("list.expandTitle"))}" aria-label="${esc(expanded ? t("list.collapseTitle") : t("list.expandTitle"))}" click="actions.toggleRow(event)">${ic("chevDown", 13)}</button>
         </span>
