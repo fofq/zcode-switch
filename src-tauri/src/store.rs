@@ -681,6 +681,17 @@ pub fn unique_name(accounts: &[Account], base: &str) -> String {
     format!("{base} {}", Uuid::new_v4().simple())
 }
 
+/// 入库自动编号：现有账号中纯数字名的最大值 +1（非数字名不参与，编号只增不减；
+/// 手动改过的数字名同样计入基准）。只在账号创建时触发一次，此后手动重命名不受影响。
+pub fn next_incremental_name(accounts: &[Account]) -> String {
+    let max = accounts
+        .iter()
+        .filter_map(|a| a.name.trim().parse::<u64>().ok())
+        .max()
+        .unwrap_or(0);
+    (max + 1).to_string()
+}
+
 pub fn capture_current(paths: &Paths, name: Option<String>) -> Result<Account, String> {
     let live = read_live(paths)?.ok_or(tr("err.live.no_creds_file"))?;
     if !is_logged_in(&live) {
@@ -694,10 +705,8 @@ pub fn capture_current(paths: &Paths, name: Option<String>) -> Result<Account, S
     let config = read_live_config(paths);
     let name = match name {
         Some(n) => unique_name(&accounts, &n),
-        None => {
-            let id = zcrypto::account_identity(&live, &paths.home);
-            unique_name(&accounts, &id.label().unwrap_or_else(|| "Account 1".into()))
-        }
+        // 显式命名优先；未指定则按增量编号（入库自动重命名）
+        None => next_incremental_name(&accounts),
     };
     let ts = now_ts();
     let mut acc = Account {
@@ -743,7 +752,8 @@ fn auto_preserve(paths: &Paths, accounts: &[Account], target_hash: &str) -> Resu
     if find_same_login(&live, &hash, accounts, &paths.home).is_some() {
         return Ok(None);
     }
-    let name = unique_name(accounts, &format!("Auto {}", Local::now().format("%m-%d %H%M")));
+    // 切换途中被动收留的 live 会话同样是入库：按增量编号，保持账号池命名一致
+    let name = next_incremental_name(accounts);
     let ts = now_ts();
     let mut acc = Account {
         id: Uuid::new_v4().to_string(),
@@ -1900,6 +1910,13 @@ pub fn import_values(paths: &Paths, files: &[(String, Value)]) -> Result<ImportR
     let accounts = list_accounts(paths)?;
 
     let mut new_accounts: Vec<Account> = vec![];
+    // 入库自动编号的起点：现有最大数字名 +1（批量导入逐个递增）
+    let mut next_num: u64 = accounts
+        .iter()
+        .filter_map(|a| a.name.trim().parse::<u64>().ok())
+        .max()
+        .unwrap_or(0)
+        + 1;
 
     for (fname, v) in files {
         let cands = match import_candidates(v) {
@@ -1909,7 +1926,7 @@ pub fn import_values(paths: &Paths, files: &[(String, Value)]) -> Result<ImportR
                 continue;
             }
         };
-        for (name_opt, creds, config_opt, group_opt) in cands {
+        for (_name_opt, creds, config_opt, group_opt) in cands {
             if !is_logged_in(&creds) {
                 report.skipped.push(trf("err.import.no_creds", &[("fname", fname.as_str())]));
                 continue;
@@ -1919,11 +1936,10 @@ pub fn import_values(paths: &Paths, files: &[(String, Value)]) -> Result<ImportR
                 report.skipped.push(trf("err.import.dup", &[("fname", fname.as_str())]));
                 continue;
             }
-            let base_name = name_opt.unwrap_or_else(|| {
-                let id = zcrypto::account_identity(&creds, &paths.home);
-                id.label().unwrap_or_else(|| format!("Import {}", Local::now().format("%m-%d %H%M")))
-            });
-            let name = unique_name(&accounts, &base_name);
+            // 入库自动编号：忽略文件自带命名，按现有最大数字名 +1 递增；
+            // 批量导入时逐个递增（new_accounts 尚未入库，用本地计数器承接）
+            let name = next_num.to_string();
+            next_num += 1;
             let ts = now_ts();
             let group = group_opt.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
             let acc = Account {

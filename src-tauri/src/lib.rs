@@ -937,16 +937,8 @@ fn persist_oauth_account(
         claim::spawn_activation_report(&paths.home, &dup.credentials, mid);
         return Ok(json!({ "id": dup.id, "name": dup.name, "provider": provider, "duplicate": true }));
     }
-    let base = credentials
-        .get(format!("oauth:{provider}:user_info"))
-        .and_then(|v| v.as_str())
-        .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
-        .and_then(|u| u.get("username").and_then(|x| x.as_str()).map(String::from))
-        .unwrap_or_else(|| match provider {
-            "zai" => "z.ai".to_string(),
-            _ => "BigModel".to_string(),
-        });
-    let name = unique_name(&accounts, &base);
+    // OAuth 登录入库：按增量编号自动命名（此后手动重命名不受影响）
+    let name = store::next_incremental_name(&accounts);
     let ts = now_ts();
     let acc = Account {
         id: uuid::Uuid::new_v4().to_string(),
