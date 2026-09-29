@@ -185,6 +185,12 @@ pub struct Settings {
     pub auto_switch_gift_order: Option<String>,
     #[serde(default)]
     pub auto_switch_model_fallback: Option<bool>,
+    /// 自动归档：额度耗尽持续满 N 小时归档（0=关）
+    #[serde(default)]
+    pub auto_archive_dead_hours: Option<u32>,
+    /// 自动归档：建号超过 N 天归档（0=关）
+    #[serde(default)]
+    pub auto_archive_age_days: Option<u32>,
     #[serde(default)]
     pub two_api_on: Option<bool>,
     #[serde(default)]
@@ -222,6 +228,9 @@ impl Settings {
         }
     }
     pub fn auto_switch_model_fallback(&self) -> bool { self.auto_switch_model_fallback.unwrap_or(false) }
+    /// 0 = 关闭；上限 30 天（小时）/ 3650 天（年龄），防手滑写天文数字
+    pub fn auto_archive_dead_hours(&self) -> u32 { self.auto_archive_dead_hours.unwrap_or(0).clamp(0, 24 * 30) }
+    pub fn auto_archive_age_days(&self) -> u32 { self.auto_archive_age_days.unwrap_or(0).clamp(0, 3650) }
     pub fn auth_proxy(&self) -> Option<&str> {
         if self.auth_proxy_on.unwrap_or(false) {
             self.auth_proxy_url.as_deref().map(str::trim).filter(|s| !s.is_empty())
@@ -283,6 +292,8 @@ pub struct AppState {
     pub auto_switch_gift_first: bool,
     pub auto_switch_gift_order: String,
     pub auto_switch_model_fallback: bool,
+    pub auto_archive_dead_hours: u32,
+    pub auto_archive_age_days: u32,
     pub auth_proxy_on: bool,
     pub auth_proxy_url: Option<String>,
     pub language: String,
@@ -2048,6 +2059,8 @@ pub fn get_state(paths: &Paths) -> Result<AppState, String> {
         auto_switch_gift_first: settings.auto_switch_gift_first(),
         auto_switch_gift_order: settings.auto_switch_gift_order(),
         auto_switch_model_fallback: settings.auto_switch_model_fallback(),
+        auto_archive_dead_hours: settings.auto_archive_dead_hours(),
+        auto_archive_age_days: settings.auto_archive_age_days(),
         auth_proxy_on: settings.auth_proxy_on.unwrap_or(false),
         auth_proxy_url: settings.auth_proxy_url.clone(),
         language: crate::i18n::current().as_str().to_string(),

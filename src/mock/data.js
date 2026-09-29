@@ -169,6 +169,8 @@ const state = {
   auto_switch_gift_first: true,
   auto_switch_gift_order: "auto",
   auto_switch_model_fallback: true,
+  auto_archive_dead_hours: 0,
+  auto_archive_age_days: 0,
   auth_proxy_on: false,
   auth_proxy_url: null,
   language: "zh",

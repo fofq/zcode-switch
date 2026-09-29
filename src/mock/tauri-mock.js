@@ -153,6 +153,7 @@ const commands = {
       autoSwitchThreshold: "auto_switch_threshold", autoSwitchModel: "auto_switch_model",
       autoSwitchGiftFirst: "auto_switch_gift_first", autoSwitchGiftOrder: "auto_switch_gift_order",
       autoSwitchModelFallback: "auto_switch_model_fallback",
+      autoArchiveDeadHours: "auto_archive_dead_hours", autoArchiveAgeDays: "auto_archive_age_days",
     };
     for (const [k, v] of Object.entries(patch)) {
       if (k in map) mockState[map[k]] = v;

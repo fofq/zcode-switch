@@ -780,6 +780,24 @@ function settingsFormHtml() {
       <div class="st-sec">${t("st.secAuto")}</div>
       ${stToggle("autoClaim", t("btn.autoClaim"), t("st.autoClaimDesc"), !!s.auto_claim)}
       ${stToggle("autoSwitch", t("as.label"), t("st.autoSwitchDesc"), !!s.auto_switch, stAutoSwitchExtra())}
+      <div class="st-row">
+        <div class="st-lab" title="${esc(t("st.autoArchiveDeadDesc"))}">${t("st.autoArchiveDead")}</div>
+        <div class="st-ctl">
+          <div class="lang-seg" role="radiogroup" aria-label="${esc(t("st.autoArchiveDead"))}">
+            ${[["0", "st.aaOff"], ["24", "st.aa24h"], ["72", "st.aa3d"], ["168", "st.aa7d"]].map(([v, k]) =>
+              `<button class="lang-opt${Number(s.auto_archive_dead_hours ?? 0) === Number(v) ? " on" : ""}" role="radio" aria-checked="${Number(s.auto_archive_dead_hours ?? 0) === Number(v)}" click="actions.stAutoArchive('dead', '${v}')">${esc(t(k))}</button>`).join("")}
+          </div>
+        </div>
+      </div>
+      <div class="st-row">
+        <div class="st-lab" title="${esc(t("st.autoArchiveAgeDesc"))}">${t("st.autoArchiveAge")}</div>
+        <div class="st-ctl">
+          <div class="lang-seg" role="radiogroup" aria-label="${esc(t("st.autoArchiveAge"))}">
+            ${[["0", "st.aaOff"], ["30", "st.aa30d"], ["90", "st.aa90d"], ["365", "st.aa365d"]].map(([v, k]) =>
+              `<button class="lang-opt${Number(s.auto_archive_age_days ?? 0) === Number(v) ? " on" : ""}" role="radio" aria-checked="${Number(s.auto_archive_age_days ?? 0) === Number(v)}" click="actions.stAutoArchive('age', '${v}')">${esc(t(k))}</button>`).join("")}
+          </div>
+        </div>
+      </div>
 
       <div class="st-sec">${t("st.secBehavior")}</div>
       ${stToggle("autostart", t("s.autostart"), t("s.autostartDesc"), !!autostartOn)}
@@ -1100,7 +1118,9 @@ function visibleAccounts() {
 
 /** 分组视图：自定义分组优先，未分组按"额度健康度"分桶 */
 function groupedListHtml(accounts, rowHtml, healthMap) {
-  const buckets = bucketAccounts(accounts, { localeTag: localeTag(), healthLabel }, healthMap);
+  // 归档号在归档视图里独立成组（停靠是用户决定，不混进额度健康度桶）
+  const buckets = bucketAccounts(accounts, { localeTag: localeTag(), healthLabel }, healthMap,
+    { isArchived: (a) => isArchived(a.id), archivedLabel: t("list.filterArchived") });
   // 体验：当前分组/筛选包含在用账号时，它所在分组提到最前、组内排第一；
   // 不在当前筛选里就不动（不会把在用账号塞进所有分组）
   const activeId = state?.active_account_id;
@@ -1146,7 +1166,7 @@ function chipsHtml(sum) {
         : giftChip ? t(giftChip[1]) : healthLabel(lv);
       // 冻结筛选的雪花用白色 SVG 图标（与礼物的 🎁 同为「符号先行」，但纯白）
       const icon = lv === "frozen" ? `<span class="snow-ic">${ic("snow", 12)}</span>`
-        : lv === "archived" ? `<span class="snow-ic">${ic("folder", 12)}</span>` : "";
+        : lv === "archived" ? `<span class="snow-ic">${ic("box", 12)}</span>` : "";
       return `<button class="chip${lv === "all" ? "" : " " + lv}${on ? " on" : ""}" aria-pressed="${on}" click="actions.setHealth('${lv}')">${icon}${esc(label)}<span class="chip-n">${n}</span></button>`;
     }).join("") + `</div>`;
 }
@@ -1417,10 +1437,12 @@ function bulkBarHtml() {
   const n = ids.length;
   if (!n) return "";
   const allFrozen = ids.every((id) => isFrozen(id));
+  const allArchived = ids.every((id) => isArchived(id));
   return `<div class="bulk-bar">
     <span class="bulk-n">${esc(t("list.selected", { n }))}</span>
     <span class="lh-sp"></span>
     <button class="btn-ghost has-ic" click="actions.doBulkFreeze(${allFrozen ? "false" : "true"})">${ic("snow", 13)} ${allFrozen ? t("list.bulkUnfreeze") : t("list.bulkFreeze")}</button>
+    <button class="btn-ghost has-ic" click="actions.doBulkArchive(${allArchived ? "false" : "true"})">${ic("box", 13)} ${allArchived ? t("list.bulkUnarchive") : t("list.bulkArchive")}</button>
     <button class="btn-ghost danger has-ic" click="actions.askBulkDelete()">${ic("x", 13)} ${t("list.bulkDelete")}</button>
     <button class="btn-ghost" click="actions.clearSelection()">${t("list.clearSel")}</button>
   </div>`;
@@ -1895,7 +1917,29 @@ const actions = {
     render();
     // 冻结在用账号 = 明确要求切走：立即触发自动切换
     if (freeze && state?.auto_switch && ids.some((id) => state?.accounts?.some((a) => a.id === id && a.is_active))) {
-      autoSwitchTick(true);
+      kickSwitchNow();
+    }
+  },
+
+  /** 批量归档/取消归档：与单个归档同语义（不自动刷新/领取/切换，手动保留）。
+   *  批量归档含在用号时同样触发立即切换；取消归档清领取冷却让其尽快回轮 */
+  doBulkArchive(archive) {
+    const ids = selectedIds();
+    if (!ids.length) return;
+    for (const id of ids) {
+      if (archive) archivedIds.add(id);
+      else {
+        archivedIds.delete(id);
+        delete autoClaimCooldown[id];
+      }
+    }
+    if (ids.length) saveArchived();
+    toast(t(archive ? "list.toastBulkArchived" : "list.toastBulkUnarchived", { n: ids.length }), "ok",
+      t(archive ? "m.archivedDetail" : "m.unarchivedDetail"));
+    render();
+    if (archive && state?.auto_switch && ids.some((id) => state?.accounts?.some((a) => a.id === id && a.is_active))) {
+      noteChanged(t("as.noteArchivedActive"));
+      kickSwitchNow();
     }
   },
 
@@ -2210,6 +2254,30 @@ const actions = {
     }
   },
 
+  /** 自动归档阈值（小时/天，0=关）：乐观更新 + set_behavior，失败回滚 */
+  async stAutoArchive(kind, v) {
+    const n = Math.max(0, Number(v) || 0);
+    const field = kind === "dead" ? "auto_archive_dead_hours" : "auto_archive_age_days";
+    const param = kind === "dead" ? "autoArchiveDeadHours" : "autoArchiveAgeDays";
+    const prev = Number(state?.[field] ?? 0);
+    if (n === prev) return;
+    if (state) state[field] = n;
+    render();
+    syncSettingsModal();
+    try {
+      await invoke("set_behavior", { [param]: n });
+      await refresh();
+      render();
+      syncSettingsModal();
+      if (n > 0) autoArchiveTick(); // 阈值收紧后立即评估一轮
+    } catch (e) {
+      if (state) state[field] = prev;
+      render();
+      syncSettingsModal();
+      toast(stripErr(e), "err");
+    }
+  },
+
   async stToggleProxy() {
     const input = document.querySelector(".st-panel .st-input.proxy");
     const url = (input?.value || "").trim() || state?.auth_proxy_url || null;
@@ -2335,25 +2403,38 @@ const actions = {
     try { await invoke("open_external", { url: "https://github.com/pjpv/zcode-switch" }); }
     catch (e) { toast(stripErr(e), "err"); }
   },
-  /** 手动冻结/解冻：冻结的账号单独分组，绝不参与自动切换（手动切换不受影响） */
+  /** 手动冻结/解冻：冻结的账号单独分组，绝不参与自动切换（手动切换不受影响）。
+   *  对自动冻结（风控停靠）的号点击冻结 = 升级为手动——用户拍板的停靠不被
+   *  自动解冻路径（探测/耗尽坐实）绕过，与批量冻结同语义；再次点击才解冻 */
   toggleFreeze(id) {
-    toggleFrozen(id);
-    // 解冻 = 重新入轮换：清干净自动冻结标记/风控计数/探测冷却，避免残留导致
-    // 此后无法再次自动冻结、或旧冷却压住新状态
-    if (!isFrozen(id)) {
+    const autoOnly = isFrozen(id) && !!autoFrozenAt[id];
+    if (autoOnly) {
       delete autoFrozenAt[id];
-      autoRiskStreak[id] = 0;
-      delete autoClaimCooldown[id];
       delete autoUnfreezeHits[id];
       delete autoUnfreezeEmpty[id];
       saveAutoFrozen();
+      // frozenIds 不动：从「系统停靠」原地变为「用户停靠」
+    } else {
+      toggleFrozen(id);
+      // 解冻 = 重新入轮换：清干净自动冻结标记/风控计数/探测冷却，避免残留导致
+      // 此后无法再次自动冻结、或旧冷却压住新状态
+      if (!isFrozen(id)) {
+        delete autoFrozenAt[id];
+        autoRiskStreak[id] = 0;
+        delete autoClaimCooldown[id];
+        delete autoUnfreezeHits[id];
+        delete autoUnfreezeEmpty[id];
+        saveAutoFrozen();
+      }
     }
     render();
     const name = accountName(id);
-    toast(t(isFrozen(id) ? "m.frozenToast" : "m.unfrozenToast", { name }), "ok", t("m.frozenDetail"));
+    const frozen = isFrozen(id);
+    toast(t(autoOnly ? "m.frozenUpgradeToast" : frozen ? "m.frozenToast" : "m.unfrozenToast", { name }), "ok",
+      t(autoOnly ? "m.frozenUpgradeDetail" : "m.frozenDetail"));
     // 冻结在用账号 = 明确要求切走：立即触发自动切换（manual 绕过冷却与保护窗）。
     // tick 撞上瞬态守卫（切换锁/在飞切换）时由 kickSwitchNow 重试，保证「立即」语义
-    if (isFrozen(id) && state?.auto_switch && state?.accounts?.some((a) => a.id === id && a.is_active)) {
+    if (frozen && state?.auto_switch && state?.accounts?.some((a) => a.id === id && a.is_active)) {
       noteChanged(t("as.noteFrozenActive"));
       kickSwitchNow();
     }
@@ -3754,7 +3835,7 @@ function render(force = false) {
         ${healthDotHtml(h)}
         ${slim ? "" : `<span class="notch" style="background:${notchColor(a.id)}"></span>`}
         <div class="row-main"${ui.density === "compact" ? ` click="actions.toggleRow(event)" title="${esc(slim ? t("list.expandTitle") : t("list.collapseTitle"))}"` : ""}>
-          <div class="row-name">${ui.density === "compact" ? `<span class="row-chev${slim ? "" : " open"}">${ic("chevDown", 12)}</span>` : ""}${tierBadgeFor(a.id)}<span class="rn-text" title="${esc(displayName)}">${giftBadgeFor(a.id)}${esc(displayName)}</span>${isArchived(a.id) ? `<span class="tag-arch" title="${esc(t("m.archivedDetail"))}">${t("list.archivedTag")}</span>` : ""}${a.has_user_info === false ? `<span class="tag-relogin" title="${esc(t("btn.reloginTitle"))}">${t("btn.relogin")}</span>` : ""}${expSoon}</div>
+          <div class="row-name">${ui.density === "compact" ? `<span class="row-chev${slim ? "" : " open"}">${ic("chevDown", 12)}</span>` : ""}${tierBadgeFor(a.id)}<span class="rn-text" title="${esc(displayName)}">${giftBadgeFor(a.id)}${esc(displayName)}</span>${isFrozen(a.id) && autoFrozenAt[a.id] ? `<span class="tag-risk" title="${esc(t("m.tagRiskTitle"))}">${t("list.riskTag")}</span>` : ""}${isArchived(a.id) ? `<span class="tag-arch" title="${esc(t("m.archivedDetail"))}">${t("list.archivedTag")}</span>` : ""}${a.has_user_info === false ? `<span class="tag-relogin" title="${esc(t("btn.reloginTitle"))}">${t("btn.relogin")}</span>` : ""}${expSoon}</div>
           <div class="row-meta">${meta}</div>
         </div>
         <div class="row-info">${showChip ? quotaChipHtml(a.id, h) : ""}</div>
@@ -3762,8 +3843,8 @@ function render(force = false) {
           <span class="row-tools">
             <span class="claim-slot" data-claim-slot></span>
             <button class="icon-btn" title="${t("btn.copyKey")}" aria-label="${t("btn.copyKey")}" click="actions.copyApiKey('${a.id}')">${ic("copy", 15)}</button>
-            <button class="icon-btn${isFrozen(a.id) ? " on" : ""}" title="${isFrozen(a.id) ? t("btn.unfreeze") : t("btn.freeze")}" aria-label="${isFrozen(a.id) ? t("btn.unfreeze") : t("btn.freeze")}" click="actions.toggleFreeze('${a.id}')">${ic("snow", 15)}</button>
-            <button class="icon-btn${isArchived(a.id) ? " on" : ""}" title="${isArchived(a.id) ? t("btn.unarchive") : t("btn.archive")}" aria-label="${isArchived(a.id) ? t("btn.unarchive") : t("btn.archive")}" click="actions.toggleArchive('${a.id}')">${ic("folder", 15)}</button>
+            <button class="icon-btn${isFrozen(a.id) ? " on" : ""}" title="${isFrozen(a.id) ? (autoFrozenAt[a.id] ? t("btn.freezeUpgrade") : t("btn.unfreeze")) : t("btn.freeze")}" aria-label="${isFrozen(a.id) ? (autoFrozenAt[a.id] ? t("btn.freezeUpgrade") : t("btn.unfreeze")) : t("btn.freeze")}" click="actions.toggleFreeze('${a.id}')">${ic("snow", 15)}</button>
+            <button class="icon-btn${isArchived(a.id) ? " on" : ""}" title="${isArchived(a.id) ? t("btn.unarchive") : t("btn.archive")}" aria-label="${isArchived(a.id) ? t("btn.unarchive") : t("btn.archive")}" click="actions.toggleArchive('${a.id}')">${ic("box", 15)}</button>
             <button class="icon-btn${acctQuota[a.id]?.busy ? " spinning" : ""}" title="${t("btn.refreshQuota")}" aria-label="${t("btn.refreshQuota")}" click="actions.acctQuota('${a.id}')">${ic("refresh", 15)}</button>
             <button class="icon-btn" title="${t("btn.rename")}" aria-label="${t("btn.rename")}" click="actions.rename('${a.id}')">${ic("pen", 15)}</button>
             <button class="icon-btn" title="${t("btn.export")}" aria-label="${t("btn.export")}" click="actions.exportOne('${a.id}')">${ic("export", 15)}</button>
@@ -3832,7 +3913,7 @@ function render(force = false) {
       <span class="notch" style="background:${notchColor(a.id)}"></span>
       <div class="card-head">
         <div class="card-id">
-          <div class="row-name">${seq != null ? `<span class="card-seq" title="${esc(t("list.seqTitle"))}">${seq}</span>` : ""}${giftBadgeFor(a.id)}<span class="rn-text" title="${esc(displayName)}">${esc(displayName)}</span>${isArchived(a.id) ? `<span class="tag-arch" title="${esc(t("m.archivedDetail"))}">${t("list.archivedTag")}</span>` : ""}</div>
+          <div class="row-name">${seq != null ? `<span class="card-seq" title="${esc(t("list.seqTitle"))}">${seq}</span>` : ""}${giftBadgeFor(a.id)}<span class="rn-text" title="${esc(displayName)}">${esc(displayName)}</span>${isFrozen(a.id) && autoFrozenAt[a.id] ? `<span class="tag-risk" title="${esc(t("m.tagRiskTitle"))}">${t("list.riskTag")}</span>` : ""}${isArchived(a.id) ? `<span class="tag-arch" title="${esc(t("m.archivedDetail"))}">${t("list.archivedTag")}</span>` : ""}</div>
           <div class="row-meta">${meta}</div>
         </div>
         <span class="card-side">
@@ -3847,8 +3928,8 @@ function render(force = false) {
         <span class="claim-slot" data-claim-slot></span>
         <span class="card-tools" click="actions.noop()">
           <button class="icon-btn sm" title="${t("btn.copyKey")}" aria-label="${t("btn.copyKey")}" click="actions.copyApiKey('${a.id}')">${ic("copy", 14)}</button>
-          <button class="icon-btn sm${isFrozen(a.id) ? " on" : ""}" title="${isFrozen(a.id) ? t("btn.unfreeze") : t("btn.freeze")}" aria-label="${isFrozen(a.id) ? t("btn.unfreeze") : t("btn.freeze")}" click="actions.toggleFreeze('${a.id}')">${ic("snow", 14)}</button>
-          <button class="icon-btn sm${isArchived(a.id) ? " on" : ""}" title="${isArchived(a.id) ? t("btn.unarchive") : t("btn.archive")}" aria-label="${isArchived(a.id) ? t("btn.unarchive") : t("btn.archive")}" click="actions.toggleArchive('${a.id}')">${ic("folder", 14)}</button>
+          <button class="icon-btn sm${isFrozen(a.id) ? " on" : ""}" title="${isFrozen(a.id) ? (autoFrozenAt[a.id] ? t("btn.freezeUpgrade") : t("btn.unfreeze")) : t("btn.freeze")}" aria-label="${isFrozen(a.id) ? (autoFrozenAt[a.id] ? t("btn.freezeUpgrade") : t("btn.unfreeze")) : t("btn.freeze")}" click="actions.toggleFreeze('${a.id}')">${ic("snow", 14)}</button>
+          <button class="icon-btn sm${isArchived(a.id) ? " on" : ""}" title="${isArchived(a.id) ? t("btn.unarchive") : t("btn.archive")}" aria-label="${isArchived(a.id) ? t("btn.unarchive") : t("btn.archive")}" click="actions.toggleArchive('${a.id}')">${ic("box", 14)}</button>
           <button class="icon-btn sm${acctQuota[a.id]?.busy ? " spinning" : ""}" title="${t("btn.refreshQuota")}" aria-label="${t("btn.refreshQuota")}" click="actions.acctQuota('${a.id}')">${ic("refresh", 14)}</button>
           <button class="icon-btn sm" title="${t("btn.rename")}" aria-label="${t("btn.rename")}" click="actions.rename('${a.id}')">${ic("pen", 14)}</button>
           <button class="icon-btn sm" title="${t("btn.export")}" aria-label="${t("btn.export")}" click="actions.exportOne('${a.id}')">${ic("export", 14)}</button>
@@ -4131,6 +4212,60 @@ function isArchived(id) { return archivedIds.has(id); }
 function toggleArchived(id) {
   if (archivedIds.has(id)) archivedIds.delete(id); else archivedIds.add(id);
   saveArchived();
+}
+
+// ---- 自动归档规则 ----
+// 耗尽时长追踪（持久化）：账号进入「额度耗尽」的时刻，规则开启后从该时刻起算；
+// 数据面恢复（重新拿到额度/待激活）即清除。规则关闭时不追踪，开启时以当下为起点。
+const DEAD_SINCE_KEY = "zsw-dead-since-v1";
+let deadSince = (() => {
+  try { return JSON.parse(localStorage.getItem(DEAD_SINCE_KEY) || "{}"); }
+  catch { return {}; }
+})();
+function saveDeadSince() {
+  try { localStorage.setItem(DEAD_SINCE_KEY, JSON.stringify(deadSince)); } catch { /* 忽略 */ }
+}
+function autoArchiveTick() {
+  const deadH = Number(state?.auto_archive_dead_hours ?? 0);
+  const ageD = Number(state?.auto_archive_age_days ?? 0);
+  const now = Date.now();
+  let tracking = false;
+  for (const a of state?.accounts || []) {
+    if (isArchived(a.id)) { if (deadSince[a.id]) { delete deadSince[a.id]; tracking = true; } continue; }
+    if (deadH <= 0) break; // deadSince 只为耗尽规则服务
+    // 在用号与手动冻结号不自动归档：前者正在使用，后者是用户拍板的停靠（语义是可恢复的探测，不是退役）
+    if (a.is_active || (isFrozen(a.id) && !autoFrozenAt[a.id])) continue;
+    const h = healthMapOf().get(a.id);
+    if (h?.level === "dead") {
+      if (!deadSince[a.id]) { deadSince[a.id] = now; tracking = true; }
+    } else if (deadSince[a.id]) {
+      // 只有拿到「非 dead 的真实数据」才清时钟：启动加载期/查询中的 unknown 态
+      // 不算恢复（否则每次重启都会把耗尽时钟清零，24h 规则永远等不满）
+      const q = acctQuota[a.id];
+      if (q?.data && !q.busy && !q.err) { delete deadSince[a.id]; tracking = true; }
+    }
+  }
+  if (tracking) saveDeadSince();
+  if (deadH <= 0 && ageD <= 0) return;
+  const hits = [];
+  for (const a of state?.accounts || []) {
+    if (isArchived(a.id) || a.is_active) continue;
+    if (isFrozen(a.id) && !autoFrozenAt[a.id]) continue;
+    if (ageD > 0) {
+      const created = Date.parse(String(a.created_at || "").replace(" ", "T"));
+      if (isFinite(created) && now - created >= ageD * 86_400e3) { hits.push([a.id, "age"]); continue; }
+    }
+    if (deadH > 0 && deadSince[a.id] && now - deadSince[a.id] >= deadH * 3_600e3) {
+      hits.push([a.id, "dead"]);
+    }
+  }
+  if (!hits.length) return;
+  for (const [id] of hits) archivedIds.add(id);
+  saveArchived();
+  const names = hits.map(([id]) => accountName(id)).slice(0, 3).join(t("common.listSep"));
+  toast(t("m.autoArchivedToast", { n: hits.length }), "ok",
+    t("m.autoArchivedDetail", { names }) + t("m.autoArchivedHint"));
+  render();
 }
 
 // 额度状态持久化：重启不丢「上次已知额度/烧速样本」，启动按优先级补刷而不是全量同时打接口
@@ -4499,6 +4634,12 @@ async function doAutoSwitch(d, active, cur, lg) {
     let target = null;
     let preflights = 0;
     for (const c of d.ranked || []) {
+      // 切换瞬间的硬闸：候选评估与真正切换之间隔着预校验（秒级），期间用户冻结/
+      // 归档了该号就必须跳过——「停靠的号绝不接收自动切换」不依赖评估时刻的快照
+      if (isFrozen(c.id) || isArchived(c.id)) {
+        asAuditPush("skip-parked", { id: c.id, reason: isFrozen(c.id) ? "frozen" : "archived" });
+        continue;
+      }
       if (c.ageMs > ageLimit) {
         // 重活窗口也保底 1 次预校验（只够榜首）：彻底禁用会让切换在窗口期完全饿死
         if (preflights >= (heavy ? 1 : AS_DEFAULTS.maxPreflight)) continue;
@@ -4549,6 +4690,11 @@ async function doAutoSwitch(d, active, cur, lg) {
       lastAutoSwitchAt = Date.now();
       recentFrom.set(active.id, Date.now());
       ui.expanded.delete(best.id);
+      // 落地复核：极端竞态下（切换在飞时该号被冻结/归档）立即再切走，不停靠在用户拍板的号上
+      if (isFrozen(best.id) || isArchived(best.id)) {
+        asAuditPush("switch-parked-undo", { to: best.id });
+        setTimeout(() => kickSwitchNow(), 300);
+      }
       const bits = [];
       if (r?.hot) bits.push(t("m.bitHot"));
       if (r?.launched) bits.push(t("m.bitLaunched"));
@@ -4685,6 +4831,7 @@ async function sweepTick() {
       }).catch(() => {});
     }, 5000);
     setInterval(sweepTick, TICK_MS);
+    setInterval(autoArchiveTick, 60 * 1000);
     setInterval(() => flushQuotaCache(), 30 * 1000);
     window.addEventListener("pagehide", () => flushQuotaCache(true));
     window.addEventListener("beforeunload", () => flushQuotaCache(true));

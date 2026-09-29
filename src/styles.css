@@ -1517,6 +1517,17 @@ select.two-input { cursor: pointer; }
   padding: 0 4px;
   flex: none;
 }
+/* 风控标记：系统自动停靠（区别于用户手动冻结） */
+.tag-risk {
+  font-family: var(--mono);
+  font-size: 11.5px;
+  letter-spacing: .1em;
+  color: var(--amber);
+  border: 1px solid var(--amber-deep);
+  border-radius: 3px;
+  padding: 0 4px;
+  flex: none;
+}
 .row.archived:not(.active) .rn-text, .card.archived:not(.active) .rn-text { opacity: .55; }
 .row.archived:not(.active) .row-meta, .card.archived:not(.active) .row-meta { opacity: .7; }
 

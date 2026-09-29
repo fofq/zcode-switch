@@ -429,22 +429,26 @@ export function sortAccounts(accounts, sort, healthMap, localeTag = "zh-CN", opt
  * 分组：按健康度分桶（自定义分组已移除）。
  * 返回 [{ key, label, kind: 'health', items: [] }]，顺序按 HEALTH_ORDER。
  */
-export function bucketAccounts(accounts, { localeTag = "zh-CN", healthLabel = () => "" } = {}, healthMap) {
+export function bucketAccounts(accounts, { localeTag = "zh-CN", healthLabel = () => "" } = {}, healthMap, opts = {}) {
+  const isArchived = opts.isArchived || (() => false);
+  const archivedLabel = opts.archivedLabel || "";
   const buckets = new Map();
   for (const a of accounts) {
-    const h = healthMap?.get(a.id)?.level || "unknown";
+    // 归档独立分组：停靠是用户决定，不混进额度健康度桶（归档视图里所有号进同一组）
+    const arch = isArchived(a);
+    const h = arch ? "archived" : (healthMap?.get(a.id)?.level || "unknown");
     const key = `h:${h}`;
     if (!buckets.has(key)) {
       buckets.set(key, {
         key,
-        label: healthLabel(h),
+        label: arch ? archivedLabel : healthLabel(h),
         kind: "health",
         items: [],
       });
     }
     buckets.get(key).items.push(a);
   }
-  return HEALTH_ORDER.map((lv) => buckets.get(`h:${lv}`)).filter(Boolean);
+  return ["archived", ...HEALTH_ORDER].map((lv) => buckets.get(`h:${lv}`)).filter(Boolean);
 }
 
 /**

@@ -1117,6 +1117,8 @@ async fn set_behavior(
     auto_switch_gift_first: Option<bool>,
     auto_switch_gift_order: Option<String>,
     auto_switch_model_fallback: Option<bool>,
+    auto_archive_dead_hours: Option<u32>,
+    auto_archive_age_days: Option<u32>,
 ) -> Result<(), String> {
     let _guard = store_guard();
     let paths = Paths::detect();
@@ -1162,6 +1164,13 @@ async fn set_behavior(
     }
     if let Some(v) = auto_switch_model_fallback {
         s.auto_switch_model_fallback = Some(v);
+    }
+    // 自动归档阈值：0=关，范围交给 Settings getter 统一 clamp
+    if let Some(v) = auto_archive_dead_hours {
+        s.auto_archive_dead_hours = Some(v);
+    }
+    if let Some(v) = auto_archive_age_days {
+        s.auto_archive_age_days = Some(v);
     }
     let r = save_settings(&paths, &s);
     rebuild_tray(&app);
