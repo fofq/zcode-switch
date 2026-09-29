@@ -345,10 +345,16 @@ export function matchesSearch(acct, query) {
 
 /**
  * 搜索 + 健康度筛选。
+ * 归档是停靠维度：账号只出现在「已归档」筛选里，其余视图（含全部）一律隐藏。
  * @param healthMap Map<id, {level, remainingPct}>
+ * @param opts {{isArchived?: (a) => boolean}} 归档判定（由调用方注入，保持本模块无状态）
  */
-export function filterAccounts(accounts, { search = "", health = "all" } = {}, healthMap) {
+export function filterAccounts(accounts, { search = "", health = "all" } = {}, healthMap, opts = {}) {
+  const isArchived = opts.isArchived || (() => false);
   return (accounts || []).filter((a) => {
+    const arch = isArchived(a);
+    if (health === "archived") return arch && matchesSearch(a, search);
+    if (arch) return false;
     if (health !== "all") {
       const h = healthMap?.get(a.id);
       if (health.startsWith("gift:")) {
@@ -443,12 +449,15 @@ export function bucketAccounts(accounts, { localeTag = "zh-CN", healthLabel = ()
 
 /**
  * 合计：各健康度计数 + 平均剩余额度百分比（仅统计已拿到额度的账号，单位无关）。
+ * 归档号不计入健康度/礼物/均值，只进 counts.archived（它们在别的筛选里不可见）。
  */
-export function summarize(accounts, healthMap) {
-  const counts = { "gift:weekend": 0, "gift:global": 0, "gift:trust": 0, frozen: 0, ok: 0, low: 0, flowed: 0, dead: 0, pending: 0, auth: 0, fail: 0, unknown: 0 };
+export function summarize(accounts, healthMap, opts = {}) {
+  const counts = { "gift:weekend": 0, "gift:global": 0, "gift:trust": 0, frozen: 0, ok: 0, low: 0, flowed: 0, dead: 0, pending: 0, auth: 0, fail: 0, unknown: 0, archived: 0 };
+  const isArchived = opts.isArchived || (() => false);
   let pctSum = 0;
   let pctCount = 0;
   for (const a of accounts || []) {
+    if (isArchived(a)) { counts.archived++; continue; }
     const h = healthMap?.get(a.id);
     const lv = h?.level || "unknown";
     if (counts[lv] == null) counts.unknown++;

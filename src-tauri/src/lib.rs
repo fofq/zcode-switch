@@ -434,10 +434,18 @@ async fn claim_start(
     let mid = store::ensure_virtual_device_mid(&paths, &id)?;
     let acc = load_account(&paths, &id)?;
     let plans = claim::preview_plans(&paths.home, &acc.credentials, acc.config.as_ref(), Some(mid.clone()))?;
-    let plan = plans
-        .iter()
-        .find(|p| p.plan_id == plan_id)
-        .ok_or_else(|| i18n::tr("err.claim.gone"))?;
+    let plan = match plans.iter().find(|p| p.plan_id == plan_id) {
+        Some(p) => p,
+        None => {
+            // 报价已撤（礼包跨期轮换/资格变动）：把最新 preview 随错误带回 JSON 载荷，
+            // 前端就地把礼盒图标校准成真——不「点一次错一次」，也不必再发第三次 preview
+            return Err(serde_json::json!({
+                "gone": i18n::tr("err.claim.gone"),
+                "plans": &plans,
+            })
+            .to_string());
+        }
+    };
     let display = if plan.name.is_empty() { plan.plan_id.clone() } else { plan.name.clone() };
 
     *pending_guard() = Some(PendingClaim {

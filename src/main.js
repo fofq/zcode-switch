@@ -122,7 +122,7 @@ function claimTierCapMs(tier) {
 let claimUrgent = {};
 // 切号/入库后统一入口：清冷却 + 稍后 tick（轮次忙则下个 tick 以 T0 优先接续）
 function armClaimCheck(id) {
-  if (!id) return;
+  if (!id || isArchived(id)) return; // 归档号不主动领取
   claimUrgent[id] = true;
   autoClaimCooldown[id] = 0;
   setTimeout(() => autoClaimTick(), 4000);
@@ -168,6 +168,7 @@ function scheduleGiftCascade(planId, planName) {
   let n = 0;
   for (const a of state?.accounts || []) {
     const id = a.id;
+    if (isArchived(id)) continue; // 归档号不级联（用户决定停靠，不参与任何自动领取）
     const led = claimLedger[id] || {};
     if (fam === "global" ? led.global : led[fam] === planId) continue;
     if (isFrozen(id) && !autoFrozenAt[id]) continue;
@@ -1089,7 +1090,8 @@ function pinActiveFirst(list) {
 function visibleAccounts() {
   const hm = healthMapOf();
   const list = sortAccounts(
-    filterAccounts(state?.accounts || [], { search: ui.search, health: ui.health }, hm),
+    // list.js 的注入约定是「收账号对象」，这里包一层转成 id 判定
+    filterAccounts(state?.accounts || [], { search: ui.search, health: ui.health }, hm, { isArchived: (a) => isArchived(a.id) }),
     ui.sort, hm, localeTag(),
     { threshold: Number(state?.auto_switch_threshold ?? 15), dir: ui.sortDir, keyOf: (a) => sortKeyValue(a, ui.sort) },
   );
@@ -1131,17 +1133,20 @@ function groupedListHtml(accounts, rowHtml, healthMap) {
 const GIFT_CHIPS = [["gift:weekend", "grp.health.giftWeekend"], ["gift:global", "grp.health.giftGlobal"], ["gift:trust", "grp.health.giftTrust"]];
 
 function chipsHtml(sum) {
-  // 礼物是正交筛选维度，按活动细分（Weekend/Global Build），永远排在最前
+  // 礼物是正交筛选维度，按活动细分（Weekend/Global Build），永远排在最前；归档是停靠维度，随其后
   const giftLv = GIFT_CHIPS.map(([lv]) => lv);
-  const levels = ["all", ...[...giftLv, ...HEALTH_ORDER].filter((lv) => lv === ui.health || (sum.counts[lv] ?? 0) > 0)];
+  const levels = ["all", ...[...giftLv, "archived", ...HEALTH_ORDER].filter((lv) => lv === ui.health || (sum.counts[lv] ?? 0) > 0)];
   return `<div class="chips" role="group" aria-label="${esc(t("list.filterLabel"))}">` +
     levels.map((lv) => {
       const on = ui.health === lv;
       const n = lv === "all" ? (state?.accounts || []).length : sum.counts[lv];
       const giftChip = GIFT_CHIPS.find(([k]) => k === lv);
-      const label = lv === "all" ? t("list.filterAll") : giftChip ? t(giftChip[1]) : healthLabel(lv);
+      const label = lv === "all" ? t("list.filterAll")
+        : lv === "archived" ? t("list.filterArchived")
+        : giftChip ? t(giftChip[1]) : healthLabel(lv);
       // 冻结筛选的雪花用白色 SVG 图标（与礼物的 🎁 同为「符号先行」，但纯白）
-      const icon = lv === "frozen" ? `<span class="snow-ic">${ic("snow", 12)}</span>` : "";
+      const icon = lv === "frozen" ? `<span class="snow-ic">${ic("snow", 12)}</span>`
+        : lv === "archived" ? `<span class="snow-ic">${ic("folder", 12)}</span>` : "";
       return `<button class="chip${lv === "all" ? "" : " " + lv}${on ? " on" : ""}" aria-pressed="${on}" click="actions.setHealth('${lv}')">${icon}${esc(label)}<span class="chip-n">${n}</span></button>`;
     }).join("") + `</div>`;
 }
@@ -1514,9 +1519,9 @@ async function loadAcctQuota(id, opts = {}) {
     const prevHadQuota = (cur.data?.plans || []).some(hasRem) || hasRem(cur.data);
     if (emptySnap && prevHadQuota) {
       const tries = (quotaFlapRetry[id] = (quotaFlapRetry[id] || 0) + 1);
-      if (tries <= 3) {
+      if (tries <= 3 && !isArchived(id)) {
         setTimeout(() => { loadAcctQuota(id, { force: true }).finally(() => scheduleNext(id)); }, 2500 + Math.random() * 3000);
-      } else {
+      } else if (!isArchived(id)) {
         quotaDue[id] = Date.now() + 25 * 60e3 + Math.random() * 10 * 60e3;
       }
       // 数据面不变：保留旧数据并清掉 entry 时挂上的 busy（否则 20s 内 sweep 全部跳过
@@ -1563,7 +1568,8 @@ async function loadAcctQuota(id, opts = {}) {
     if (autoFrozenAt[id]) { autoUnfreezeHits[id] = 0; autoUnfreezeEmpty[id] = 0; }
     // 拉取失败（429/3012/网络）→ 指数退避（6s → 12s → 24s → …上限 30 分钟；成功清零），
     // 持续失败的账号不再以 6s 频率轰炸接口；活跃号 hardDown 只需连续 2 次失败，仍可在 ~20s 内触发
-    quotaDue[id] = Date.now() + failBackoffMs(quotaFailStreak[id]);
+    // 归档号不排自动重试（手动刷新是它唯一的拉取来源）
+    if (!isArchived(id)) quotaDue[id] = Date.now() + failBackoffMs(quotaFailStreak[id]);
   }
   if (!uiLocked()) render();
   // 任意账号的额度数据更新 → 立即跑一次切换判定（目标账号拿到额度/当前账号耗尽都能秒级反应）
@@ -1592,6 +1598,18 @@ function waitForClaimResult(accountId, timeoutMs = 90000) {
     const t = setTimeout(() => finish(null), timeoutMs);
     claimWaiter = { accountId, finish };
   });
+}
+
+// claim_start「报价已撤」载荷：后端重新 preview 发现目标 plan 不在时，
+// 把最新报价以 {gone, plans} JSON 随错误带回——调用方就地把 claimable 校准成真，
+// 礼盒图标免刷新自愈（礼包跨期轮换后不再「点一次错一次」），也不必再发第三次 preview
+function claimGonePayload(e) {
+  const s = String(e || "");
+  if (!s.startsWith("{")) return null;
+  try {
+    const v = JSON.parse(s);
+    return v && typeof v.gone === "string" && Array.isArray(v.plans) ? v : null;
+  } catch { return null; }
 }
 
 // 手动操作抢占自动领取轮：立即终结进行中的等待、取消挂起领取、
@@ -1777,7 +1795,7 @@ const actions = {
   },
 
   setHealth(lv) {
-    ui.health = (lv.startsWith("gift:") || HEALTH_ORDER.includes(lv)) ? lv : "all";
+    ui.health = (lv === "archived" || lv.startsWith("gift:") || HEALTH_ORDER.includes(lv)) ? lv : "all";
     render();
   },
 
@@ -1899,7 +1917,7 @@ const actions = {
       quotaSweep.cancel = true;
       return;
     }
-    const ids = (state?.accounts || []).map((a) => a.id);
+    const ids = (state?.accounts || []).filter((a) => !isArchived(a.id)).map((a) => a.id);
     if (!ids.length) return;
     // 当前使用中的账号优先刷新：全库刷新一个周期很久，而决定“要不要切”的正是活跃账号
     const act = (state?.accounts || []).find((a) => a.is_active);
@@ -1968,8 +1986,9 @@ const actions = {
       delete acctQuota[id]; delete quotaHist[id]; delete quotaSampleAt[id];
       delete quotaDue[id]; delete quotaFailStreak[id]; delete quotaForceAt[id];
       delete autoClaimCooldown[id]; delete autoClaimEmptyRounds[id]; delete autoClaimFailRounds[id]; delete autoFrozenAt[id]; delete autoRiskStreak[id]; delete autoRiskLastAt[id]; delete autoUnfreezeHits[id]; delete autoUnfreezeEmpty[id]; delete claimable[id];
-      // 冻结集合是 localStorage 持久化的：不删会让已删号的 id 永久残留
+      // 冻结/归档集合是 localStorage 持久化的：不删会让已删号的 id 永久残留
       frozenIds.delete(id); saveFrozen();
+      archivedIds.delete(id); saveArchived();
       ui.selected.delete(id); ui.expanded.delete(id);
       markQuotaCacheDirty(); flushQuotaCache(true);
       toast(t("m.toastDeleted"));
@@ -2332,10 +2351,33 @@ const actions = {
     render();
     const name = accountName(id);
     toast(t(isFrozen(id) ? "m.frozenToast" : "m.unfrozenToast", { name }), "ok", t("m.frozenDetail"));
-    // 冻结在用账号 = 明确要求切走：立即触发自动切换（manual 绕过冷却与保护窗）
+    // 冻结在用账号 = 明确要求切走：立即触发自动切换（manual 绕过冷却与保护窗）。
+    // tick 撞上瞬态守卫（切换锁/在飞切换）时由 kickSwitchNow 重试，保证「立即」语义
     if (isFrozen(id) && state?.auto_switch && state?.accounts?.some((a) => a.id === id && a.is_active)) {
       noteChanged(t("as.noteFrozenActive"));
-      autoSwitchTick(true);
+      kickSwitchNow();
+    }
+  },
+
+  /** 归档/取消归档：归档 = 彻底停靠——不自动刷新额度、不参与自动领取/级联/一键领取、
+   *  不作为自动切换候选；只保留手动刷新与手动领取（随时可手动看一眼有没有新礼物）。
+   *  归档在用账号 = 明确要求切走，立即触发自动切换（与冻结同路径） */
+  toggleArchive(id) {
+    const wasActive = state?.accounts?.some((a) => a.id === id && a.is_active);
+    toggleArchived(id);
+    if (!isArchived(id)) {
+      // 取消归档 = 重新入轮：立刻安排一次额度刷新，领取冷却清零让轮次尽快接续
+      pokeAccount(id);
+      delete autoClaimCooldown[id];
+    }
+    render();
+    const name = accountName(id);
+    const arch = isArchived(id);
+    toast(t(arch ? "m.archivedToast" : "m.unarchivedToast", { name }), "ok",
+      t(arch ? "m.archivedDetail" : "m.unarchivedDetail"));
+    if (arch && wasActive && state?.auto_switch) {
+      noteChanged(t("as.noteArchivedActive"));
+      kickSwitchNow();
     }
   },
 
@@ -2585,8 +2627,18 @@ const actions = {
       if (!r) toast(t("m.claimTimeout"), "warn");
       else pokeAccount(id);
     } catch (e) {
-      if (riskInText(stripErr(e))) noteClaimRisk(id);
-      toast(stripErr(e), "err");
+      const gone = claimGonePayload(e);
+      if (gone) {
+        // 报价已撤：用后端带回的最新 preview 就地校准（换期新实例可能就在其中），图标随之修正
+        claimable[id] = { plans: gone.plans, err: null, busy: false };
+        render();
+        toast(gone.gone, "err");
+      } else {
+        if (riskInText(stripErr(e))) noteClaimRisk(id);
+        toast(stripErr(e), "err");
+        // 手动节奏下的单次复核：1002「活动已结束」这类服务端确定性拒绝后，死图标立刻消失
+        awaitClaimPreviewFresh(id).then(() => { if (!uiLocked()) render(); });
+      }
     } finally {
       claimActive = false;
       // 被抢占的自动轮：手动领取结束后尽快续跑余下账号
@@ -2604,7 +2656,7 @@ const actions = {
     const ids = accountsNewFirst(
       (state?.accounts || [])
         .map((a) => a.id)
-        .filter((id) => (claimable[id]?.plans || []).length > 0),
+        .filter((id) => !isArchived(id) && (claimable[id]?.plans || []).length > 0),
     ).sort((x, y) => claimTierOf(x) - claimTierOf(y)); // 同自动轮：当前号优先，同层内新号优先
     if (!ids.length) { toast(t("m.noClaimableAccounts"), "warn"); return; }
     if (claimActive && !autoClaimRunning) return;
@@ -2631,6 +2683,13 @@ const actions = {
         try {
           await invoke("claim_start", { id, planId: plan.plan_id });
         } catch (e) {
+          const gone = claimGonePayload(e);
+          if (gone) {
+            // 报价已撤：就地校准、静默出列——跨期僵尸报价一次批处理全部清干净，
+            // 不逐号弹「已不可领取」刷屏，也不进失败冷却（号本身没问题）
+            claimable[id] = { plans: gone.plans, err: null, busy: false };
+            continue;
+          }
           if (riskInText(stripErr(e))) noteClaimRisk(id);
           toast(t("m.claimAccountErr", { name, err: stripErr(e) }), "err");
           // 单账号失败：该号进入冷却，批次继续（一个号的问题不代表其他号）
@@ -2899,10 +2958,10 @@ async function autoClaimTick() {
   const ids = accountsNewFirst(
     (state.accounts || [])
       .map((a) => a.id)
-      .filter((id) => (autoClaimCooldown[id] ?? 0) <= Date.now()),
+      .filter((id) => !isArchived(id) && (autoClaimCooldown[id] ?? 0) <= Date.now()),
   ).sort((x, y) => claimTierOf(x) - claimTierOf(y)).slice(0, AUTO_CLAIM_ROUND_CAP);
   if (!ids.length) {
-    if ((state.accounts || []).some((a) => (claimable[a.id]?.plans || []).length > 0)) {
+    if ((state.accounts || []).some((a) => !isArchived(a.id) && (claimable[a.id]?.plans || []).length > 0)) {
       lastAutoRound = { at: Date.now(), claimed: 0, skipped: 0, cooldownAll: true };
     }
     return;
@@ -2952,6 +3011,13 @@ async function autoClaimTick() {
             break;
           }
         } catch (e) {
+          const gone = claimGonePayload(e);
+          if (gone) {
+            // 报价在轮内 preview 与 claim_start 之间被上游撤掉：就地校准，不计失败
+            // 不升级冷却（号本身没问题，最新报价交给下一轮按正常节奏接续）
+            claimable[id] = { plans: gone.plans, err: null, busy: false };
+            break;
+          }
           if (riskInText(stripErr(e))) { noteClaimRisk(id); noteFleetRiskFail(); }
           await invoke("claim_cancel").catch(() => {});
           // 抛错（405 风控拦截等）与提交失败同谱升级：30min→2^n 封顶 4h，
@@ -3474,7 +3540,7 @@ function patchProgressDom() {
         ${ic("refresh", 17)}${refreshAllBadge()}
       </button>`);
   }
-  const claimableCount = (state?.accounts || []).filter((a) => (claimable[a.id]?.plans || []).length > 0).length;
+  const claimableCount = (state?.accounts || []).filter((a) => !isArchived(a.id) && (claimable[a.id]?.plans || []).length > 0).length;
   if (claimableCount > 0 || claimAllState.running) {
     replace("[data-gift-btn]", giftBtnHtml(claimableCount));
   }
@@ -3483,7 +3549,7 @@ function patchProgressDom() {
 /** 结构未变、仅额度数据变化时的精准补丁：只就地更新额度相关 DOM，宽度/滚动零扰动 */
 function patchQuotaDom() {
   const { list: visible, hm } = visibleAccounts();
-  const sum = summarize(state?.accounts || [], hm);
+  const sum = summarize(state?.accounts || [], hm, { isArchived: (a) => isArchived(a.id) });
   const replace = (sel, html) => {
     const el = $app.querySelector(sel);
     if (!el) return;
@@ -3628,7 +3694,7 @@ function render(force = false) {
       : t("m.status.loggedOut");
 
   const { list: visible, hm: healthMap } = visibleAccounts();
-  const sum = summarize(s.accounts, healthMap);
+  const sum = summarize(s.accounts, healthMap, { isArchived: (a) => isArchived(a.id) });
 
   const rowHtml = (a, seq) => {
     const h = healthMap.get(a.id) || { level: "unknown", remainingPct: null };
@@ -3681,14 +3747,14 @@ function render(force = false) {
       || t("list.unnamed");
     const seqBadge = seq != null ? `<span class="row-seq" title="${esc(t("list.seqTitle"))}">${seq}</span>` : "";
     return `
-    <div class="row${isActive ? " active" : ""}${checked ? " picked" : ""}${slim ? " slim" : ""}" data-id="${a.id}">
+    <div class="row${isActive ? " active" : ""}${checked ? " picked" : ""}${slim ? " slim" : ""}${isArchived(a.id) ? " archived" : ""}" data-id="${a.id}">
       <div class="row-top">
         ${seqBadge}
         <span class="rchk" role="checkbox" aria-checked="${checked}" title="${esc(t("list.selectHint"))}" click="actions.toggleSelect('${a.id}')">${ic("check", 11)}</span>
         ${healthDotHtml(h)}
         ${slim ? "" : `<span class="notch" style="background:${notchColor(a.id)}"></span>`}
         <div class="row-main"${ui.density === "compact" ? ` click="actions.toggleRow(event)" title="${esc(slim ? t("list.expandTitle") : t("list.collapseTitle"))}"` : ""}>
-          <div class="row-name">${ui.density === "compact" ? `<span class="row-chev${slim ? "" : " open"}">${ic("chevDown", 12)}</span>` : ""}${tierBadgeFor(a.id)}<span class="rn-text" title="${esc(displayName)}">${giftBadgeFor(a.id)}${esc(displayName)}</span>${a.has_user_info === false ? `<span class="tag-relogin" title="${esc(t("btn.reloginTitle"))}">${t("btn.relogin")}</span>` : ""}${expSoon}</div>
+          <div class="row-name">${ui.density === "compact" ? `<span class="row-chev${slim ? "" : " open"}">${ic("chevDown", 12)}</span>` : ""}${tierBadgeFor(a.id)}<span class="rn-text" title="${esc(displayName)}">${giftBadgeFor(a.id)}${esc(displayName)}</span>${isArchived(a.id) ? `<span class="tag-arch" title="${esc(t("m.archivedDetail"))}">${t("list.archivedTag")}</span>` : ""}${a.has_user_info === false ? `<span class="tag-relogin" title="${esc(t("btn.reloginTitle"))}">${t("btn.relogin")}</span>` : ""}${expSoon}</div>
           <div class="row-meta">${meta}</div>
         </div>
         <div class="row-info">${showChip ? quotaChipHtml(a.id, h) : ""}</div>
@@ -3697,6 +3763,7 @@ function render(force = false) {
             <span class="claim-slot" data-claim-slot></span>
             <button class="icon-btn" title="${t("btn.copyKey")}" aria-label="${t("btn.copyKey")}" click="actions.copyApiKey('${a.id}')">${ic("copy", 15)}</button>
             <button class="icon-btn${isFrozen(a.id) ? " on" : ""}" title="${isFrozen(a.id) ? t("btn.unfreeze") : t("btn.freeze")}" aria-label="${isFrozen(a.id) ? t("btn.unfreeze") : t("btn.freeze")}" click="actions.toggleFreeze('${a.id}')">${ic("snow", 15)}</button>
+            <button class="icon-btn${isArchived(a.id) ? " on" : ""}" title="${isArchived(a.id) ? t("btn.unarchive") : t("btn.archive")}" aria-label="${isArchived(a.id) ? t("btn.unarchive") : t("btn.archive")}" click="actions.toggleArchive('${a.id}')">${ic("folder", 15)}</button>
             <button class="icon-btn${acctQuota[a.id]?.busy ? " spinning" : ""}" title="${t("btn.refreshQuota")}" aria-label="${t("btn.refreshQuota")}" click="actions.acctQuota('${a.id}')">${ic("refresh", 15)}</button>
             <button class="icon-btn" title="${t("btn.rename")}" aria-label="${t("btn.rename")}" click="actions.rename('${a.id}')">${ic("pen", 15)}</button>
             <button class="icon-btn" title="${t("btn.export")}" aria-label="${t("btn.export")}" click="actions.exportOne('${a.id}')">${ic("export", 15)}</button>
@@ -3760,12 +3827,12 @@ function render(force = false) {
     // 卡片即切换按钮：点击卡片 = askSwitch（在用账号由 cardSwitch 忽略）；
     // 头部固定两行：名称行（序号+名称+使用中）/ 徽标行，模型条位置恒定。
     return `
-    <div class="card${isActive ? " active" : ""}${checked ? " picked" : ""}${expanded ? " expanded" : ""}" data-id="${a.id}"
+    <div class="card${isActive ? " active" : ""}${checked ? " picked" : ""}${expanded ? " expanded" : ""}${isArchived(a.id) ? " archived" : ""}" data-id="${a.id}"
       ${isActive ? "" : `click="actions.cardSwitch('${a.id}')"`} title="${isActive ? "" : esc(t("btn.switch"))}">
       <span class="notch" style="background:${notchColor(a.id)}"></span>
       <div class="card-head">
         <div class="card-id">
-          <div class="row-name">${seq != null ? `<span class="card-seq" title="${esc(t("list.seqTitle"))}">${seq}</span>` : ""}${giftBadgeFor(a.id)}<span class="rn-text" title="${esc(displayName)}">${esc(displayName)}</span></div>
+          <div class="row-name">${seq != null ? `<span class="card-seq" title="${esc(t("list.seqTitle"))}">${seq}</span>` : ""}${giftBadgeFor(a.id)}<span class="rn-text" title="${esc(displayName)}">${esc(displayName)}</span>${isArchived(a.id) ? `<span class="tag-arch" title="${esc(t("m.archivedDetail"))}">${t("list.archivedTag")}</span>` : ""}</div>
           <div class="row-meta">${meta}</div>
         </div>
         <span class="card-side">
@@ -3781,6 +3848,7 @@ function render(force = false) {
         <span class="card-tools" click="actions.noop()">
           <button class="icon-btn sm" title="${t("btn.copyKey")}" aria-label="${t("btn.copyKey")}" click="actions.copyApiKey('${a.id}')">${ic("copy", 14)}</button>
           <button class="icon-btn sm${isFrozen(a.id) ? " on" : ""}" title="${isFrozen(a.id) ? t("btn.unfreeze") : t("btn.freeze")}" aria-label="${isFrozen(a.id) ? t("btn.unfreeze") : t("btn.freeze")}" click="actions.toggleFreeze('${a.id}')">${ic("snow", 14)}</button>
+          <button class="icon-btn sm${isArchived(a.id) ? " on" : ""}" title="${isArchived(a.id) ? t("btn.unarchive") : t("btn.archive")}" aria-label="${isArchived(a.id) ? t("btn.unarchive") : t("btn.archive")}" click="actions.toggleArchive('${a.id}')">${ic("folder", 14)}</button>
           <button class="icon-btn sm${acctQuota[a.id]?.busy ? " spinning" : ""}" title="${t("btn.refreshQuota")}" aria-label="${t("btn.refreshQuota")}" click="actions.acctQuota('${a.id}')">${ic("refresh", 14)}</button>
           <button class="icon-btn sm" title="${t("btn.rename")}" aria-label="${t("btn.rename")}" click="actions.rename('${a.id}')">${ic("pen", 14)}</button>
           <button class="icon-btn sm" title="${t("btn.export")}" aria-label="${t("btn.export")}" click="actions.exportOne('${a.id}')">${ic("export", 14)}</button>
@@ -3809,7 +3877,7 @@ function render(force = false) {
           ? `<div class="card-grid">${pinActiveFirst(visible).map((a, i) => cardRowHtml(a, i + 1)).join("")}</div>`
           : pinActiveFirst(visible).map((a, i) => rowHtml(a, i + 1)).join("");
 
-  const claimableCount = s.accounts.filter((a) => (claimable[a.id]?.plans || []).length > 0).length;
+  const claimableCount = s.accounts.filter((a) => !isArchived(a.id) && (claimable[a.id]?.plans || []).length > 0).length;
 
   $app.innerHTML = `
     <header class="topbar">
@@ -4048,6 +4116,23 @@ function toggleFrozen(id) {
   saveFrozen();
 }
 
+// 归档：彻底停靠的账号——不自动刷新额度、不参与自动领取/级联/一键领取、不作为自动切换候选。
+// 只保留手动刷新与手动领取（用户随时可以手动看一眼有没有新礼物）。比冻结更静：
+// 冻结号仍随轮次刷新额度并参与领取探测（解冻证据需要），归档号完全不发起任何自动请求。
+const ARCHIVED_KEY = "zsw-archived-ids";
+let archivedIds = (() => {
+  try { return new Set(JSON.parse(localStorage.getItem(ARCHIVED_KEY) || "[]")); }
+  catch { return new Set(); }
+})();
+function saveArchived() {
+  try { localStorage.setItem(ARCHIVED_KEY, JSON.stringify([...archivedIds])); } catch { /* 忽略 */ }
+}
+function isArchived(id) { return archivedIds.has(id); }
+function toggleArchived(id) {
+  if (archivedIds.has(id)) archivedIds.delete(id); else archivedIds.add(id);
+  saveArchived();
+}
+
 // 额度状态持久化：重启不丢「上次已知额度/烧速样本」，启动按优先级补刷而不是全量同时打接口
 const QUOTA_CACHE_KEY = "zsw-quota-cache-v1";
 let quotaCacheDirty = false;
@@ -4093,6 +4178,7 @@ function seedStartupDue() {
   const activeId = state?.active_account_id;
   const g = { first: [], pending: [], mid: [], dead: [] };
   for (const a of state?.accounts || []) {
+    if (isArchived(a.id)) continue; // 归档号不进自动刷新铺排
     if (a.id === activeId) { g.first.push(a.id); continue; }
     const lv = hm.get(a.id)?.level || "unknown";
     if (lv === "dead") g.dead.push(a.id);
@@ -4109,6 +4195,8 @@ const TICK_MS = 8000;
 let quotaDue = {};
 
 function scheduleNext(id, base = Date.now()) {
+  // 归档号不排自动刷新（手动刷新照常，但刷完不自动续期）
+  if (isArchived(id)) { quotaDue[id] = Infinity; return; }
   const h = healthMapOf().get(id);
   const isActive = state?.accounts?.some((a) => a.id === id && a.is_active);
   if (isActive) {
@@ -4261,10 +4349,12 @@ function noteForDecision(d) {
  */
 async function autoSwitchTick(manual = false) {
   const s = state;
-  if (!s?.auto_switch || switchLock || autoSwitchRunning || busy) return;
-  if (!(s.accounts || []).length) return;
+  // 返回值 = tick 是否真正起跑。false 只出现在瞬态守卫（切换锁/在飞切换/守卫忙碌）
+  // 或自动切换已关闭——前者是「冻结当前号立即切」这类手动意图需要重试的信号
+  if (!s?.auto_switch || switchLock || autoSwitchRunning || busy) return false;
+  if (!(s.accounts || []).length) return true;
   const active = activeAccount();
-  if (!active) return;
+  if (!active) return true;
   const thr = Number(s.auto_switch_threshold ?? 15);
   const model = effectiveFocusModel();
   const now = Date.now();
@@ -4315,9 +4405,9 @@ async function autoSwitchTick(manual = false) {
   }
   if (!lg && ap.flowed) cur.flowed = true;
 
-  // 在用账号被手动冻结：用户明确要求切走 → 按硬故障处理，
-  // 旧额度/烧速作废，立即切到最佳非冻结候选（manual 绕过冷却与保护窗）
-  if (isFrozen(active.id)) {
+  // 在用账号被手动冻结/归档：用户明确要求切走 → 按硬故障处理，
+  // 旧额度/烧速作废，立即切到最佳非停靠候选（manual 绕过冷却与保护窗）
+  if (isFrozen(active.id) || isArchived(active.id)) {
     cur.hardDown = true;
     cur.pct = null;
     cur.tokens = null;
@@ -4330,8 +4420,8 @@ async function autoSwitchTick(manual = false) {
     if (a.id === active.id) continue;
     const h = hm.get(a.id);
     if (h && (h.level === "auth" || h.level === "fail")) continue;
-    // 手动冻结的账号绝不作为自动切换目标（即使有额度）；手动切换不受影响
-    if (isFrozen(a.id)) continue;
+    // 手动冻结/归档的账号绝不作为自动切换目标（即使有额度）；手动切换不受影响
+    if (isFrozen(a.id) || isArchived(a.id)) continue;
     // 最近一次额度查询失败（业务码500无套餐/鉴权/限流）：旧数据不得作为切换依据，
     // 否则会顶着过期前缓存的高百分比被选中/通过预校验；等下次成功拉到数据再回池
     if (acctQuota[a.id]?.err) continue;
@@ -4375,11 +4465,25 @@ async function autoSwitchTick(manual = false) {
     } else {
       noteChanged("");
     }
-    return;
+    return true;
   }
-  if (d.action === "refresh") { noteForDecision(d); forceRefresh(active.id); return; }
-  if (d.action === "wait") { noteForDecision(d); return; }
+  if (d.action === "refresh") { noteForDecision(d); forceRefresh(active.id); return true; }
+  if (d.action === "wait") { noteForDecision(d); return true; }
   await doAutoSwitch(d, active, cur, lg);
+  return true;
+}
+
+/** 手动意图的立即切换（冻结/归档在用账号 = 明确要求切走）：tick 被瞬态守卫吞掉时
+ *  短间隔重试（切换锁/在飞切换/守卫忙碌都会在秒级释放），最长 ~10s；
+ *  意图取消（解冻/取消归档/关自动切换）即停。tick 真正起跑后由其自身决策收尾 */
+function kickSwitchNow() {
+  let tries = 0;
+  const kick = () => {
+    if (!state?.auto_switch) return;
+    if (autoSwitchTick(true)) return;
+    if (++tries <= 20) setTimeout(kick, 500);
+  };
+  kick();
 }
 
 /** 执行切换：先对陈旧候选做预校验，再热切，最后记审计 */
@@ -4485,7 +4589,7 @@ const expiryRefreshDone = new Map();
 function expiryRefreshTick() {
   const now = Date.now();
   for (const a of state?.accounts || []) {
-    if (acctQuota[a.id]?.busy) continue;
+    if (acctQuota[a.id]?.busy || isArchived(a.id)) continue;
     for (const p of acctQuota[a.id]?.data?.plans || []) {
       const txt = String(p.expire || "");
       if (!txt) continue;
@@ -4507,7 +4611,7 @@ function pumpSweep() {
   if (sweepInFlight >= SWEEP_CONCURRENCY) return;
   const now = Date.now();
   const due = (state?.accounts || []).filter(
-    (a) => (quotaDue[a.id] ?? Infinity) <= now && !acctQuota[a.id]?.busy && !claimable[a.id]?.busy,
+    (a) => (quotaDue[a.id] ?? Infinity) <= now && !acctQuota[a.id]?.busy && !claimable[a.id]?.busy && !isArchived(a.id),
   );
   if (!due.length) return;
   due.sort((x, y) => (quotaDue[x.id] ?? 0) - (quotaDue[y.id] ?? 0));

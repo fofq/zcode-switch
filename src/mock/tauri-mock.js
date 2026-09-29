@@ -50,6 +50,12 @@ window.__MOCK_PUSH_GIFT_INSTANCE__ = (planId, name) => {
 const mockQuotaFlap = new Set();
 window.__MOCK_SET_QUOTA_FLAP__ = (id) => mockQuotaFlap.add(id);
 
+// 报价已撤：下一次对该号的 claim_start 抛 {gone, plans} 载荷（与真实后端 claim_start
+// 的 err.claim.gone 载荷同形），验证礼盒图标的就地自愈
+const mockClaimGone = new Set();
+window.__MOCK_SET_CLAIM_GONE__ = (id) => mockClaimGone.add(id);
+window.__MOCK_CLEAR_CLAIM_GONE__ = () => mockClaimGone.clear();
+
 // 各命令的 mock 实现；返回 null/对象都行，未列出的命令回退为 null 并告警
 const commands = {
   async app_version() { return "1.6.0-preview"; },
@@ -87,6 +93,14 @@ const commands = {
 
   async claim_start({ id }) {
     const acc = mockAccounts().find((a) => a.id === id);
+    if (mockClaimGone.has(id)) {
+      mockClaimGone.delete(id);
+      // 模拟跨期轮换：目标报价已撤，最新 preview（剩余的）随错误带回
+      throw JSON.stringify({
+        gone: "该套餐已不可领取，报价已更新",
+        plans: mockClaimPlans(id).slice(1),
+      });
+    }
     const plan = mockClaimPlans(id)[0];
     setTimeout(() => {
       if (plan) applyClaimedGift(id);
@@ -262,6 +276,7 @@ window.__ZSW_MOCK__ = true;
 window.__MOCK_EMIT__ = emit;
 try {
   if (!localStorage.getItem("zsw-frozen-ids")) localStorage.setItem("zsw-frozen-ids", JSON.stringify(["acct-15"]));
+  if (!localStorage.getItem("zsw-archived-ids")) localStorage.setItem("zsw-archived-ids", JSON.stringify(["acct-12"]));
   localStorage.removeItem("zsw-quota-cache-v1");
 } catch { /* 隐私模式等场景忽略 */ }
 
