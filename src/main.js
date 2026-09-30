@@ -3,7 +3,7 @@ import { listen } from "@tauri-apps/api/event";
 import { esc, toast, openPwModal, openConfirmModal, openProviderModal, installDelegation, dismissSplash } from "./ui.js";
 import { ic } from "./icons.js";
 import { init, t, has, lang, localeTag, stripErr, errCode } from "./i18n.js";
-import { HEALTH_ORDER, healthOf, filterAccounts, sortAccounts, bucketAccounts, summarize, modelKeyMatch, quotaBarParts, planExpired, planIsGift, PENDING_WINDOW_MS, quotaRemainingPct, entitlementGiftMap } from "./list.js";
+import { HEALTH_ORDER, healthOf, filterAccounts, sortAccounts, bucketAccounts, summarize, modelKeyMatch, quotaBarParts, planExpired, planIsGift, PENDING_WINDOW_MS, entitlementGiftMap } from "./list.js";
 import { AS_DEFAULTS, poolStats, poolStatsFromSignals, poolsRate, sampleFrom, pushSample, etaOf, evaluate, fmtEta, giftFirstBasis } from "./autoswitch.js";
 
 // 纯浏览器预览：无 Tauri 后端（普通浏览器开 dev server）时注入 mock IPC 再继续启动；
@@ -40,8 +40,9 @@ let autoClaimEmptyRounds = {};
 // 连续领取失败轮数 → 失败冷却同样翻倍至 24h 封顶：持续失败的领取多半是
 // 号被标记/资格问题，每 30min 重试只会加固风控画像
 let autoClaimFailRounds = {};
-// 自动风控冻结：连续 2 次风控信号且仍有额度的账号自动冻结（不参与自动切换），
-// 3h 冷却到期后随领取轮探测，提交成功即自动解冻。手动冻结不在此列（永不自动解冻）
+// 自动风控冻结：领取链路吃到 HTTP 层风控信号（405/unusual activity 等）**首次即冻结**
+// （不参与自动切换、停止领取），3h 冷却到期后随轮次探测复测：提交成功/额度恢复即
+// 解冻，再吃风控信号顺延停靠。手动冻结不在此列（永不自动解冻）
 const AUTO_FROZEN_KEY = "zsw-auto-frozen";
 let autoFrozenAt = (() => {
   try { return JSON.parse(localStorage.getItem(AUTO_FROZEN_KEY) || "{}"); }
@@ -2933,25 +2934,29 @@ function claimFailureRisk(r) {
   return r.ok === false && riskInText(r.message);
 }
 
-/** 风控信号记账：连续 2 次 + 仍有额度 → 自动冻结（数小时后随轮次探测恢复） */
+/** 风控信号记账：领取链路的 HTTP 层拒绝（405/429/401/unusual activity 等）
+ *  **首次信号即自动冻结**——旧逻辑要求 24h 内连续 2 次 + 有额度，实践中几乎
+ *  无法触发（提交 405 后冷却 3h 起、第二次信号至少滞后 3 小时；新号领首个
+ *  礼包时额度数据为 null 被额度门直接放行，87/88/86 三个号各吃一次 405 后
+ *  再无人冻结，09-29/30 实证）。复测语义：冷却（3h±50%）到期后随领取轮探测
+ *  ——提交成功即解冻（claim://result ok）；再吃风控信号 → 走本函数顺延停靠。
+ *  手动冻结不介入（用户拍板）；额度门已删除——风控停靠的语义包含「停止领取」，
+ *  对无额度号同样成立（防抖与解冻出路见 noteFrozenQuotaSeen 注释）。 */
 function noteClaimRisk(id) {
   if (isFrozen(id) && !autoFrozenAt[id]) return; // 手动冻结：用户决定，不介入
   const now = Date.now();
-  // 信号时间窗：超过 24h 的旧信号不累计（隔天的单次风控不应触发冻结）
+  // 信号时间窗：超过 24h 的旧信号不累计（streak 现仅作观测计数，冻结不再依赖它）
   if ((autoRiskLastAt[id] ?? 0) < now - 24 * 3600e3) autoRiskStreak[id] = 0;
   autoRiskLastAt[id] = now;
   autoRiskStreak[id] = (autoRiskStreak[id] || 0) + 1;
-  if (autoRiskStreak[id] < 2) return; // 单次信号不冻，防瞬时抖动误判
-  if (autoFrozenAt[id]) { // 已在自动冻结期：顺延探测时间（封顶 24h——信号反复时也不能无限顺延成「永不恢复」）
-    const cap = Date.now() + 24 * 60 * 60 * 1000;
-    autoClaimCooldown[id] = Math.min(Math.max(autoClaimCooldown[id] ?? 0, Date.now() + autoClaimGap(3 * 60 * 60 * 1000)), cap);
+  if (autoFrozenAt[id]) { // 复测仍撞墙：顺延停靠（封顶 24h——信号反复时也不能无限顺延成「永不恢复」）
+    const cap = now + 24 * 60 * 60 * 1000;
+    autoClaimCooldown[id] = Math.min(Math.max(autoClaimCooldown[id] ?? 0, now + autoClaimGap(3 * 60 * 60 * 1000)), cap);
     return;
   }
-  const h = healthMapOf().get(id);
-  if (!h || h.remainingPct == null || h.remainingPct <= 0) return; // 无额度：交给正常耗尽判定
   frozenIds.add(id);
-  autoFrozenAt[id] = Date.now();
-  autoClaimCooldown[id] = Date.now() + autoClaimGap(3 * 60 * 60 * 1000);
+  autoFrozenAt[id] = now;
+  autoClaimCooldown[id] = now + autoClaimGap(3 * 60 * 60 * 1000);
   saveFrozen(); saveAutoFrozen();
   toast(t("m.autoFrozenToast", { name: accountName(id) }), "warn", t("m.autoFrozenDetail"));
   render();
@@ -2977,14 +2982,15 @@ function autoUnfreeze(id, reason = "probe") {
 // a) 领取提交成功（claim://result，原有的探测通过路径）；
 // b) 额度恢复：冻结满 2h 后连续 3 次成功刷新都带可用额度（风控解除的旁证；
 //    5min 刷新节奏下 ≈ 冻结后 2h15m，兑现「数小时后自动探测，恢复即解冻」）；
-// c) 额度耗尽坐实：数据面确定判死（空快照/全过期/剩余 0，服务器确定性结论，
-//    单次即可信）→ 立即解除；或冻结满 6h 且连续 3 次刷新都无可用额度（65 号这类
-//    查不出有效额度数据的退化号）→ 坐实没额度解除。冻结语义是「有额度但被风控
-//    停靠」，对没额度的号毫无意义——它们本就不参与自动切换，解冻后回归真实分组
-//    （额度耗尽/待查询），按耗尽号节奏（60-120min）刷新，新礼物到账正常级联恢复。
+// c) 无可用额度坐实：冻结满 6h 且连续 3 次刷新都无可用额度（65 号这类查不出
+//    有效额度数据的退化号）→ 坐实没额度解除。
+// 【已删除】旧 c')「数据面确定判死（definiteDeadData）单次即解」：风控停靠的语义
+//    已扩展到「停止领取」，对无额度号同样成立；死数据 ≠ 风控解除——否则刚吃 405
+//    冻结的号会在下一次额度刷新（读到空/死）被当场放行，再 405 再冻，抖动不止
+//    （G8）。解冻出路仍有 a/b/c 三条 + 手动升级/解冻，无吸收态。
 //    解冻刻意不清领取冷却：冷却必到期且级联可用 min() 下拉，不是吸收态；
 //    风控证据未必完全洗白，保留领取端节流更稳。
-// 手动冻结不受 c) 影响（用户决定停靠，标记保留），仅分组显示归位（见 healthMapOf）。
+// 手动冻结不受 b/c) 影响（用户决定停靠，标记保留），仅分组显示归位（见 healthMapOf）。
 const AUTO_UNFREEZE_MIN_MS = 2 * 60 * 60 * 1000;
 const AUTO_UNFREEZE_EMPTY_MS = 6 * 60 * 60 * 1000;
 const AUTO_UNFREEZE_HITS = 3;
@@ -2997,19 +3003,8 @@ function hasLiveQuota(data) {
   const pools = plans.length ? plans.flatMap((p) => p.items || []) : (data.items || []);
   return pools.some((it) => Number(it?.remaining ?? 0) > 0);
 }
-/** 数据面确定判死：与 healthOf 的 dead 判定同口径（空快照 / 全部过期 / 剩余 0） */
-function definiteDeadData(data) {
-  if (!data) return false;
-  if (data.is_empty === true) return true;
-  const plans = data.plans || [];
-  if (plans.length && plans.every((p) => planExpired(p))) return true;
-  const pct = quotaRemainingPct({ data });
-  return pct != null && pct <= 0;
-}
 function noteFrozenQuotaSeen(id, data) {
   if (!autoFrozenAt[id]) return; // 手动冻结/未冻结：不介入
-  // 确定耗尽：冻结立刻失去意义，立即解除（「额度恢复」的否定面坐实）
-  if (definiteDeadData(data)) { autoUnfreeze(id, "exhausted"); return; }
   const live = hasLiveQuota(data);
   const healthy = (autoUnfreezeHits[id] = live ? (autoUnfreezeHits[id] || 0) + 1 : 0);
   const empty = (autoUnfreezeEmpty[id] = live ? 0 : (autoUnfreezeEmpty[id] || 0) + 1);
@@ -3132,7 +3127,10 @@ async function autoClaimTick() {
           // 抛错（405 风控拦截等）与提交失败同谱升级：30min→2^n 封顶 4h，
           // 写死 10min 会让被拦账号反复撞墙、两轮就吃满风控信号被冻结
           const streak = (autoClaimFailRounds[id] = (autoClaimFailRounds[id] || 0) + 1);
+          // 取 max（含既有冷却）：风控冻结刚写入的 3h 探测冷却不得被这里的
+          // 30min 退避覆盖（G7），否则刚停靠的号 ~30min 就被重新推上撞墙位
           autoClaimCooldown[id] = Math.max(
+            autoClaimCooldown[id] ?? 0,
             Date.now() + autoClaimGap(AUTO_CLAIM_INTERVAL_MS),
             Date.now() + autoClaimGap(AUTO_CLAIM_FAIL_MIN_MS * (2 ** Math.min(streak - 1, 3))),
           );

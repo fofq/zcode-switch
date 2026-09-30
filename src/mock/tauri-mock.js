@@ -56,6 +56,12 @@ const mockClaimGone = new Set();
 window.__MOCK_SET_CLAIM_GONE__ = (id) => mockClaimGone.add(id);
 window.__MOCK_CLEAR_CLAIM_GONE__ = () => mockClaimGone.clear();
 
+// 提交风控：对该号的领取提交返回 HTTP 405 失败（与真实后端 failure_payload 同形，
+// message 含 HTTP 405 命中 riskInText）——验证「首次风控信号即冻结 / 复测通过解冻」
+const mockClaimRisk = new Set();
+window.__MOCK_SET_CLAIM_RISK__ = (id) => mockClaimRisk.add(id);
+window.__MOCK_CLEAR_CLAIM_RISK__ = () => mockClaimRisk.clear();
+
 // 陈旧套餐：把该号主套餐 expire 拨到过去但保留 expired=false（复现 69 号形态）
 window.__MOCK_MAKE_PLAN_STALE__ = (id) => makePlanStale(id);
 
@@ -106,6 +112,16 @@ const commands = {
     }
     const plan = mockClaimPlans(id)[0];
     setTimeout(() => {
+      if (mockClaimRisk.has(id)) {
+        mockClaimRisk.delete(id);
+        // 提交被 WAF 拦截：失败 payload 与 claim.rs failure_payload 同形
+        emit("claim://result", {
+          ok: false, accountId: id, accountName: acc?.name || id,
+          planName: plan?.name || "Start Plan", code: -1, nextAt: null,
+          message: "领取请求失败 HTTP 405: request has been blocked due to unusual activity.",
+        });
+        return;
+      }
       if (plan) applyClaimedGift(id);
       emit("claim://result", {
         ok: true, accountId: id, accountName: acc?.name || id,

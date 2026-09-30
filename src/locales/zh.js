@@ -81,7 +81,7 @@ export const zh = {
   "m.claimAccountErr": "「{name}」{err}",
   "m.claimAcctTimeout": "「{name}」验证超时，已跳过",
   "m.autoFrozenToast": "已自动冻结「{name}」",
-  "m.autoFrozenDetail": "账号有额度但请求被风控拦截：冻结期间不参与自动切换，数小时后自动探测，恢复即解冻",
+  "m.autoFrozenDetail": "领取请求被风控拦截，首次即停靠：不参与自动切换、暂停领取；约 3 小时后自动复测，通过即解冻，再撞墙则继续停靠",
   "m.autoUnfrozenToast": "「{name}」风控解除",
   "m.autoUnfrozenDetail": "风控已解除（探测通过或额度恢复），账号重新参与自动切换",
   "m.autoUnfrozenExhausted": "账号额度已耗尽，冻结自动解除——冻结只对有额度的号有意义，耗尽号回归正常轮换，新礼物到账后自动恢复",

@@ -85,7 +85,7 @@ export const en = {
   "m.claimAccountErr": "\"{name}\": {err}",
   "m.claimAcctTimeout": "\"{name}\" verification timed out — skipped",
   "m.autoFrozenToast": "Auto-frozen \"{name}\"",
-  "m.autoFrozenDetail": "Account has quota but requests are blocked by risk control: excluded from auto-switching, probed automatically in a few hours",
+  "m.autoFrozenDetail": "Claim requests hit risk control — parked on the first signal: excluded from auto-switching, claiming paused; re-probed in ~3h, unfrozen if it passes, kept parked if it hits again",
   "m.autoUnfrozenToast": "\"{name}\" risk control lifted",
   "m.autoUnfrozenDetail": "Risk control lifted (probe passed or quota recovered) — account restored for auto-switching",
   "m.autoUnfrozenExhausted": "Quota is exhausted — freeze lifted automatically (freezing only matters for accounts with quota; the account returns to normal rotation and recovers when new gifts land)",
