@@ -366,11 +366,17 @@ eq(rt10b.ranked[0].id, "B", "无 token 时按 pct 排序（全序一致）");
 // ---------- 礼物优先（giftFirst）：礼物池口径判定 + 候选礼物层 + 礼物顺序 ----------
 
 // 11. 池统计的礼物/常规拆分（三套餐：Weekend + Global 礼物，Start 常规）
+// 日期必须相对 now：planExpired 有本地时钟复核（expire 落在过去即过期，69 号 0930 修复）
+const gfDate = (offsetDays, hhmm) => {
+  const d = new Date(Date.now() + offsetDays * 86400e3);
+  const p = (n) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${hhmm}`;
+};
 const qGF = { data: {
   plans: [
-    { gift: true,  name: "ZCode Weekend Build", expire: "2026-09-28 09:00", items: [ { name: "GLM-5.3-Flash", total: 200000, used: 0, remaining: 200000 } ] },
-    { gift: true,  name: "ZCode Global Build",  expire: "2026-09-21 09:00", items: [ { name: "GLM-5.3-Flash", total: 100000000, used: 94300000, remaining: 5700000 } ] },
-    { gift: false, name: "ZCode Start Plan",    expire: "2026-09-21 23:59", items: [ { name: "GLM-5.3-Flash", total: 5000000, used: 0, remaining: 5000000 }, { name: "GLM-5.3", total: 3000000, used: 0, remaining: 3000000 } ] },
+    { gift: true,  name: "ZCode Weekend Build", expire: gfDate(3, "09:00"), items: [ { name: "GLM-5.3-Flash", total: 200000, used: 0, remaining: 200000 } ] },
+    { gift: true,  name: "ZCode Global Build",  expire: gfDate(1, "09:00"), items: [ { name: "GLM-5.3-Flash", total: 100000000, used: 94300000, remaining: 5700000 } ] },
+    { gift: false, name: "ZCode Start Plan",    expire: gfDate(1, "23:59"), items: [ { name: "GLM-5.3-Flash", total: 5000000, used: 0, remaining: 5000000 }, { name: "GLM-5.3", total: 3000000, used: 0, remaining: 3000000 } ] },
   ],
 }};
 const sGF = poolStats(qGF, "GLM-5.3-Flash");
@@ -378,7 +384,7 @@ eq(sGF.giftTokens, 5900000, "礼物池聚合 token（Weekend+Global）");
 eq(sGF.regTokens, 5000000, "常规池聚合 token（仅 Start 的 Flash）");
 ok(Math.abs(sGF.giftPct - 100) < 0.01, `礼物口径 bestPct=Weekend 100%（实际 ${sGF.giftPct}）`);
 ok(sGF.giftKinds.includes("weekend") && sGF.giftKinds.includes("global"), "礼物细分含 weekend/global");
-ok(sGF.giftExpireMs != null && sGF.giftExpireMs < Date.parse("2026-09-21T23:59"), "礼物最早到期取 Global 09:00");
+ok(sGF.giftExpireMs != null && sGF.giftExpireMs < Date.parse(gfDate(1, "23:59").replace(" ", "T")), "礼物最早到期取 Global 09:00");
 
 // 11b. giftFirstBasis：礼物还有 → 礼物口径；礼物耗尽 → 回落常规；无拆分 → 透传
 const b11 = giftFirstBasis(sGF);
