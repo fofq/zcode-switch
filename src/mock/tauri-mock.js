@@ -2,7 +2,8 @@
 // 让 src/main.js 原封不动地跑在普通浏览器里。仅 dev 生效（main.js 顶部有 DEV 守卫，
 // 生产构建会被整段剔除），所有数据来自 ./data.js 的拟真数据集。
 import {
-  mockAccounts, mockQuota, mockState, mockUsage, mockClaimPlans, mockTwoUsage, applyClaimedGift, makePlanStale,
+  mockAccounts, mockQuota, mockState, mockUsage, mockClaimPlans, mockTwoUsage,
+  applyClaimedGift, makePlanStale, drainQuota, expireGift,
 } from "./data.js";
 
 const handlers = new Map(); // eventName -> Set<cb>
@@ -64,6 +65,10 @@ window.__MOCK_CLEAR_CLAIM_RISK__ = () => mockClaimRisk.clear();
 
 // 陈旧套餐：把该号主套餐 expire 拨到过去但保留 expired=false（复现 69 号形态）
 window.__MOCK_MAKE_PLAN_STALE__ = (id) => makePlanStale(id);
+// 当日窗口用完：抽干全部未过期套餐的池（健康度 dead 但套餐未到期——不应归档）
+window.__MOCK_DRAIN_QUOTA__ = (id) => drainQuota(id);
+// 部分到期：只把第一个礼物套餐拨过期（多套餐场景不应整号归档）
+window.__MOCK_EXPIRE_GIFT__ = (id) => expireGift(id);
 
 // 各命令的 mock 实现；返回 null/对象都行，未列出的命令回退为 null 并告警
 const commands = {

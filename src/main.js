@@ -99,6 +99,12 @@ function markClaimedPlan(id, planName, planId) {
 // 分层：0=当前账号 1=新号(<48h)/GlobalBuild未证词 2=有额度 3=其余(含用尽)。
 // 有额度与否跟资格无关（满额老号也不可见），但决定请求预算的先后
 const CLAIM_NEW_MS = 48 * 3600e3;
+/** 新入库：建号 48h 内（与领取分层的新号口径一致）。新入库却始终无额度/停留在
+ *  待激活，多半是激活或领取风控被拦——行内「新入库」tag 是给用户的目视诊断信号 */
+function isNewEnrolled(a) {
+  const c = Date.parse(String(a?.created_at || "").replace(" ", "T"));
+  return Number.isFinite(c) && Date.now() - c < CLAIM_NEW_MS;
+}
 const CLAIM_T0_POLL_MS = 12 * 60e3;
 const CLAIM_T1_CAP_MS = 30 * 60e3;
 const CLAIM_T2_CAP_MS = 2 * 3600e3;
@@ -3861,7 +3867,7 @@ function render(force = false) {
         ${healthDotHtml(h)}
         ${slim ? "" : `<span class="notch" style="background:${notchColor(a.id)}"></span>`}
         <div class="row-main"${ui.density === "compact" ? ` click="actions.toggleRow(event)" title="${esc(slim ? t("list.expandTitle") : t("list.collapseTitle"))}"` : ""}>
-          <div class="row-name">${ui.density === "compact" ? `<span class="row-chev${slim ? "" : " open"}">${ic("chevDown", 12)}</span>` : ""}${tierBadgeFor(a.id)}<span class="rn-text" title="${esc(displayName)}">${giftBadgeFor(a.id)}${esc(displayName)}</span>${isFrozen(a.id) && autoFrozenAt[a.id] ? `<span class="tag-risk" title="${esc(t("m.tagRiskTitle"))}">${t("list.riskTag")}</span>` : ""}${isArchived(a.id) ? `<span class="tag-arch" title="${esc(t("m.archivedDetail"))}">${t("list.archivedTag")}</span>` : ""}${a.has_user_info === false ? `<span class="tag-relogin" title="${esc(t("btn.reloginTitle"))}">${t("btn.relogin")}</span>` : ""}${expSoon}</div>
+          <div class="row-name">${ui.density === "compact" ? `<span class="row-chev${slim ? "" : " open"}">${ic("chevDown", 12)}</span>` : ""}${tierBadgeFor(a.id)}<span class="rn-text" title="${esc(displayName)}">${giftBadgeFor(a.id)}${esc(displayName)}</span>${isNewEnrolled(a) ? `<span class="tag-new" title="${esc(t("m.tagNewTitle"))}">${t("list.newTag")}</span>` : ""}${isFrozen(a.id) && autoFrozenAt[a.id] ? `<span class="tag-risk" title="${esc(t("m.tagRiskTitle"))}">${t("list.riskTag")}</span>` : ""}${isArchived(a.id) ? `<span class="tag-arch" title="${esc(t("m.archivedDetail"))}">${t("list.archivedTag")}</span>` : ""}${a.has_user_info === false ? `<span class="tag-relogin" title="${esc(t("btn.reloginTitle"))}">${t("btn.relogin")}</span>` : ""}${expSoon}</div>
           <div class="row-meta">${meta}</div>
         </div>
         <div class="row-info">${showChip ? quotaChipHtml(a.id, h) : ""}</div>
@@ -3939,7 +3945,7 @@ function render(force = false) {
       <span class="notch" style="background:${notchColor(a.id)}"></span>
       <div class="card-head">
         <div class="card-id">
-          <div class="row-name">${seq != null ? `<span class="card-seq" title="${esc(t("list.seqTitle"))}">${seq}</span>` : ""}${giftBadgeFor(a.id)}<span class="rn-text" title="${esc(displayName)}">${esc(displayName)}</span>${isFrozen(a.id) && autoFrozenAt[a.id] ? `<span class="tag-risk" title="${esc(t("m.tagRiskTitle"))}">${t("list.riskTag")}</span>` : ""}${isArchived(a.id) ? `<span class="tag-arch" title="${esc(t("m.archivedDetail"))}">${t("list.archivedTag")}</span>` : ""}</div>
+          <div class="row-name">${seq != null ? `<span class="card-seq" title="${esc(t("list.seqTitle"))}">${seq}</span>` : ""}${giftBadgeFor(a.id)}<span class="rn-text" title="${esc(displayName)}">${esc(displayName)}</span>${isNewEnrolled(a) ? `<span class="tag-new" title="${esc(t("m.tagNewTitle"))}">${t("list.newTag")}</span>` : ""}${isFrozen(a.id) && autoFrozenAt[a.id] ? `<span class="tag-risk" title="${esc(t("m.tagRiskTitle"))}">${t("list.riskTag")}</span>` : ""}${isArchived(a.id) ? `<span class="tag-arch" title="${esc(t("m.archivedDetail"))}">${t("list.archivedTag")}</span>` : ""}</div>
           <div class="row-meta">${meta}</div>
         </div>
         <span class="card-side">
@@ -4251,6 +4257,18 @@ let deadSince = (() => {
 function saveDeadSince() {
   try { localStorage.setItem(DEAD_SINCE_KEY, JSON.stringify(deadSince)); } catch { /* 忽略 */ }
 }
+// 「确定无未来额度」口径（比健康度 dead 更严）：整号空（is_empty）或全部套餐已过期。
+// 健康度的 dead 还包含「每日窗口当天用完」（pct<=0 但套餐未到期）——那类号跨午夜
+// 就由服务端重置恢复，不能作为归档依据（否则 1 小时规则会在晚间误归档还有数天
+// 有效期的号；多套餐场景同理：部分套餐到期、部分未到期 → 不是 dead 也不满足本口径）
+const noFutureQuota = (id) => {
+  const q = acctQuota[id];
+  const data = q?.data;
+  if (!data || q.busy || q.err) return false;
+  if (data.is_empty === true) return true;
+  const plans = data.plans || [];
+  return plans.length > 0 && plans.every((p) => planExpired(p));
+};
 function autoArchiveTick() {
   const deadH = Number(state?.auto_archive_dead_hours ?? 0);
   const ageD = Number(state?.auto_archive_age_days ?? 0);
@@ -4261,11 +4279,14 @@ function autoArchiveTick() {
     if (deadH <= 0) break; // deadSince 只为耗尽规则服务
     // 在用号与手动冻结号不自动归档：前者正在使用，后者是用户拍板的停靠（语义是可恢复的探测，不是退役）
     if (a.is_active || (isFrozen(a.id) && !autoFrozenAt[a.id])) continue;
-    const h = healthMapOf().get(a.id);
-    if (h?.level === "dead") {
+    // 新入库宽限（建号 48h 内）：套餐可能尚未发放或激活被拦——这是要「看见」的
+    // 诊断态（新入库 tag），不是耗尽；这类号由建号超期规则兜底
+    const createdTs = Date.parse(String(a.created_at || "").replace(" ", "T"));
+    if (Number.isFinite(createdTs) && now - createdTs < CLAIM_NEW_MS) continue;
+    if (noFutureQuota(a.id)) {
       if (!deadSince[a.id]) { deadSince[a.id] = now; tracking = true; }
     } else if (deadSince[a.id]) {
-      // 只有拿到「非 dead 的真实数据」才清时钟：启动加载期/查询中的 unknown 态
+      // 只有拿到「有未来额度」的真实数据才清时钟：启动加载期/查询中的 unknown 态
       // 不算恢复（否则每次重启都会把耗尽时钟清零，24h 规则永远等不满）
       const q = acctQuota[a.id];
       if (q?.data && !q.busy && !q.err) { delete deadSince[a.id]; tracking = true; }

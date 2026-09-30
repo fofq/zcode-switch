@@ -244,3 +244,32 @@ export function makePlanStale(id) {
   }
   return p ? { id, expire: p.expire } : null;
 }
+
+/** 当日窗口用完形态：所有未过期套餐的池全部抽干（remaining=0），套餐本身未到期
+ *  ——健康度会读 dead（pct=0），但「确定无未来额度」口径不应归档（跨午夜即恢复） */
+export function drainQuota(id) {
+  const q = quotas[id];
+  let n = 0;
+  for (const p of q?.plans || []) {
+    if (p.expired) continue;
+    for (const it of p.items || []) {
+      it.used = it.total;
+      it.remaining = 0;
+      it.percent_used = 100;
+      n++;
+    }
+  }
+  return n;
+}
+
+/** 部分到期形态：只把第一个礼物套餐拨过期（非礼物套餐不动）
+ *  ——多套餐场景应继续按剩余套餐判定，不得整号归档 */
+export function expireGift(id) {
+  const q = quotas[id];
+  const p = q?.plans?.find((x) => x.gift && !x.expired);
+  if (p) {
+    p.expire = timeStr(now - DAY);
+    p.expired = true;
+  }
+  return p ? { id, expire: p.expire } : null;
+}

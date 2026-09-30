@@ -1528,6 +1528,17 @@ select.two-input { cursor: pointer; }
   padding: 0 4px;
   flex: none;
 }
+/* 新入库标记：建号 48h 内（诊断信号——新入库却始终无额度可能是激活/风控被拦） */
+.tag-new {
+  font-family: var(--mono);
+  font-size: 11.5px;
+  letter-spacing: .1em;
+  color: #6f9fc0;
+  border: 1px solid rgba(111, 159, 192, .5);
+  border-radius: 3px;
+  padding: 0 4px;
+  flex: none;
+}
 .row.archived:not(.active) .rn-text, .card.archived:not(.active) .rn-text { opacity: .55; }
 .row.archived:not(.active) .row-meta, .card.archived:not(.active) .row-meta { opacity: .7; }
 
