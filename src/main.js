@@ -647,12 +647,11 @@ function healthMapOf() {
         h = { ...h, remainingPct: pct, level: levelOf(pct, opts.threshold), modelMatched: true, modelName: lg.worstName || h.modelName, fromLog: true };
       }
     }
-    // 冻结叠加：手动冻结遮「有额度/状态未定」的号，底层已判死的回归真实分组
-    // （用户拍板的停靠不遮真相）；**风控自动冻结一律进「已冻结」组**——新语义下
-    // 风控停靠包含「停止领取」，对无额度号同样成立，且用户要求目视统一：
-    // 带风控标签的号必须能在冻结组找到（018e203 后 dead+风控=「撞墙且没额度」，
-    // 散落在额度耗尽组里反而难盘点）
-    if (isFrozen(a.id) && (autoFrozenAt[a.id] || h.level !== "dead")) h = { ...h, level: "frozen" };
+    // 冻结叠加：冻结（手动=风控代位/自动）一律进「已冻结」组——手动冻结的意义就是
+    // 弥补风控不及时（250b1d2），目视盘点同样要能在冻结组找到；base 保留罩前真实
+    // 分组，供调度区分节奏（scheduleNext：耗尽号 90min 只对手动冻结/未冻结生效，
+    // 自动冻结的耗尽号保持 5min 喂 b/c) 解冻证据机）
+    if (isFrozen(a.id)) h = { ...h, base: h.level, level: "frozen" };
     map.set(a.id, h);
   }
   return map;
@@ -4448,8 +4447,10 @@ function scheduleNext(id, base = Date.now()) {
     return;
   }
   // 耗尽号：大幅拉长复查周期（60-120 分钟）——几十个死号按 5 分钟刷是纯风控负担；
-  // 新礼物（周礼/Global Build）发放后下一次刷新即恢复 normal 轮换
-  if (h?.level === "dead") {
+  // 新礼物（周礼/Global Build）发放后下一次刷新即恢复 normal 轮换。
+  // 按「罩前分组」(base) 判断：自动冻结的耗尽号例外保持 5min——那是 b/c) 解冻
+  // 证据机的数据源；手动冻结的耗尽号没有消费者，维持 90min 不增流量
+  if ((h?.base || h?.level) === "dead" && !(isFrozen(id) && autoFrozenAt[id])) {
     const j = 1 + (Math.random() * 2 - 1) * SWEEP_JITTER_DEAD;
     quotaDue[id] = base + Math.round(SWEEP_PERIOD_DEAD * j);
     return;
