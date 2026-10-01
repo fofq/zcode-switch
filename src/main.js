@@ -1188,9 +1188,9 @@ function summaryHtml(sum) {
   const activeId = state?.active_account_id;
   const ah = activeId ? healthMapOf().get(activeId) : null;
   const eff = m && ah?.fallback && ah?.modelName ? ah.modelName : m;
-  // 实际可用 = 总账号 − 风控停靠（自动冻结）− 归档；手动冻结可手动切换使用，计入可用
+  // 实际可用 = 总账号 − 冻结（手动+风控）− 归档；解冻/取消归档即恢复计算
   const total = (state?.accounts || []).length;
-  const parked = (state?.accounts || []).filter((a) => isArchived(a.id) || (isFrozen(a.id) && autoFrozenAt[a.id])).length;
+  const parked = (state?.accounts || []).filter((a) => isArchived(a.id) || isFrozen(a.id)).length;
   const base = t("list.summary", { n: total, usable: Math.max(0, total - parked), avg });
   const label = eff ? t(eff !== m ? "list.focusModelFlow" : "list.focusModel", { model: eff }) : "";
   return `<span class="lh-sum">${esc(label ? base + " · " + label : base)}</span>`;
