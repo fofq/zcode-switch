@@ -1186,11 +1186,16 @@ function summaryHtml(sum) {
   const m = focusModel();
   // 流转显示：活跃账号判定已流转到其它模型时，展示实际生效的模型
   const activeId = state?.active_account_id;
-  const ah = activeId ? healthMapOf().get(activeId) : null;
+  const hm = healthMapOf();
+  const ah = activeId ? hm.get(activeId) : null;
   const eff = m && ah?.fallback && ah?.modelName ? ah.modelName : m;
-  // 实际可用 = 总账号 − 冻结（手动+风控）− 归档；解冻/取消归档即恢复计算
+  // 实际可用 = 总账号 − 冻结（手动+风控）− 归档 − 耗尽（dead）。dead 含每日窗口当天用完的号
+  // （跨午夜服务端恢复即自动回流）；冻结/归档旗下的 dead 已由前两项扣过，health 门不会重复计
   const total = (state?.accounts || []).length;
-  const parked = (state?.accounts || []).filter((a) => isArchived(a.id) || isFrozen(a.id)).length;
+  const parked = (state?.accounts || []).filter((a) => {
+    if (isArchived(a.id) || isFrozen(a.id)) return true;
+    return hm.get(a.id)?.level === "dead";
+  }).length;
   const base = t("list.summary", { n: total, usable: Math.max(0, total - parked), avg });
   const label = eff ? t(eff !== m ? "list.focusModelFlow" : "list.focusModel", { model: eff }) : "";
   return `<span class="lh-sum">${esc(label ? base + " · " + label : base)}</span>`;
