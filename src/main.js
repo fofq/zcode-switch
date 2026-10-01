@@ -1723,7 +1723,8 @@ const actions = {
 
   async rename(id) {
     renaming = id; render();
-    const input = document.querySelector(`.row[data-id="${id}"] .rename-input`);
+    // 行与卡片两种容器：统一按 data-id 找输入框（卡片视图点击名字进入重命名时同样聚焦）
+    const input = document.querySelector(`[data-id="${id}"] .rename-input`);
     if (input) { input.focus(); input.select(); }
   },
 
@@ -2729,6 +2730,19 @@ const actions = {
         }
       },
     });
+  },
+
+  async queryGift(id) {
+    // 手动礼物查询：只发 billing/preview 拿最新可领报价（轻量，不发激活上报、不触领取）
+    if (claimable[id]?.busy) return;
+    await loadClaimPreview(id);
+    if (!uiLocked()) render();
+    const c = claimable[id] || {};
+    if (c.err) { toast(stripErr(c.err), "err"); return; }
+    const plans = c.plans || [];
+    if (!plans.length) { toast(t("m.giftQueryNone")); return; }
+    const names = plans.map((p) => planDisplayName(p.name || p.plan_id)).join(t("common.listSep"));
+    toast(t("m.giftQueryDone", { n: plans.length }), "ok", names);
   },
 
   async claim(id) {
@@ -3876,7 +3890,7 @@ function render(force = false) {
         ${healthDotHtml(h)}
         ${slim ? "" : `<span class="notch" style="background:${notchColor(a.id)}"></span>`}
         <div class="row-main"${ui.density === "compact" ? ` click="actions.toggleRow(event)" title="${esc(slim ? t("list.expandTitle") : t("list.collapseTitle"))}"` : ""}>
-          <div class="row-name">${ui.density === "compact" ? `<span class="row-chev${slim ? "" : " open"}">${ic("chevDown", 12)}</span>` : ""}${tierBadgeFor(a.id)}<span class="rn-text" title="${esc(displayName)}">${giftBadgeFor(a.id)}${esc(displayName)}</span>${isNewEnrolled(a) ? `<span class="tag-new" title="${esc(t("m.tagNewTitle"))}">${t("list.newTag")}</span>` : ""}${isFrozen(a.id) && autoFrozenAt[a.id] ? `<span class="tag-risk" title="${esc(t("m.tagRiskTitle"))}">${t("list.riskTag")}</span>` : ""}${isArchived(a.id) ? `<span class="tag-arch" title="${esc(t("m.archivedDetail"))}">${t("list.archivedTag")}</span>` : ""}${a.has_user_info === false ? `<span class="tag-relogin" title="${esc(t("btn.reloginTitle"))}">${t("btn.relogin")}</span>` : ""}${expSoon}</div>
+          <div class="row-name">${ui.density === "compact" ? `<span class="row-chev${slim ? "" : " open"}">${ic("chevDown", 12)}</span>` : ""}${tierBadgeFor(a.id)}<span class="rn-text" title="${esc(displayName)} · ${t("btn.rename")}" click="actions.rename('${a.id}')">${giftBadgeFor(a.id)}${esc(displayName)}</span>${isNewEnrolled(a) ? `<span class="tag-new" title="${esc(t("m.tagNewTitle"))}">${t("list.newTag")}</span>` : ""}${isFrozen(a.id) && autoFrozenAt[a.id] ? `<span class="tag-risk" title="${esc(t("m.tagRiskTitle"))}">${t("list.riskTag")}</span>` : ""}${isArchived(a.id) ? `<span class="tag-arch" title="${esc(t("m.archivedDetail"))}">${t("list.archivedTag")}</span>` : ""}${a.has_user_info === false ? `<span class="tag-relogin" title="${esc(t("btn.reloginTitle"))}">${t("btn.relogin")}</span>` : ""}${expSoon}</div>
           <div class="row-meta">${meta}</div>
         </div>
         <div class="row-info">${showChip ? quotaChipHtml(a.id, h) : ""}</div>
@@ -3887,7 +3901,7 @@ function render(force = false) {
             <button class="icon-btn${isFrozen(a.id) ? " on" : ""}" title="${isFrozen(a.id) ? (autoFrozenAt[a.id] ? t("btn.freezeUpgrade") : t("btn.unfreeze")) : t("btn.freeze")}" aria-label="${isFrozen(a.id) ? (autoFrozenAt[a.id] ? t("btn.freezeUpgrade") : t("btn.unfreeze")) : t("btn.freeze")}" click="actions.toggleFreeze('${a.id}')">${ic("snow", 15)}</button>
             <button class="icon-btn${isArchived(a.id) ? " on" : ""}" title="${isArchived(a.id) ? t("btn.unarchive") : t("btn.archive")}" aria-label="${isArchived(a.id) ? t("btn.unarchive") : t("btn.archive")}" click="actions.toggleArchive('${a.id}')">${ic("box", 15)}</button>
             <button class="icon-btn${acctQuota[a.id]?.busy ? " spinning" : ""}" title="${t("btn.refreshQuota")}" aria-label="${t("btn.refreshQuota")}" click="actions.acctQuota('${a.id}')">${ic("refresh", 15)}</button>
-            <button class="icon-btn" title="${t("btn.rename")}" aria-label="${t("btn.rename")}" click="actions.rename('${a.id}')">${ic("pen", 15)}</button>
+            <button class="icon-btn${claimable[a.id]?.busy ? " spinning" : ""}" title="${t("btn.giftQuery")}" aria-label="${t("btn.giftQuery")}" click="actions.queryGift('${a.id}')">${ic("search", 15)}</button>
             <button class="icon-btn" title="${t("btn.export")}" aria-label="${t("btn.export")}" click="actions.exportOne('${a.id}')">${ic("export", 15)}</button>
             <button class="icon-btn${isActive ? " on" : ""}" title="${t("btn.coldSwitch")}" aria-label="${t("btn.coldSwitch")}" click="actions.askColdSwitch('${a.id}')">${ic("power", 15)}</button>
             <button class="icon-btn danger" title="${t("btn.delete")}" aria-label="${t("btn.delete")}" click="actions.delete('${a.id}')">${ic("x", 15)}</button>
@@ -3954,7 +3968,7 @@ function render(force = false) {
       <span class="notch" style="background:${notchColor(a.id)}"></span>
       <div class="card-head">
         <div class="card-id">
-          <div class="row-name">${seq != null ? `<span class="card-seq" title="${esc(t("list.seqTitle"))}">${seq}</span>` : ""}${giftBadgeFor(a.id)}<span class="rn-text" title="${esc(displayName)}">${esc(displayName)}</span>${isNewEnrolled(a) ? `<span class="tag-new" title="${esc(t("m.tagNewTitle"))}">${t("list.newTag")}</span>` : ""}${isFrozen(a.id) && autoFrozenAt[a.id] ? `<span class="tag-risk" title="${esc(t("m.tagRiskTitle"))}">${t("list.riskTag")}</span>` : ""}${isArchived(a.id) ? `<span class="tag-arch" title="${esc(t("m.archivedDetail"))}">${t("list.archivedTag")}</span>` : ""}</div>
+          <div class="row-name">${seq != null ? `<span class="card-seq" title="${esc(t("list.seqTitle"))}">${seq}</span>` : ""}${giftBadgeFor(a.id)}<span class="rn-text" title="${esc(displayName)} · ${t("btn.rename")}" click="actions.rename('${a.id}')">${esc(displayName)}</span>${isNewEnrolled(a) ? `<span class="tag-new" title="${esc(t("m.tagNewTitle"))}">${t("list.newTag")}</span>` : ""}${isFrozen(a.id) && autoFrozenAt[a.id] ? `<span class="tag-risk" title="${esc(t("m.tagRiskTitle"))}">${t("list.riskTag")}</span>` : ""}${isArchived(a.id) ? `<span class="tag-arch" title="${esc(t("m.archivedDetail"))}">${t("list.archivedTag")}</span>` : ""}</div>
           <div class="row-meta">${meta}</div>
         </div>
         <span class="card-side">
@@ -3972,7 +3986,7 @@ function render(force = false) {
           <button class="icon-btn sm${isFrozen(a.id) ? " on" : ""}" title="${isFrozen(a.id) ? (autoFrozenAt[a.id] ? t("btn.freezeUpgrade") : t("btn.unfreeze")) : t("btn.freeze")}" aria-label="${isFrozen(a.id) ? (autoFrozenAt[a.id] ? t("btn.freezeUpgrade") : t("btn.unfreeze")) : t("btn.freeze")}" click="actions.toggleFreeze('${a.id}')">${ic("snow", 14)}</button>
           <button class="icon-btn sm${isArchived(a.id) ? " on" : ""}" title="${isArchived(a.id) ? t("btn.unarchive") : t("btn.archive")}" aria-label="${isArchived(a.id) ? t("btn.unarchive") : t("btn.archive")}" click="actions.toggleArchive('${a.id}')">${ic("box", 14)}</button>
           <button class="icon-btn sm${acctQuota[a.id]?.busy ? " spinning" : ""}" title="${t("btn.refreshQuota")}" aria-label="${t("btn.refreshQuota")}" click="actions.acctQuota('${a.id}')">${ic("refresh", 14)}</button>
-          <button class="icon-btn sm" title="${t("btn.rename")}" aria-label="${t("btn.rename")}" click="actions.rename('${a.id}')">${ic("pen", 14)}</button>
+          <button class="icon-btn sm${claimable[a.id]?.busy ? " spinning" : ""}" title="${t("btn.giftQuery")}" aria-label="${t("btn.giftQuery")}" click="actions.queryGift('${a.id}')">${ic("search", 14)}</button>
           <button class="icon-btn sm" title="${t("btn.export")}" aria-label="${t("btn.export")}" click="actions.exportOne('${a.id}')">${ic("export", 14)}</button>
           <button class="icon-btn sm${isActive ? " on" : ""}" title="${t("btn.coldSwitch")}" aria-label="${t("btn.coldSwitch")}" click="actions.askColdSwitch('${a.id}')">${ic("power", 14)}</button>
           <button class="icon-btn sm danger" title="${t("btn.delete")}" aria-label="${t("btn.delete")}" click="actions.delete('${a.id}')">${ic("x", 14)}</button>
