@@ -223,7 +223,7 @@ export const en = {
   "list.bulkUnarchive": "Unarchive",
   "list.toastBulkArchived": "{n} accounts archived",
   "list.toastBulkUnarchived": "{n} accounts unarchived",
-  "list.summary": "{n} accounts · avg {avg} left",
+  "list.summary": "{n} accounts · {usable} usable · avg {avg} left",
   "list.focusModel": "current focus {model}",
   "list.focusModelFlow": "current focus {model} · flowed",
   "list.qhBtn": "Quota Stats",

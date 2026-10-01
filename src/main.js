@@ -648,11 +648,12 @@ function healthMapOf() {
         h = { ...h, remainingPct: pct, level: levelOf(pct, opts.threshold), modelMatched: true, modelName: lg.worstName || h.modelName, fromLog: true };
       }
     }
-    // 冻结叠加只遮「有额度/状态未定」的号：底层已判死（耗尽）的号回归真实分组——
-    // 冻结语义是「有额度但被停靠」，对没额度的号没有意义，遮住只会造成
-    // 「明明没额度却永远挂在冻结组」的吸收态（自动冻结标记由 noteFrozenQuotaSeen
-    // 解除；手动冻结标记保留，仅显示归位到额度耗尽组）
-    if (isFrozen(a.id) && h.level !== "dead") h = { ...h, level: "frozen" };
+    // 冻结叠加：手动冻结遮「有额度/状态未定」的号，底层已判死的回归真实分组
+    // （用户拍板的停靠不遮真相）；**风控自动冻结一律进「已冻结」组**——新语义下
+    // 风控停靠包含「停止领取」，对无额度号同样成立，且用户要求目视统一：
+    // 带风控标签的号必须能在冻结组找到（018e203 后 dead+风控=「撞墙且没额度」，
+    // 散落在额度耗尽组里反而难盘点）
+    if (isFrozen(a.id) && (autoFrozenAt[a.id] || h.level !== "dead")) h = { ...h, level: "frozen" };
     map.set(a.id, h);
   }
   return map;
@@ -1187,7 +1188,10 @@ function summaryHtml(sum) {
   const activeId = state?.active_account_id;
   const ah = activeId ? healthMapOf().get(activeId) : null;
   const eff = m && ah?.fallback && ah?.modelName ? ah.modelName : m;
-  const base = t("list.summary", { n: (state?.accounts || []).length, avg });
+  // 实际可用 = 总账号 − 风控停靠（自动冻结）− 归档；手动冻结可手动切换使用，计入可用
+  const total = (state?.accounts || []).length;
+  const parked = (state?.accounts || []).filter((a) => isArchived(a.id) || (isFrozen(a.id) && autoFrozenAt[a.id])).length;
+  const base = t("list.summary", { n: total, usable: Math.max(0, total - parked), avg });
   const label = eff ? t(eff !== m ? "list.focusModelFlow" : "list.focusModel", { model: eff }) : "";
   return `<span class="lh-sum">${esc(label ? base + " · " + label : base)}</span>`;
 }

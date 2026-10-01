@@ -218,7 +218,7 @@ export const zh = {
   "list.bulkUnarchive": "取消归档",
   "list.toastBulkArchived": "已归档 {n} 个账号",
   "list.toastBulkUnarchived": "已取消归档 {n} 个账号",
-  "list.summary": "{n} 个账号 · 平均剩余 {avg}",
+  "list.summary": "{n} 个账号 · 可用 {usable} · 平均剩余 {avg}",
   "list.focusModel": "当前关注模型 {model}",
   "list.focusModelFlow": "当前关注模型 {model} · 已流转",
   "list.qhBtn": "额度统计",
