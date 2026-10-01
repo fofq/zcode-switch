@@ -136,7 +136,7 @@ function armClaimCheck(id) {
 }
 // 新实例登记：plan_id 首次出现（preview/balance/客户端日志任一来源）→ 级联一次：
 // 所有未持有该实例的账号错峰排入领取轮。global 族按「领过即出列」、其余族按实例比对；
-// 手动冻结号不级联（用户决定停靠）；自动冻结号参与——新礼物到账正是它的恢复路径，
+// 冻结号（手动=风控代位/自动）均参与——新礼物到账正是停靠号的复测/恢复路径，
 // 节奏仍由领取冷却/风控顺延统一节流。级联只铺冷却，顺序/限速仍由分层轮次统一控制。
 // 过期/非生效实例只登记不级联（否则每次余额刷新都会重复触发）
 function notePlanInstances(list) {
@@ -178,7 +178,6 @@ function scheduleGiftCascade(planId, planName) {
     if (isArchived(id)) continue; // 归档号不级联（用户决定停靠，不参与任何自动领取）
     const led = claimLedger[id] || {};
     if (fam === "global" ? led.global : led[fam] === planId) continue;
-    if (isFrozen(id) && !autoFrozenAt[id]) continue;
     // 错峰铺开（20s×序号±抖动）：级联只让账号「变为可调」，不做对齐风暴
     const stagger = n * 20_000 + Math.round(Math.random() * 20_000);
     autoClaimCooldown[id] = Math.min(autoClaimCooldown[id] ?? Infinity, now + stagger);
@@ -1940,6 +1939,10 @@ const actions = {
           delete autoUnfreezeEmpty[id];
         }
         frozenIds.add(id);
+        // 手动冻结 = 风控冻结代位（用户弥补风控不及时）：与自动冻结同轨「停靠含停止领取」
+        delete claimUrgent[id];
+        autoClaimCooldown[id] = Math.max(autoClaimCooldown[id] ?? 0,
+          Date.now() + autoClaimGap(3 * 60 * 60 * 1000));
       } else {
         frozenIds.delete(id);
         delete autoFrozenAt[id];
@@ -2453,6 +2456,10 @@ const actions = {
       delete autoFrozenAt[id];
       delete autoUnfreezeHits[id];
       delete autoUnfreezeEmpty[id];
+      // 升级 = 用户确认风控停靠：重新拉满 3h 探测窗口（max 不缩短既有冷却）
+      delete claimUrgent[id];
+      autoClaimCooldown[id] = Math.max(autoClaimCooldown[id] ?? 0,
+        Date.now() + autoClaimGap(3 * 60 * 60 * 1000));
       saveAutoFrozen();
       // frozenIds 不动：从「系统停靠」原地变为「用户停靠」
     } else {
@@ -2466,6 +2473,12 @@ const actions = {
         delete autoUnfreezeHits[id];
         delete autoUnfreezeEmpty[id];
         saveAutoFrozen();
+      } else {
+        // 手动冻结 = 风控冻结代位（弥补风控不及时）：与自动冻结同轨「停靠含停止领取」——
+        // 写入 3h 探测冷却，到期后随轮复测；撞墙顺延（noteClaimRisk）与提交成功解冻同轨
+        delete claimUrgent[id];
+        autoClaimCooldown[id] = Math.max(autoClaimCooldown[id] ?? 0,
+          Date.now() + autoClaimGap(3 * 60 * 60 * 1000));
       }
     }
     render();
@@ -2972,8 +2985,14 @@ function claimFailureRisk(r) {
  *  手动冻结不介入（用户拍板）；额度门已删除——风控停靠的语义包含「停止领取」，
  *  对无额度号同样成立（防抖与解冻出路见 noteFrozenQuotaSeen 注释）。 */
 function noteClaimRisk(id) {
-  if (isFrozen(id) && !autoFrozenAt[id]) return; // 手动冻结：用户决定，不介入
   const now = Date.now();
+  // 手动冻结 = 风控冻结代位：复测撞墙同样顺延停靠（同 24h 封顶）；不夺取所有权、
+  // 不记 streak——b/c) 证据机不盘点手动冻结，streak 只是它的观测计数
+  if (isFrozen(id) && !autoFrozenAt[id]) {
+    const cap = now + 24 * 60 * 60 * 1000;
+    autoClaimCooldown[id] = Math.min(Math.max(autoClaimCooldown[id] ?? 0, now + autoClaimGap(3 * 60 * 60 * 1000)), cap);
+    return;
+  }
   // 信号时间窗：超过 24h 的旧信号不累计（streak 现仅作观测计数，冻结不再依赖它）
   if ((autoRiskLastAt[id] ?? 0) < now - 24 * 3600e3) autoRiskStreak[id] = 0;
   autoRiskLastAt[id] = now;
