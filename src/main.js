@@ -647,11 +647,11 @@ function healthMapOf() {
         h = { ...h, remainingPct: pct, level: levelOf(pct, opts.threshold), modelMatched: true, modelName: lg.worstName || h.modelName, fromLog: true };
       }
     }
-    // 冻结叠加：冻结（手动=风控代位/自动）一律进「已冻结」组——手动冻结的意义就是
-    // 弥补风控不及时（250b1d2），目视盘点同样要能在冻结组找到；base 保留罩前真实
-    // 分组，供调度区分节奏（scheduleNext：耗尽号 90min 只对手动冻结/未冻结生效，
-    // 自动冻结的耗尽号保持 5min 喂 b/c) 解冻证据机）
-    if (isFrozen(a.id)) h = { ...h, base: h.level, level: "frozen" };
+    // 冻结叠加：自动冻结一律进「已冻结」组（bd1f591：风控停靠含停止领取，撞墙号
+    // 必须能在冻结组盘点）；手动冻结遮「有额度/状态未定」的号（用户确认的风控嫌疑），
+    // 但底层正常耗尽（套餐到期/额度自然耗尽，非风控撞墙）回归额度耗尽组——
+    // 10-02 定案：正常耗尽不因手动冻结改组，冻结组只收「风控嫌疑」的号
+    if (isFrozen(a.id) && (autoFrozenAt[a.id] || h.level !== "dead")) h = { ...h, level: "frozen" };
     map.set(a.id, h);
   }
   return map;
@@ -2745,9 +2745,24 @@ const actions = {
   },
 
   async queryGift(id) {
-    // 手动礼物查询：只发 billing/preview 拿最新可领报价（轻量，不发激活上报、不触领取）
+    // 手动礼物查询：与自动轮的单号查询完全同轨（claim_refresh = 激活上报 + preview），
+    // 仅触发方式不同；urgent 走 180s 快槽（同为用户主动操作，同入库/切号紧急检查）。
+    // 不受冻结/冷却限制（主动行为），风控信号同样记账（撞墙顺延/首次即冻结）
     if (claimable[id]?.busy) return;
-    await loadClaimPreview(id);
+    claimable[id] = { ...(claimable[id] || {}), busy: true };
+    try {
+      const r = await invoke("claim_refresh", { id, urgent: true });
+      claimable[id] = { plans: r.plans || [], err: null, busy: false };
+      // 同自动轮：激活上报被上游拒绝 = 该号正被风控盯上，实时记账
+      if (r.activationError && riskInText(stripErr(r.activationError))) noteClaimRisk(id);
+      // preview 结果喂给实例登记：新 plan_id 首现 → 级联未持有者
+      notePlanInstances((r.plans || []).map((p) => ({ planId: p.plan_id, name: p.name })));
+    } catch (e) {
+      claimable[id] = { plans: claimable[id]?.plans || [], err: String(e), busy: false };
+      if (riskInText(stripErr(e))) noteClaimRisk(id);
+      else autoClaimCooldown[id] = Math.max(autoClaimCooldown[id] ?? 0,
+        Date.now() + autoClaimGap(AUTO_CLAIM_INTERVAL_MS));
+    }
     if (!uiLocked()) render();
     const c = claimable[id] || {};
     if (c.err) { toast(stripErr(c.err), "err"); return; }
@@ -3141,7 +3156,9 @@ async function autoClaimTick() {
       } catch (e) {
         claimable[id] = { plans: claimable[id]?.plans || [], err: String(e), busy: false };
         if (riskInText(stripErr(e))) { noteClaimRisk(id); noteFleetRiskFail(); }
-        autoClaimCooldown[id] = Date.now() + autoClaimGap(AUTO_CLAIM_INTERVAL_MS);
+        // G7 同款：30min 例行退避不得覆盖 noteClaimRisk 刚写入的 3h 停靠冷却
+        autoClaimCooldown[id] = Math.max(autoClaimCooldown[id] ?? 0,
+          Date.now() + autoClaimGap(AUTO_CLAIM_INTERVAL_MS));
         roundSkipped++;
         continue;
       }
@@ -4448,9 +4465,9 @@ function scheduleNext(id, base = Date.now()) {
   }
   // 耗尽号：大幅拉长复查周期（60-120 分钟）——几十个死号按 5 分钟刷是纯风控负担；
   // 新礼物（周礼/Global Build）发放后下一次刷新即恢复 normal 轮换。
-  // 按「罩前分组」(base) 判断：自动冻结的耗尽号例外保持 5min——那是 b/c) 解冻
-  // 证据机的数据源；手动冻结的耗尽号没有消费者，维持 90min 不增流量
-  if ((h?.base || h?.level) === "dead" && !(isFrozen(id) && autoFrozenAt[id])) {
+  // 自动冻结的耗尽号因冻结叠加 level=frozen、落入下方 5min 档——那是 b/c) 解冻
+  // 证据机的数据源，有意为之；正常耗尽（含手动冻结的）保持本 90min 节奏
+  if (h?.level === "dead") {
     const j = 1 + (Math.random() * 2 - 1) * SWEEP_JITTER_DEAD;
     quotaDue[id] = base + Math.round(SWEEP_PERIOD_DEAD * j);
     return;
