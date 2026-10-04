@@ -1137,8 +1137,13 @@ select.two-input { cursor: pointer; }
 .plan-grp + .plan-grp { margin-top: 7px; padding-top: 6px; border-top: 1px dashed var(--hairline-soft); }
 /* 过期套餐是留档：整组置灰，避免「已过期」tag 旁边还挂着满血绿条误导（冻结号看起来像有额度） */
 .plan-grp.expired { opacity: .5; }
+/* 条目级额度条仍按 percent_used 画满绿（无未来额度的号 percent_used=0 → 满格条），
+   父级 opacity 压不住内联背景色——对过期组内 qbar 再灰化，消除「100% 绿条+已过期」同屏 */
+.plan-grp.expired .qbar { filter: grayscale(1); opacity: .8; }
 .pg-head { display: flex; align-items: center; gap: 7px; margin-bottom: 3px; min-width: 0; }
 .plan-expired { font-family: var(--mono); font-size: 10px; color: #c4766f; border: 1px solid rgba(224,86,106,.45); border-radius: 4px; padding: 1px 5px; margin-left: 6px; }
+/* 「停靠」弱标签（手动冻结）：中性色弱化，与「风控」红标区分——手动冻结=用户拍板的停靠，非风控信号 */
+.tag-dock { font-family: var(--mono); font-size: 10px; color: var(--ink-dim); border: 1px solid var(--hairline); border-radius: 4px; padding: 1px 5px; margin-left: 6px; }
 .pg-name {
   font-size: 12.5px;
   color: var(--ink-dim);

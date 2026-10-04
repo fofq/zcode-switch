@@ -799,16 +799,32 @@ fn merge_parts(parts: Vec<QuotaOverview>) -> QuotaOverview {
         }
         refreshed = refreshed.max(p.refreshed_at);
         for s in &p.plans {
-            let dup = slot_src.iter().enumerate().any(|(i, src)| {
-                src != &p.source
+            // 跨来源同名同 tier 且双非空 items 的槽先入槽者胜；命中 dup 不再整体丢弃——
+            // 把后到槽的过期断言合并进存活槽（expired 取 OR、expire 文本补缺）。
+            // monitor 通道恒不下发 expired，billing 的过期标记若随槽被挤掉，
+            // 前端 planExpired 在 expire 文本也缺失时整体失效，死号顶着满格
+            // 额度条留在「额度充足」。只增不减信号，不动下方 pri_idx 的额度数值选取
+            let dup_idx = slot_src.iter().enumerate().find_map(|(i, src)| {
+                (src != &p.source
                     && slots[i].tier == s.tier
                     && slots[i].name == s.name
                     && !slots[i].items.is_empty()
-                    && !s.items.is_empty()
+                    && !s.items.is_empty())
+                .then_some(i)
             });
-            if !dup {
-                slots.push(s.clone());
-                slot_src.push(p.source.clone());
+            match dup_idx {
+                None => {
+                    slots.push(s.clone());
+                    slot_src.push(p.source.clone());
+                }
+                Some(i) => {
+                    if s.expired == Some(true) && slots[i].expired != Some(true) {
+                        slots[i].expired = Some(true);
+                        if slots[i].expire.is_none() {
+                            slots[i].expire = s.expire.clone();
+                        }
+                    }
+                }
             }
         }
     }
@@ -1750,5 +1766,39 @@ mod no_plan_tests {
         let start = ov.plans.iter().find(|s| s.pid == "zcode-v3-start-plan-0817").expect("start 槽应存在");
         assert_eq!(start.items.len(), 1, "start 余额应挂进 start 槽");
         assert_eq!(start.gift, Some(false), "monthly 周期不是礼物");
+    }
+
+    /// 跨来源合并：monitor 先入槽、billing 同名同 tier 带 expired 后到 →
+    /// 后到槽并入存活槽时必须合并过期断言（expired 取 OR、expire 文本补缺），
+    /// 不得随槽整体丢弃——monitor 通道恒不下发 expired，丢了它 monitor 供数的
+    /// 过期号在跨来源合并后丢失过期标记，前端死号顶着满格额度条留在「额度充足」。
+    #[test]
+    fn merge_parts_lifts_expired_from_later_billing_slot() {
+        let monitor = QuotaOverview {
+            source: "bigmodel.cn/api/monitor".into(),
+            plans: vec![PlanSlot {
+                tier: Some("GLM Coding Plan".into()),
+                name: Some("GLM Coding Plan".into()),
+                items: vec![QuotaItem { name: "prompt".into(), ..Default::default() }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let billing = QuotaOverview {
+            source: "zcode.z.ai/billing".into(),
+            plans: vec![PlanSlot {
+                tier: Some("GLM Coding Plan".into()),
+                name: Some("GLM Coding Plan".into()),
+                expire: Some("2026-08-01".into()),
+                expired: Some(true),
+                items: vec![QuotaItem { name: "prompt".into(), ..Default::default() }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let merged = merge_parts(vec![monitor, billing]);
+        assert_eq!(merged.plans.len(), 1, "同名同 tier 双非空槽：后到者并入存活槽");
+        assert_eq!(merged.plans[0].expired, Some(true), "过期断言必须合并进存活槽");
+        assert_eq!(merged.plans[0].expire.as_deref(), Some("2026-08-01"), "expire 文本补缺");
     }
 }
