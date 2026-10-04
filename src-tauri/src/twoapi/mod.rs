@@ -752,7 +752,8 @@ fn sniff_200_head(mut reader: Box<dyn std::io::Read + Send>) -> (Vec<u8>, Box<dy
     let mut buf = [0u8; 2048];
     while head.len() < SNIFF_CAP && !has_model_key(&head) {
         let room = SNIFF_CAP - head.len();
-        match reader.read(&mut buf[..room.min(buf.len())]) {
+        let want = room.min(buf.len());
+        match reader.read(&mut buf[..want]) {
             Ok(0) => break,
             Ok(n) => head.extend_from_slice(&buf[..n]),
             Err(_) => break,
@@ -1281,7 +1282,7 @@ fn append_head_usage(
             t: unix_now(),
             acct: acct.to_string(),
             model: model.to_string(),
-            up,
+            up: up.clone(),
             code: code.clone(),
             input_tokens: 0,
             output_tokens: 0,
@@ -1316,7 +1317,7 @@ fn log_usage(ctx: &UsageCtx, s: &meter::MeterSummary) {
             t: unix_now(),
             acct: ctx.acct.clone(),
             model: ctx.model.clone(),
-            up,
+            up: up.clone(),
             code: code.clone(),
             input_tokens: s.input_tokens,
             output_tokens: s.output_tokens,
@@ -2005,9 +2006,9 @@ mod tests {
 
     #[test]
     fn peek_model_extracts_upstream_name() {
-        assert_eq!(peek_model(br#""model":"glm-5.3","x":1"#), "glm-5.3");
+        assert_eq!(peek_model(r#""model":"glm-5.3","x":1"#), "glm-5.3");
         assert_eq!(peek_model("no model here"), "");
-        assert_eq!(peek_model(br#""model":""#), "");
+        assert_eq!(peek_model(r#""model":""#), "");
     }
 
     #[test]
