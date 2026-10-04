@@ -2,7 +2,8 @@
 //! 套餐额度只挂在 zcode-plan 体系（JWT），所以这里**只认 JWT**——平台 key 属于
 //! 「复制 key / 免费模型 key 池」路径，两条路刻意不混（见 store::account_jwt_key）。
 //! 所有涉及账号解密的调用都放进 spawn_blocking，避免占死异步运行时导致界面卡死。
-//! 故障切换的后续候选（全账号 JWT 池）由 mod.rs 在主候选失败后按需拉取（store::jwt_pool）。
+//! 主候选解析失败不再终止请求（也无视冷却的豁免）：mod.rs 会把原因记入聚合后
+//! 落回全账号 JWT 池继续试（store::jwt_pool），冷却过滤对主账号与池候选一视同仁。
 
 use std::time::{Duration, Instant};
 

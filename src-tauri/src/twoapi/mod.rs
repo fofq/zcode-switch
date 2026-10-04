@@ -10,13 +10,23 @@
 //!   失败后按需拉全账号 JWT 池继续试（≤5 个），按错误分类冷却：
 //!   401/403→600s、429（Retry-After 退避后）→30s、402/额度词→1800s、3012 风控与 WAF
 //!   （3xx / 2xx 非 JSON 挑战页）→120s、连接失败→60s；全败聚合 503。
+//!   冷却过滤对主账号与池候选一视同仁；主候选解析失败也落池继续试；池候选按粘性
+//!   排序（最近成功账号优先，见 SharedState.sticky）。
 //!   上游请求带官方客户端全套伪装头（quota::zai_billing_headers_with_mid，
-//!   每账号配自己的虚拟 device_mid 防 3001 错位）+ metadata.user_id。
+//!   每账号配自己的虚拟 device_mid 防 3001 错位，另补 x-api-key/sec-fetch-mode/
+//!   accept-language）+ metadata.user_id（恒覆盖，session_id 每账号每日）+ max_tokens
+//!   缺省 8192 + 官方 system 回放（sysprompt，3012 风控的关键，取不到块保持现状）。
+//!   200 响应先嗅探 ≤4KB 头：错误信封伪装（无 "model":" 有 error/code 线索）按风控
+//!   换号，全部候选都异常 200 时回放最后一份（Anthropic 入站原样、OpenAI 入站按协议
+//!   翻译成错误，见 replay_abnormal）；响应流全程包 meter::Meter 计量，
+//!   usage 落 store_dir()/usage.jsonl（>8MB 轮转），并发一行 flowlog 日志。
 //! OpenAI 入站的套餐请求做 请求/响应/SSE 三层翻译（openai_map）：
 //!   thinking→reasoning_content、带 signature 的思考块经回放缓存注回工具循环。
 
+pub mod meter;
 pub mod openai_map;
 pub mod resolve;
+pub mod sysprompt;
 
 use axum::body::Body;
 use axum::extract::State;
@@ -49,6 +59,12 @@ const COOL_RATE: u64 = 30; // 429 退避重试仍失败
 const COOL_EXHAUSTED: u64 = 1800; // 402/额度耗尽
 const COOL_RISK: u64 = 120; // 3012 风控 / WAF 挑战
 const COOL_NET: u64 = 60; // 连接失败
+/// 客户端没带 max_tokens 时的上游缺省（只补缺省不覆盖；参考 zcode-pool external_body）
+const PLAN_DEFAULT_MAX_TOKENS: i64 = 8192;
+/// 真模型响应在缓冲头里必有的键（JSON 顶层或 message_start 的 "model":"）
+const MODEL_KEY: &[u8] = b"\"model\":\"";
+/// 200 响应嗅探缓冲上限（字节）：单次 read 裁到剩余配额，head 恰好不超此数
+const SNIFF_CAP: usize = 4096;
 
 pub fn is_free_model(m: &str) -> bool {
     let l = m.to_lowercase();
@@ -288,6 +304,8 @@ pub struct SharedState {
     pub active_cache: Mutex<Option<(std::time::Instant, Option<String>)>>,
     /// 套餐路由账号冷却表：id -> 冷却截止时刻
     pub cooldown: Mutex<HashMap<String, std::time::Instant>>,
+    /// 粘性路由：最近成功交付的账号 id；下一请求把它排到池候选最前（主账号未冷却时仍最先）
+    pub sticky: Mutex<Option<String>>,
     /// 轮询游标
     pub rr: AtomicU64,
 }
@@ -347,6 +365,7 @@ pub async fn sync(paths: &Paths) -> Result<(), String> {
         pool: Mutex::new(None),
         active_cache: Mutex::new(None),
         cooldown: Mutex::new(HashMap::new()),
+        sticky: Mutex::new(None),
         rr: AtomicU64::new(0),
     });
     let app = router(state.clone());
@@ -407,6 +426,7 @@ pub async fn start_for_test(paths: &Paths, port_override: Option<u16>) -> Result
         pool: Mutex::new(None),
         active_cache: Mutex::new(None),
         cooldown: Mutex::new(HashMap::new()),
+        sticky: Mutex::new(None),
         rr: AtomicU64::new(0),
     });
     let app = router(state.clone());
@@ -686,6 +706,91 @@ fn ctype_ok(ctype: &str) -> bool {
     l.contains("json") || l.contains("event-stream")
 }
 
+/// 每账号每日 session_id：sha256("zsw-sid|账号id|UTC日期") 取前 16 字节，手工置
+/// version/variant 位后按 uuid v4 格式化。同账号同日稳定、跨日轮换——上游按 session
+/// 侧记风控信誉（参考 zcode-pool gateway.rs::account_session，种子改用 UTC 日期）。
+fn account_session_id(acct: &str, day: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(b"zsw-sid|");
+    h.update(acct.as_bytes());
+    h.update(b"|");
+    h.update(day.as_bytes());
+    let d = h.finalize();
+    let mut b = [0u8; 16];
+    b.copy_from_slice(&d[..16]);
+    b[6] = (b[6] & 0x0f) | 0x40;
+    b[8] = (b[8] & 0x3f) | 0x80;
+    uuid::Uuid::from_bytes(b).to_string()
+}
+
+/// UTC 日期（yyyy-mm-dd）：session_id 的日轮换种子
+fn utc_today() -> String {
+    chrono::Utc::now().format("%Y-%m-%d").to_string()
+}
+
+fn has_model_key(h: &[u8]) -> bool {
+    h.windows(MODEL_KEY.len()).any(|w| w == MODEL_KEY)
+}
+
+/// 异常 200 判定：缓冲头里没有 "model":" 但含 "error"/"code" 线索 → 错误信封伪装
+/// 成 200（参考 zcode-pool gateway.rs 的 abnormal 嗅探；真模型响应的 message_start /
+/// JSON 顶层必带 "model":"）。
+fn abnormal_200_head(head: &[u8]) -> bool {
+    if has_model_key(head) {
+        return false;
+    }
+    let txt = String::from_utf8_lossy(head);
+    txt.contains("\"error\"") || txt.contains("\"code\"")
+}
+
+/// 200 响应嗅探：从响应体预读 ≤4KB（拿到 "model":" 或 EOF 即停；单次 read 裁到剩余
+/// 配额，head 恰好封顶 4KB），返回（缓冲头, 剩余 reader）。嗅探后缓冲头原样续接剩余
+/// 流——正常路径的字节转发不受影响。
+fn sniff_200_head(mut reader: Box<dyn std::io::Read + Send>) -> (Vec<u8>, Box<dyn std::io::Read + Send>) {
+    let mut head = Vec::new();
+    let mut buf = [0u8; 2048];
+    while head.len() < SNIFF_CAP && !has_model_key(&head) {
+        let room = SNIFF_CAP - head.len();
+        match reader.read(&mut buf[..room.min(buf.len())]) {
+            Ok(0) => break,
+            Ok(n) => head.extend_from_slice(&buf[..n]),
+            Err(_) => break,
+        }
+    }
+    (head, reader)
+}
+
+/// 从流头文本嗅探上游实际模型名（"model":" 值）；没有返回空串
+fn peek_model(head: &str) -> String {
+    let Some(i) = head.find("\"model\":\"") else {
+        return String::new();
+    };
+    let rest = &head[i + "\"model\":\"".len()..];
+    match rest.find('"') {
+        Some(0) | None => String::new(),
+        Some(end) => rest[..end].to_string(),
+    }
+}
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// 粘性排序：把最近成功账号（sticky）排到池候选最前，其余保持相对顺序（稳定排序）
+fn sticky_first(
+    mut pool: Vec<(String, String, ApiKeyInfo, Option<String>)>,
+    sticky: Option<&str>,
+) -> Vec<(String, String, ApiKeyInfo, Option<String>)> {
+    if let Some(sid) = sticky {
+        pool.sort_by_key(|(id, ..)| id.as_str() != sid);
+    }
+    pool
+}
+
 /// 全部候选失败：503 + 去重原因聚合（≤300 字符）+ 最近冷却恢复倒计时。
 fn final_unavailable(mode: &PumpMode, reasons: &[String], st: &Arc<SharedState>) -> Response {
     let mut uniq: Vec<String> = Vec::new();
@@ -720,10 +825,14 @@ fn final_unavailable(mode: &PumpMode, reasons: &[String], st: &Arc<SharedState>)
 }
 
 /// 套餐路由统一入口（anthropic 入站 Raw / OpenAI 入站翻译模式共用）：多账号降级链。
-/// 主候选 = 锁定账号（用户显式指定，无视冷却）或跟随激活账号；主候选失败后按需拉
-/// 全账号 JWT 池（store::jwt_pool，纯本地）继续试，最多 MAX_PLAN_ATTEMPTS 个候选。
+/// 主候选 = 锁定账号或跟随激活账号（与池候选同受冷却过滤：主账号冷却中就跳过）；
+/// 主候选解析失败**不再终止请求**——原因记入聚合后同样落回全账号 JWT 池
+/// （store::jwt_pool，纯本地）继续试，最多 MAX_PLAN_ATTEMPTS 个候选。
+/// 池候选按粘性排序：最近成功账号（st.sticky）排最前（主账号未冷却时仍最先）。
 /// 每次尝试带官方客户端伪装头（quota::zai_billing_headers_with_mid，账号配对 mid），
-/// 非 2xx 缓冲分类处置（验证码桥接 / 冷却换号 / 如实透传）。
+/// 非 2xx 缓冲分类处置（验证码桥接 / 冷却换号 / 如实透传）；每次尝试都以异常 200 收场
+/// （无任何其他失败原因）时把最后一份异常响应回放（Raw 原样 / OpenAI 入站按协议翻译，
+/// 见 replay_abnormal）；混合失败不回放，落 503 聚合。
 async fn relay_plan_multi(
     st: &Arc<SharedState>,
     anthropic_version: &str,
@@ -732,21 +841,38 @@ async fn relay_plan_multi(
     path: &str,
     mode: &PumpMode,
 ) -> Response {
-    let primary = match resolve::resolve_primary(st).await {
-        Ok(p) => p,
-        Err(e) => {
-            stats().errors.fetch_add(1, Ordering::Relaxed);
-            return err_json(StatusCode::BAD_GATEWAY, &e);
-        }
+    // 官方 system 两块：注册表扫描/读 cjs/解析是重活，一次请求取一次（进程 OnceLock
+    // + 磁盘缓存后是快速路径）；拿不到则 rendered_body 保持现状。仅 /v1/messages 需要。
+    let sys_blocks: Option<Vec<Value>> = if path.ends_with("/v1/messages") {
+        tauri::async_runtime::spawn_blocking(|| {
+            sysprompt::official_system_blocks(Some(&Paths::detect().store_dir()))
+        })
+        .await
+        .unwrap_or(None)
+    } else {
+        None
     };
-    let mut candidates = vec![Candidate {
-        label: account_label("", &primary.id),
-        id: primary.id,
-        info: primary.info,
-        mid: primary.mid,
-    }];
+    // 主候选解析：失败不再直接 502，落回 JWT 池候选继续（原因记入聚合）
+    let mut candidates: Vec<Candidate> = Vec::new();
+    let mut reasons: Vec<String> = Vec::new();
+    match resolve::resolve_primary(st).await {
+        Ok(p) => {
+            if cooling_remaining(st, &p.id).is_some() {
+                // 冷却过滤同样作用于主账号（pinned/follow）：冷却中就跳过它
+                reasons.push(format!("主账号 {} 冷却中，跳过", p.id));
+            } else {
+                candidates.push(Candidate {
+                    label: account_label("", &p.id),
+                    id: p.id,
+                    info: p.info,
+                    mid: p.mid,
+                });
+            }
+        }
+        Err(e) => reasons.push(format!("主账号解析失败: {e}")),
+    }
     let mut tried: Vec<String> = vec![];
-    let mut reasons: Vec<String> = vec![];
+    let mut ablog = AbnormalLog::default();
     let mut pool_loaded = false;
     for _ in 0..MAX_PLAN_ATTEMPTS {
         let cand = loop {
@@ -757,13 +883,16 @@ async fn relay_plan_multi(
                 break None;
             }
             pool_loaded = true;
-            // 主候选已败：按需拉全账号 JWT 池（排除已试与冷却中）
+            // 无主候选可试（解析失败/冷却跳过/已败）：按需拉全账号 JWT 池（排除已试与冷却中）
             let others = tauri::async_runtime::spawn_blocking(move || store::jwt_pool(&Paths::detect()))
                 .await
                 .map_err(|e| format!("内部任务失败: {e}"))
                 .ok()
                 .and_then(|r| r.ok())
                 .unwrap_or_default();
+            // 粘性：最近成功的账号排到池候选最前（主账号未冷却时本就在最前）
+            let sticky = st.sticky.lock().unwrap().clone();
+            let others = sticky_first(others, sticky.as_deref());
             for (id, name, info, mid) in others {
                 if tried.contains(&id) || candidates.iter().any(|c| c.id == id) {
                     continue;
@@ -780,44 +909,77 @@ async fn relay_plan_multi(
             let mut u = st.usage.lock().unwrap();
             *u.entry(c.id.clone()).or_insert(0) += 1;
         }
-        match plan_attempt(st, &c, anthropic_version, body, body_val, path, mode).await {
+        match plan_attempt(
+            st,
+            &c,
+            anthropic_version,
+            body,
+            body_val,
+            path,
+            mode,
+            tried.len() as u32,
+            sys_blocks.as_deref(),
+            &mut ablog,
+        )
+        .await
+        {
             AttemptOutcome::Done(resp) => return resp,
             AttemptOutcome::Next(reason) => reasons.push(format!("{}: {}", c.label, reason)),
+        }
+    }
+    // 回放只在「每次尝试都以异常 200 收场」时触发（count == tried.len()，每个候选至多
+    // 记一次异常）；混合失败（有候选死于 401/额度/验证码等）不回放，走下方 503 聚合，
+    // 与上方注释及模组头文档的「全部候选异常 200」表述严格一致。
+    if ablog.count > 0 && ablog.count as usize == tried.len() {
+        if let Some(ab) = ablog.last {
+            crate::flowlog::log("twoapi", "abnormal-replay", "全部候选异常 200，回放最后一份异常响应");
+            return replay_abnormal(ab, mode).await;
         }
     }
     stats().errors.fetch_add(1, Ordering::Relaxed);
     final_unavailable(mode, &reasons, st)
 }
 
-/// 每次尝试的请求体：在「账号视角」渲染——metadata.user_id 注入官方形状
-/// （字符串化 JSON：device_id=该账号 mid，session_id=进程级常量）。
-/// count_tokens 不注入；无 mid 或客户端已带 user_id 时保持原样。
-fn rendered_body(body: &[u8], body_val: Option<&Value>, path: &str, mid: Option<&str>) -> Vec<u8> {
+/// 每次尝试的请求体：在「账号视角」渲染（仅 /v1/messages 套餐路由）——
+/// - metadata.user_id 恒覆盖官方形状（字符串化 JSON：device_id=该账号 mid，
+///   session_id=每账号每日；客户端自带的一律替换，对齐参考实现）；
+/// - max_tokens 缺省 8192（只补缺省不覆盖客户端值；OpenAI 入站经
+///   openai_map::translate_request 的路径在同一渲染处统一生效）；
+/// - 官方 system 回放：sysprompt 取到两块就垫前、调用方原 system 追加在后，
+///   取不到（None）保持现状。
+/// count_tokens 不做以上任何注入；无 mid 时不注入 metadata。
+fn rendered_body(
+    body: &[u8],
+    body_val: Option<&Value>,
+    path: &str,
+    mid: Option<&str>,
+    acct: &str,
+    blocks: Option<&[Value]>,
+) -> Vec<u8> {
     let Some(v) = body_val else { return body.to_vec() };
     if !path.ends_with("/v1/messages") {
         return body.to_vec();
     }
-    let Some(mid) = mid.map(str::trim).filter(|m| !m.is_empty()) else {
-        return body.to_vec();
-    };
     let Some(obj) = v.as_object() else { return body.to_vec() };
-    let has_uid = obj
-        .get("metadata")
-        .and_then(|m| m.get("user_id"))
-        .and_then(|u| u.as_str())
-        .map(|s| !s.trim().is_empty())
-        .unwrap_or(false);
-    if has_uid {
-        return body.to_vec();
-    }
     let mut obj = obj.clone();
-    let mut meta = obj.get("metadata").and_then(|m| m.as_object()).cloned().unwrap_or_default();
-    meta.insert(
-        "user_id".to_string(),
-        Value::String(json!({"device_id": mid, "account_uuid": "", "session_id": session_id()}).to_string()),
-    );
-    obj.insert("metadata".to_string(), Value::Object(meta));
-    Value::Object(obj).to_string().into_bytes()
+    obj.entry("max_tokens")
+        .or_insert(json!(PLAN_DEFAULT_MAX_TOKENS));
+    if let Some(mid) = mid.map(str::trim).filter(|m| !m.is_empty()) {
+        let mut meta = obj.get("metadata").and_then(|m| m.as_object()).cloned().unwrap_or_default();
+        meta.insert(
+            "user_id".to_string(),
+            Value::String(
+                json!({"device_id": mid, "account_uuid": "", "session_id": account_session_id(acct, &utc_today())})
+                    .to_string(),
+            ),
+        );
+        obj.insert("metadata".to_string(), Value::Object(meta));
+    }
+    let mut out = Value::Object(obj);
+    if let Some(blocks) = blocks {
+        sysprompt::apply_system(&mut out, blocks);
+    }
+    out.to_string().into_bytes()
 }
 
 /// 验证码参数请求头
@@ -905,10 +1067,26 @@ async fn model_captcha_skipped() -> bool {
     skip
 }
 
+/// 异常 200（嗅探判定，见 abnormal_200_head）处置：按风控冷却换号；响应本体记入
+/// AbnormalLog（last = 最后一份，供回放；count = 异常次数，供「全部候选异常」判定），
+/// 见 replay_abnormal。
+fn abnormal_outcome(
+    ab: PlanAbnormal,
+    st: &Arc<SharedState>,
+    id: &str,
+    log: &mut AbnormalLog,
+) -> AttemptOutcome {
+    cool_down(st, id, COOL_RISK);
+    log.count += 1;
+    log.last = Some(ab);
+    AttemptOutcome::Next("HTTP 200 但响应异常（无模型数据，疑似错误信封伪装）".into())
+}
+
 /// 单账号一次尝试：验证码墙未关闭时**预取**参数随首次请求带上（官方旧版
 /// 同款：无感预解）；已关闭（skip_model_request）则裸发。429 请求内退避
 /// 重试一次；参数过期被 3007 拒时作废重解再试一次；其余按分类冷却换号 /
-/// 如实透传。
+/// 如实透传。异常 200 记入 AbnormalLog 并换号。
+#[allow(clippy::too_many_arguments)]
 async fn plan_attempt(
     st: &Arc<SharedState>,
     c: &Candidate,
@@ -917,11 +1095,20 @@ async fn plan_attempt(
     body_val: Option<&Value>,
     path: &str,
     mode: &PumpMode,
+    tries: u32,
+    blocks: Option<&[Value]>,
+    ablog: &mut AbnormalLog,
 ) -> AttemptOutcome {
     let url = format!("{}{}", c.info.base_url.trim_end_matches('/'), path);
     // 验证码墙挂在 zcode-plan 端点（start-plan JWT 路线）
     let captcha_wall = c.info.base_url.contains("zcode.z.ai");
-    let payload = rendered_body(body, body_val, path, c.mid.as_deref());
+    let payload = rendered_body(body, body_val, path, c.mid.as_deref(), &c.id, blocks);
+    let model = body_val
+        .and_then(|v| v.get("model"))
+        .and_then(|m| m.as_str())
+        .unwrap_or("")
+        .to_string();
+    let usage = UsageCtx { dir: Some(st.paths.store_dir()), acct: c.id.clone(), model, tries };
     let send = |extra: Vec<(String, String)>| {
         plan_request_once(
             url.clone(),
@@ -931,6 +1118,7 @@ async fn plan_attempt(
             payload.clone(),
             mode.clone(),
             c.mid.clone(),
+            usage.clone(),
         )
     };
     // 预取验证码参数（45s 缓存命中 = 零弹窗零等待；无界面环境拿不到就裸打）。
@@ -942,8 +1130,9 @@ async fn plan_attempt(
         }
     }
     let err = match send(first_extra.clone()).await {
-        Ok(ok) => return finish_plan_ok(ok, st, &c.id),
-        Err(e) => e,
+        PlanSend::Ok(ok) => return finish_plan_ok(ok, st, &c.id),
+        PlanSend::Abnormal(ab) => return abnormal_outcome(ab, st, &c.id, ablog),
+        PlanSend::Err(e) => e,
     };
     match classify_plan_err(err.status, &err.text) {
         // 429：带同样参数请求内退避重试一次（尊重 Retry-After，封顶 5s），仍 429 才冷却换号
@@ -951,8 +1140,9 @@ async fn plan_attempt(
             let wait = err.retry_after.unwrap_or(2).clamp(1, 5);
             tokio::time::sleep(Duration::from_secs(wait)).await;
             match send(first_extra).await {
-                Ok(ok) => finish_plan_ok(ok, st, &c.id),
-                Err(e2) => {
+                PlanSend::Ok(ok) => finish_plan_ok(ok, st, &c.id),
+                PlanSend::Abnormal(ab) => abnormal_outcome(ab, st, &c.id, ablog),
+                PlanSend::Err(e2) => {
                     cool_down(st, &c.id, COOL_RATE);
                     if let PlanFail::RateLimited = classify_plan_err(e2.status, &e2.text) {
                         AttemptOutcome::Next("上游限流 429".into())
@@ -972,8 +1162,9 @@ async fn plan_attempt(
                 return AttemptOutcome::Next("验证码求解失败或超时".into());
             };
             match send(captcha_headers(param, region)).await {
-                Ok(ok) => finish_plan_ok(ok, st, &c.id),
-                Err(e2) => {
+                PlanSend::Ok(ok) => finish_plan_ok(ok, st, &c.id),
+                PlanSend::Abnormal(ab) => abnormal_outcome(ab, st, &c.id, ablog),
+                PlanSend::Err(e2) => {
                     if let PlanFail::Captcha = classify_plan_err(e2.status, &e2.text) {
                         // 参数被上游作废：清缓存让下一个请求/账号重新解
                         captcha_cache_invalidate();
@@ -1004,7 +1195,7 @@ async fn plan_attempt(
     }
 }
 
-/// 2xx 响应收尾：WAF 挑战页（非 JSON/SSE）按风控冷却换号，否则交付客户端。
+/// 2xx 响应收尾：WAF 挑战页（非 JSON/SSE）按风控冷却换号，否则交付客户端并记粘性账号。
 fn finish_plan_ok(ok: PlanOk, st: &Arc<SharedState>, id: &str) -> AttemptOutcome {
     if (200..300).contains(&ok.status) && !ctype_ok(&ok.ctype) {
         cool_down(st, id, COOL_RISK);
@@ -1013,6 +1204,8 @@ fn finish_plan_ok(ok: PlanOk, st: &Arc<SharedState>, id: &str) -> AttemptOutcome
             clip(&ok.ctype, 40)
         ));
     }
+    // 成功交付：记粘性账号，下一请求把它排到池候选最前
+    *st.sticky.lock().unwrap() = Some(id.to_string());
     AttemptOutcome::Done(ok.resp)
 }
 
@@ -1028,10 +1221,164 @@ struct PlanErr {
     retry_after: Option<u64>,
 }
 
+/// 异常 200 响应：status/content-type 正常但缓冲头像错误信封（无 "model":" 有
+/// error/code 线索）。head + 剩余 reader 保留，全部候选都异常时回放给客户端
+/// （Raw 原样 / OpenAI 入站按协议翻译，见 replay_abnormal）。
+struct PlanAbnormal {
+    status: u16,
+    ctype: String,
+    head: Vec<u8>,
+    reader: Box<dyn std::io::Read + Send>,
+}
+
+/// 异常 200 记账：每个候选至多记一次（abnormal_outcome 即返）。count 供「每次尝试都
+/// 以异常 200 收场」判定（count == tried.len() 才回放，混合失败落 503 聚合），
+/// last 供回放取最后一份。
+#[derive(Default)]
+struct AbnormalLog {
+    count: u32,
+    last: Option<PlanAbnormal>,
+}
+
+/// plan_request_once 的三种结局：正常响应（含如实透传的终端错误）/ 异常 200 / 失败
+enum PlanSend {
+    Ok(PlanOk),
+    Abnormal(PlanAbnormal),
+    Err(PlanErr),
+}
+
+/// spawn_blocking 泵线程回传的元信息
+enum PlanMeta {
+    Ok { status: u16, ctype: String },
+    Abnormal { status: u16, ctype: String, head: Vec<u8>, reader: Box<dyn std::io::Read + Send> },
+    Err(PlanErr),
+}
+
+/// 用量落盘上下文：随请求传进 spawn_blocking 泵线程，泵结束时组装 UsageRecord（见 log_usage）
+#[derive(Clone)]
+struct UsageCtx {
+    dir: Option<std::path::PathBuf>,
+    acct: String,
+    model: String,
+    tries: u32,
+}
+
+/// 无 Meter 的简版用量（非 2xx 错误体 / 异常 200 缓冲头）：head 文本直接提码落盘 + flowlog
+fn append_head_usage(
+    dir: Option<&std::path::Path>,
+    acct: &str,
+    model: &str,
+    status: u16,
+    tries: u32,
+    stream: bool,
+    head: &str,
+) {
+    let code = meter::head_error_code(head);
+    let up = peek_model(head);
+    meter::append_usage(
+        dir,
+        &meter::UsageRecord {
+            t: unix_now(),
+            acct: acct.to_string(),
+            model: model.to_string(),
+            up,
+            code: code.clone(),
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_read: 0,
+            ttfb_ms: 0,
+            total_ms: 0,
+            bytes: head.len() as u64,
+            status,
+            tries,
+            stream,
+        },
+    );
+    crate::flowlog::log(
+        "twoapi",
+        "usage",
+        &format!("acct={acct} model={model} up={up} http={status} code={code} tries={tries} bytes={}", head.len()),
+    );
+}
+
+/// 泵结束：Meter 摘要 → 落 usage.jsonl + flowlog 一行（append_usage 任何失败都静默，不影响请求路径）
+fn log_usage(ctx: &UsageCtx, s: &meter::MeterSummary) {
+    let up = peek_model(&s.head);
+    // 错误码先扫 head，提不到再扫 tail（对齐参考实现 peek_code head→tail）：
+    // 流末尾才出现的错误事件（SSE 尾部 error / overloaded_error）只落 tail 窗口
+    let mut code = meter::head_error_code(&s.head);
+    if code.is_empty() {
+        code = meter::head_error_code(&s.tail);
+    }
+    meter::append_usage(
+        ctx.dir.as_deref(),
+        &meter::UsageRecord {
+            t: unix_now(),
+            acct: ctx.acct.clone(),
+            model: ctx.model.clone(),
+            up,
+            code: code.clone(),
+            input_tokens: s.input_tokens,
+            output_tokens: s.output_tokens,
+            cache_read: s.cache_read,
+            ttfb_ms: s.ttfb_ms,
+            total_ms: s.total_ms,
+            bytes: s.bytes,
+            status: s.status,
+            tries: ctx.tries,
+            stream: s.stream,
+        },
+    );
+    crate::flowlog::log(
+        "twoapi",
+        "usage",
+        &format!(
+            "acct={} model={} up={} in={} out={} cache={} {}ms {}B http={} code={code} tries={}",
+            ctx.acct, ctx.model, up, s.input_tokens, s.output_tokens, s.cache_read, s.total_ms, s.bytes, s.status, ctx.tries
+        ),
+    );
+}
+
+/// 全候选都异常：把最后一份异常响应回放给客户端，按入站协议区分（与本文件其他错误
+/// 路径的 PumpMode 翻译约定一致）：
+/// - Raw（Anthropic 入站）：原样回放（status + content-type + 缓冲头续接剩余流），
+///   客户端看到上游真实错误信封；
+/// - OpenAI 入站（OpenAiJson/OpenAiStream）：异常体是 Anthropic 形态错误信封且带伪装
+///   的 200 状态码，原样回放会让 SDK 把错误当成功体解析（流式则拿到非 SSE 裸 JSON），
+///   故读全异常体（缓冲头 + 剩余流）后走 buffered_error_response 包 OpenAI error JSON，
+///   状态码如实改 502——上游 200 是伪装，非 200 才能让客户端 SDK 进错误分支。
+async fn replay_abnormal(ab: PlanAbnormal, mode: &PumpMode) -> Response {
+    if !matches!(mode, PumpMode::Raw) {
+        let text = tauri::async_runtime::spawn_blocking(move || {
+            let mut buf = Vec::new();
+            let mut r = std::io::Cursor::new(ab.head).chain(ab.reader);
+            let _ = r.read_to_end(&mut buf);
+            String::from_utf8_lossy(&buf).into_owned()
+        })
+        .await
+        .unwrap_or_default();
+        return buffered_error_response(StatusCode::BAD_GATEWAY.as_u16(), &text, mode);
+    }
+    let code = StatusCode::from_u16(ab.status).unwrap_or(StatusCode::BAD_GATEWAY);
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<Vec<u8>, std::io::Error>>(32);
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut reader: Box<dyn std::io::Read + Send> = Box::new(std::io::Cursor::new(ab.head).chain(ab.reader));
+        pump_reader(reader.as_mut(), &tx);
+    });
+    let stream = tokio_stream::wrappers::ReceiverStream::new(rx);
+    Response::builder()
+        .status(code)
+        .header(header::CONTENT_TYPE, ab.ctype)
+        .body(Body::from_stream(stream))
+        .unwrap_or_else(|_| err_json(StatusCode::INTERNAL_SERVER_ERROR, "响应构建失败"))
+}
+
 /// 单次套餐请求：官方客户端全套伪装头（User-Agent/Referer/X-Title/X-Platform/...
-/// + Authorization Bearer JWT + 每请求新 x-request-id，出自 quota::zai_billing_headers_with_mid）
-/// + anthropic-version + X-ZCode-Agent；2xx（及所有流式响应）走泵流式转发；
-/// 非 2xx 缓冲完整响应体交上层分类处置（错误体都很小），Retry-After 随错误带回。
+/// + Authorization Bearer JWT + 每请求新 x-request-id，出自 quota::zai_billing_headers_with_mid；
+/// 另对齐参考实现补 x-api-key（与 Authorization 同值）+ sec-fetch-mode: cors + accept-language: *）
+/// + anthropic-version + X-ZCode-Agent；200 且 JSON/SSE 先嗅探 ≤4KB 头（异常 200 不进
+/// 客户端管道，按风控换号），正常则缓冲头原样续流进 Meter 计量泵；其余 2xx 直接进
+/// Meter 泵；非 2xx 缓冲完整响应体交上层分类处置（错误体都很小），Retry-After 随错误带回。
 async fn plan_request_once(
     url: String,
     jwt: String,
@@ -1040,17 +1387,15 @@ async fn plan_request_once(
     body: Vec<u8>,
     mode: PumpMode,
     mid: Option<String>,
-) -> Result<PlanOk, PlanErr> {
+    usage: UsageCtx,
+) -> PlanSend {
     let accept = match &mode {
         PumpMode::OpenAiJson(_) => "application/json",
         _ => "text/event-stream",
     };
-    let (meta_tx, meta_rx) = tokio::sync::oneshot::channel::<Result<(u16, String), PlanErr>>();
+    let (meta_tx, meta_rx) = tokio::sync::oneshot::channel::<PlanMeta>();
     let (body_tx, body_rx) = tokio::sync::mpsc::channel::<Result<Vec<u8>, std::io::Error>>(32);
     tauri::async_runtime::spawn_blocking(move || {
-        let send_meta = |r: Result<(u16, String), PlanErr>| {
-            let _ = meta_tx.send(r);
-        };
         let base = crate::quota::zai_billing_headers_with_mid(&jwt, mid);
         let rb0 = upstream_agent().post(&url);
         let rb = base.into_iter().fold(rb0, |acc, (k, v)| acc.set(&k, &v));
@@ -1058,6 +1403,9 @@ async fn plan_request_once(
             .set("content-type", "application/json")
             .set("anthropic-version", &version)
             .set("accept", accept)
+            .set("x-api-key", &jwt)
+            .set("sec-fetch-mode", "cors")
+            .set("accept-language", "*")
             .set("X-ZCode-Agent", "glm")
             // 官方 start-plan 聊天请求的归因头（zcode.cjs kLs）——风控按会话信誉打分，
             // 缺这些头时同一请求在 billing 通、在 /v1/messages 吃 3012（实测）
@@ -1072,19 +1420,54 @@ async fn plan_request_once(
             Ok(resp) => {
                 let status = resp.status();
                 let ctype = resp.content_type().to_string();
-                send_meta(Ok((status, ctype)));
-                pump_ok(resp, mode, &body_tx);
+                if status == 200 && ctype_ok(&ctype) {
+                    // 先嗅探再原样续流：异常 200（错误信封伪装）不进客户端管道
+                    let (head, reader) = sniff_200_head(resp.into_reader());
+                    if abnormal_200_head(&head) {
+                        let head_str = String::from_utf8_lossy(&head);
+                        crate::flowlog::log(
+                            "twoapi",
+                            "abnormal-200",
+                            &format!("acct={} ctype={} head={}", usage.acct, ctype, clip(&head_str, 120)),
+                        );
+                        append_head_usage(
+                            usage.dir.as_deref(),
+                            &usage.acct,
+                            &usage.model,
+                            status,
+                            usage.tries,
+                            ctype.to_lowercase().contains("event-stream"),
+                            &head_str,
+                        );
+                        let _ = meta_tx.send(PlanMeta::Abnormal { status, ctype, head, reader });
+                        return;
+                    }
+                    let reader: Box<dyn std::io::Read + Send> =
+                        Box::new(std::io::Cursor::new(head).chain(reader));
+                    let meter = meter::Meter::new(reader, status, ctype.to_lowercase().contains("event-stream"));
+                    let _ = meta_tx.send(PlanMeta::Ok { status, ctype });
+                    pump_metered(meter, mode, status, &body_tx, &usage);
+                    return;
+                }
+                let stream = ctype.to_lowercase().contains("event-stream");
+                let reader: Box<dyn std::io::Read + Send> = resp.into_reader();
+                let meter = meter::Meter::new(reader, status, stream);
+                let _ = meta_tx.send(PlanMeta::Ok { status, ctype });
+                pump_metered(meter, mode, status, &body_tx, &usage);
             }
             Err(ureq::Error::Status(code, resp)) => {
                 let retry_after = resp.header("retry-after").and_then(|v| v.trim().parse::<u64>().ok());
                 let text = resp.into_string().unwrap_or_default();
-                send_meta(Err(PlanErr { status: code, text, retry_after }));
+                append_head_usage(usage.dir.as_deref(), &usage.acct, &usage.model, code, usage.tries, false, &text);
+                let _ = meta_tx.send(PlanMeta::Err(PlanErr { status: code, text, retry_after }));
             }
-            Err(e) => send_meta(Err(PlanErr { status: 0, text: format!("上游请求失败: {e}"), retry_after: None })),
+            Err(e) => {
+                let _ = meta_tx.send(PlanMeta::Err(PlanErr { status: 0, text: format!("上游请求失败: {e}"), retry_after: None }));
+            }
         }
     });
     match meta_rx.await {
-        Ok(Ok((status, ctype))) => {
+        Ok(PlanMeta::Ok { status, ctype }) => {
             let code = StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY);
             let stream = tokio_stream::wrappers::ReceiverStream::new(body_rx);
             match Response::builder()
@@ -1092,12 +1475,15 @@ async fn plan_request_once(
                 .header(header::CONTENT_TYPE, ctype.clone())
                 .body(Body::from_stream(stream))
             {
-                Ok(resp) => Ok(PlanOk { status, ctype, resp }),
-                Err(e) => Err(PlanErr { status: 500, text: format!("响应构建失败: {e}"), retry_after: None }),
+                Ok(resp) => PlanSend::Ok(PlanOk { status, ctype, resp }),
+                Err(e) => PlanSend::Err(PlanErr { status: 500, text: format!("响应构建失败: {e}"), retry_after: None }),
             }
         }
-        Ok(Err(e)) => Err(e),
-        Err(_) => Err(PlanErr { status: 0, text: "内部管道错误".into(), retry_after: None }),
+        Ok(PlanMeta::Abnormal { status, ctype, head, reader }) => {
+            PlanSend::Abnormal(PlanAbnormal { status, ctype, head, reader })
+        }
+        Ok(PlanMeta::Err(e)) => PlanSend::Err(e),
+        Err(_) => PlanSend::Err(PlanErr { status: 0, text: "内部管道错误".into(), retry_after: None }),
     }
 }
 
@@ -1219,6 +1605,13 @@ async fn get_pool(st: &Arc<SharedState>) -> (Vec<PoolKey>, Option<String>) {
     (pool, diag)
 }
 
+/// 免费池项的账目标识：provider + key 尾 4 位（usage.jsonl 里区分来源，不落完整 key）
+fn free_acct_tag(pk: &PoolKey) -> String {
+    let n = pk.api_key.chars().count();
+    let tail: String = pk.api_key.chars().skip(n.saturating_sub(4)).collect();
+    format!("{}:…{tail}", pk.provider)
+}
+
 /// 免费模型统一入口：key 池轮询（双网关池），401/403/429 与传输失败都自动换下一项重试。
 /// url_of / auth_of 决定走 paas/v4（OpenAI 入站）还是 anthropic coding endpoint（anthropic 入站）。
 async fn free_call(
@@ -1237,13 +1630,23 @@ async fn free_call(
         }
         return err_json(StatusCode::BAD_GATEWAY, &msg);
     }
+    let model = serde_json::from_slice::<Value>(&body)
+        .ok()
+        .and_then(|v| v.get("model").and_then(|m| m.as_str()).map(String::from))
+        .unwrap_or_default();
     let n = pool.len();
     let start = st.rr.fetch_add(1, Ordering::Relaxed) as usize;
     let mut last: Option<Response> = None;
     let mut last_net_err: Option<String> = None;
     for k in 0..n {
         let pk = &pool[(start + k) % n];
-        match pump_request(url_of(pk), auth_of(pk), body.clone(), mode.clone()).await {
+        let usage = UsageCtx {
+            dir: Some(st.paths.store_dir()),
+            acct: free_acct_tag(pk),
+            model: model.clone(),
+            tries: (k + 1) as u32,
+        };
+        match pump_request(url_of(pk), auth_of(pk), body.clone(), mode.clone(), usage).await {
             Ok(resp) => {
                 let s = resp.status().as_u16();
                 if matches!(s, 401 | 403 | 429) && k + 1 < n {
@@ -1286,8 +1689,14 @@ fn free_auth_paas(pk: &PoolKey) -> AuthStyle {
 }
 
 /// 单次免费池请求：Ok = 上游已给出 HTTP 响应（含 4xx/5xx，交上层按状态轮询/透传）；
-/// Err = 传输层失败（TLS/超时/断连），调用方换下一个池项。
-async fn pump_request(url: String, auth: AuthStyle, body: Vec<u8>, mode: PumpMode) -> Result<Response, String> {
+/// Err = 传输层失败（TLS/超时/断连），调用方换下一个池项。响应体包 Meter 计量落盘。
+async fn pump_request(
+    url: String,
+    auth: AuthStyle,
+    body: Vec<u8>,
+    mode: PumpMode,
+    usage: UsageCtx,
+) -> Result<Response, String> {
     let (meta_tx, meta_rx) = tokio::sync::oneshot::channel::<Result<(u16, String), String>>();
     let (body_tx, body_rx) = tokio::sync::mpsc::channel::<Result<Vec<u8>, std::io::Error>>(32);
     tauri::async_runtime::spawn_blocking(move || {
@@ -1309,13 +1718,13 @@ async fn pump_request(url: String, auth: AuthStyle, body: Vec<u8>, mode: PumpMod
                 let status = resp.status();
                 let ctype = resp.content_type().to_string();
                 send_meta(Ok((status, ctype)));
-                pump_ok(resp, mode, &body_tx);
+                pump_ok(resp, mode, &body_tx, usage);
             }
             Err(ureq::Error::Status(_code, resp)) => {
                 let status = resp.status();
                 let ctype = resp.content_type().to_string();
                 send_meta(Ok((status, ctype)));
-                pump_ok(resp, mode, &body_tx);
+                pump_ok(resp, mode, &body_tx, usage);
             }
             Err(e) => send_meta(Err(format!("上游请求失败: {e}"))),
         }
@@ -1337,29 +1746,66 @@ async fn pump_request(url: String, auth: AuthStyle, body: Vec<u8>, mode: PumpMod
     }
 }
 
-/// 上游已建立连接后的泵：按 mode 转发/翻译，直到 EOF；客户端断开时 channel 报错自然退出。
-fn pump_ok(resp: ureq::Response, mode: PumpMode, tx: &tokio::sync::mpsc::Sender<Result<Vec<u8>, std::io::Error>>) {
+/// 上游已建立连接后的泵（免费路由）：包 Meter 计量后按 mode 转发/翻译，直到 EOF；
+/// 客户端断开时 channel 报错自然退出；泵结束落一条用量（见 log_usage）。
+fn pump_ok(
+    resp: ureq::Response,
+    mode: PumpMode,
+    tx: &tokio::sync::mpsc::Sender<Result<Vec<u8>, std::io::Error>>,
+    usage: UsageCtx,
+) {
     let status = resp.status();
+    let ctype = resp.content_type().to_string();
+    let stream = ctype.to_lowercase().contains("event-stream");
+    let reader: Box<dyn std::io::Read + Send> = resp.into_reader();
+    let meter = meter::Meter::new(reader, status, stream);
+    pump_metered(meter, mode, status, tx, &usage);
+}
+
+/// 计量泵：Meter 包装的上游 reader 按 mode 转发/翻译，结束时 finish() 产摘要落盘。
+/// 只在 spawn_blocking 线程内使用（Meter 是阻塞 IO）。
+fn pump_metered(
+    mut meter: meter::Meter<Box<dyn std::io::Read + Send>>,
+    mode: PumpMode,
+    status: u16,
+    tx: &tokio::sync::mpsc::Sender<Result<Vec<u8>, std::io::Error>>,
+    usage: &UsageCtx,
+) {
     match mode {
-        PumpMode::Raw => pump_raw(resp, tx),
+        PumpMode::Raw => pump_reader(&mut meter, tx),
         PumpMode::OpenAiJson(model) => {
-            let text = resp.into_string().unwrap_or_default();
+            let mut text = String::new();
+            if meter.read_to_string(&mut text).is_err() {
+                text.clear();
+            }
             if status >= 400 {
                 send_openai_error(&text, status, tx);
-                return;
-            }
-            match serde_json::from_str::<Value>(&text) {
-                Ok(up) => {
-                    let out = openai_map::translate_response(&up, &model);
-                    let _ = tx.blocking_send(Ok(out.to_string().into_bytes()));
-                }
-                Err(e) => {
-                    let _ = tx.blocking_send(Err(std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string())));
+            } else {
+                match serde_json::from_str::<Value>(&text) {
+                    Ok(up) => {
+                        let out = openai_map::translate_response(&up, &model);
+                        let _ = tx.blocking_send(Ok(out.to_string().into_bytes()));
+                    }
+                    Err(e) => {
+                        let _ = tx.blocking_send(Err(std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string())));
+                    }
                 }
             }
         }
-        PumpMode::OpenAiStream(model) => pump_openai_stream(resp, &model, status, tx),
+        PumpMode::OpenAiStream(model) => {
+            if status >= 400 {
+                let mut text = String::new();
+                let _ = meter.read_to_string(&mut text);
+                let msg = upstream_error_message(&text, status);
+                let _ = tx.blocking_send(Ok(format!("data: {}\n\n", json!({"error": {"message": msg, "type": "upstream_error", "code": status}})).into_bytes()));
+                let _ = tx.blocking_send(Ok(b"data: [DONE]\n\n".to_vec()));
+            } else {
+                pump_openai_stream(&mut meter, &model, tx);
+            }
+        }
     }
+    let s = meter.finish();
+    log_usage(usage, &s);
 }
 
 fn upstream_error_message(text: &str, status: u16) -> String {
@@ -1380,8 +1826,9 @@ fn send_openai_error(text: &str, status: u16, tx: &tokio::sync::mpsc::Sender<Res
     let _ = tx.blocking_send(Ok(json!({"error": {"message": msg, "type": "upstream_error", "code": status}}).to_string().into_bytes()));
 }
 
-fn pump_raw(resp: ureq::Response, tx: &tokio::sync::mpsc::Sender<Result<Vec<u8>, std::io::Error>>) {
-    let mut reader = resp.into_reader();
+/// 逐字节泵：把任意 reader 读到 EOF 转发进管道（Raw 透传 / 异常响应回放共用）；
+/// 客户端断开时 blocking_send 报错自然退出。
+fn pump_reader(reader: &mut dyn std::io::Read, tx: &tokio::sync::mpsc::Sender<Result<Vec<u8>, std::io::Error>>) {
     let mut buf = [0u8; 8192];
     loop {
         match reader.read(&mut buf) {
@@ -1399,17 +1846,16 @@ fn pump_raw(resp: ureq::Response, tx: &tokio::sync::mpsc::Sender<Result<Vec<u8>,
     }
 }
 
-fn pump_openai_stream(resp: ureq::Response, model: &str, status: u16, tx: &tokio::sync::mpsc::Sender<Result<Vec<u8>, std::io::Error>>) {
-    if status >= 400 {
-        let text = resp.into_string().unwrap_or_default();
-        let msg = upstream_error_message(&text, status);
-        let _ = tx.blocking_send(Ok(format!("data: {}\n\n", json!({"error": {"message": msg, "type": "upstream_error", "code": status}})).into_bytes()));
-        let _ = tx.blocking_send(Ok(b"data: [DONE]\n\n".to_vec()));
-        return;
-    }
-    let reader = std::io::BufReader::new(resp.into_reader());
+/// OpenAI 入站的 SSE → chunk 翻译泵（reader 已包 Meter）：逐行喂 SseTransformer，
+/// 结束时把带签名的思考块存入回放缓存（error 流不存）。
+fn pump_openai_stream(
+    reader: &mut dyn std::io::Read,
+    model: &str,
+    tx: &tokio::sync::mpsc::Sender<Result<Vec<u8>, std::io::Error>>,
+) {
+    let mut br = std::io::BufReader::new(reader);
     let mut tr = openai_map::SseTransformer::new(model);
-    for line in reader.lines() {
+    for line in br.lines() {
         match line {
             Ok(l) => {
                 let mut out = Vec::new();
@@ -1473,24 +1919,128 @@ mod tests {
     #[test]
     fn rendered_body_injects_official_user_id() {
         let body = json!({"model": "glm-5.3", "max_tokens": 100, "messages": []});
-        let out = rendered_body(body.to_string().as_bytes(), Some(&body), "/v1/messages", Some("MID1"));
+        let out = rendered_body(body.to_string().as_bytes(), Some(&body), "/v1/messages", Some("MID1"), "acct1", None);
         let v: Value = serde_json::from_slice(&out).unwrap();
         let uid = v["metadata"]["user_id"].as_str().unwrap();
         assert!(uid.contains("\"device_id\":\"MID1\""), "{uid}");
         assert!(uid.contains("\"account_uuid\":\"\""));
-        assert!(uid.contains("\"session_id\":"));
-        // 客户端已带 user_id：不覆盖
+        assert!(uid.contains("\"session_id\":\""));
+        // 客户端自带 user_id 也恒覆盖（对齐参考实现，不再尊重原值）
         let owned = json!({"metadata": {"user_id": "mine"}});
-        let out2 = rendered_body(owned.to_string().as_bytes(), Some(&owned), "/v1/messages", Some("MID1"));
+        let out2 = rendered_body(owned.to_string().as_bytes(), Some(&owned), "/v1/messages", Some("MID1"), "acct1", None);
         let v2: Value = serde_json::from_slice(&out2).unwrap();
-        assert_eq!(v2["metadata"]["user_id"], "mine");
-        // 无 mid：原样
-        let out3 = rendered_body(body.to_string().as_bytes(), Some(&body), "/v1/messages", None);
+        let uid2 = v2["metadata"]["user_id"].as_str().unwrap();
+        assert_ne!(uid2, "mine");
+        assert!(uid2.contains("\"device_id\":\"MID1\""), "{uid2}");
+        // 无 mid：不注入 metadata（其余改写照常——本例 max_tokens 已带、无 system，字节不变）
+        let out3 = rendered_body(body.to_string().as_bytes(), Some(&body), "/v1/messages", None, "acct1", None);
         assert_eq!(out3, body.to_string().into_bytes());
         // count_tokens：不注入
-        let out4 = rendered_body(body.to_string().as_bytes(), Some(&body), "/v1/messages/count_tokens", Some("MID1"));
+        let out4 = rendered_body(body.to_string().as_bytes(), Some(&body), "/v1/messages/count_tokens", Some("MID1"), "acct1", None);
         let v4: Value = serde_json::from_slice(&out4).unwrap();
         assert!(v4.get("metadata").is_none());
+    }
+
+    #[test]
+    fn rendered_body_max_tokens_default() {
+        // 没带 max_tokens：补缺省 8192
+        let body = json!({"model": "glm-5.3", "messages": []});
+        let out = rendered_body(body.to_string().as_bytes(), Some(&body), "/v1/messages", Some("MID1"), "acct1", None);
+        let v: Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(v["max_tokens"].as_i64(), Some(8192));
+        // 客户端已带：只补缺省不覆盖（无 mid 时也不注入 metadata）
+        let own = json!({"model": "glm-5.3", "max_tokens": 64, "messages": []});
+        let out2 = rendered_body(own.to_string().as_bytes(), Some(&own), "/v1/messages", None, "acct1", None);
+        let v2: Value = serde_json::from_slice(&out2).unwrap();
+        assert_eq!(v2["max_tokens"].as_i64(), Some(64));
+        assert!(v2.get("metadata").is_none());
+    }
+
+    #[test]
+    fn rendered_body_applies_official_system() {
+        let blocks = vec![
+            json!({"type": "text", "text": "OFFICIAL0"}),
+            json!({"type": "text", "text": "OFFICIAL1"}),
+        ];
+        let body = json!({"model": "glm-5.3", "messages": [], "system": "caller system"});
+        // 取到块：官方两块垫前，调用方原 system 追加在后
+        let out = rendered_body(body.to_string().as_bytes(), Some(&body), "/v1/messages", Some("MID1"), "acct1", Some(&blocks));
+        let v: Value = serde_json::from_slice(&out).unwrap();
+        let sys = v["system"].as_array().unwrap();
+        assert_eq!(sys.len(), 3);
+        assert_eq!(sys[0]["text"], "OFFICIAL0");
+        assert_eq!(sys[1]["text"], "OFFICIAL1");
+        assert_eq!(sys[2]["text"], "caller system");
+        // 取不到块（None）：system 保持现状
+        let out2 = rendered_body(body.to_string().as_bytes(), Some(&body), "/v1/messages", Some("MID1"), "acct1", None);
+        let v2: Value = serde_json::from_slice(&out2).unwrap();
+        assert_eq!(v2["system"], "caller system");
+    }
+
+    #[test]
+    fn account_session_id_is_daily_v4() {
+        let a = account_session_id("acct1", "2026-10-04");
+        let b = account_session_id("acct1", "2026-10-04");
+        assert_eq!(a, b, "同账号同日稳定");
+        assert_ne!(a, account_session_id("acct1", "2026-10-05"), "跨日轮换");
+        assert_ne!(a, account_session_id("acct2", "2026-10-04"), "跨账号不同");
+        // uuid v4 形态：第三组 4 开头、第四组 8/9/a/b 开头
+        assert_eq!(a.len(), 36);
+        assert_eq!(&a[14..15], "4");
+        assert!(matches!(&a[19..20], "8" | "9" | "a" | "b"));
+    }
+
+    #[test]
+    fn abnormal_200_head_detection() {
+        // 错误信封伪装成 200：无 "model":" 但有 error/code 线索
+        assert!(abnormal_200_head(br#"{"error":{"type":"api_error","message":"overloaded"}}"#));
+        assert!(abnormal_200_head(br#"{"code":1113,"msg":"no resource package"}"#));
+        // 正常模型响应：缓冲头带 "model":"（JSON 顶层 / message_start）→ 不算异常
+        assert!(!abnormal_200_head(br#"{"model":"glm-5.3","usage":{"input_tokens":1}}"#));
+        assert!(!abnormal_200_head(b"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"model\":\"glm-5.3\"}}"));
+        // 无 model 也无线索（纯文本等）→ 不算（宁缺毋滥）
+        assert!(!abnormal_200_head(b"plain text"));
+        assert!(!abnormal_200_head(b""));
+    }
+
+    #[test]
+    fn peek_model_extracts_upstream_name() {
+        assert_eq!(peek_model(br#""model":"glm-5.3","x":1"#), "glm-5.3");
+        assert_eq!(peek_model("no model here"), "");
+        assert_eq!(peek_model(br#""model":""#), "");
+    }
+
+    #[test]
+    fn sticky_first_reorders_pool() {
+        let info = || ApiKeyInfo {
+            label: String::new(),
+            api_key: String::new(),
+            base_url: String::new(),
+            provider: "zai".into(),
+            kind: "jwt".into(),
+            mint_error: None,
+        };
+        let mk = |id: &str| -> (String, String, ApiKeyInfo, Option<String>) {
+            (id.to_string(), String::new(), info(), None)
+        };
+        let pool = vec![mk("a"), mk("b"), mk("c")];
+        // 无 sticky：保持原序
+        let out = sticky_first(pool.clone(), None);
+        let ids: Vec<&str> = out.iter().map(|(id, ..)| id.as_str()).collect();
+        assert_eq!(ids, vec!["a", "b", "c"]);
+        // sticky="b"：排最前，其余保持相对顺序（稳定排序）
+        let out = sticky_first(pool, Some("b"));
+        let ids: Vec<&str> = out.iter().map(|(id, ..)| id.as_str()).collect();
+        assert_eq!(ids, vec!["b", "a", "c"]);
+    }
+
+    #[test]
+    fn free_acct_tag_masks_key() {
+        let pk = PoolKey { api_key: "abcdef123456".into(), provider: "zai".into() };
+        assert_eq!(free_acct_tag(&pk), "zai:…3456");
+        assert!(!free_acct_tag(&pk).contains("abcdef"));
+        let short = PoolKey { api_key: "ab".into(), provider: "bigmodel".into() };
+        assert_eq!(free_acct_tag(&short), "bigmodel:…ab");
     }
 
     #[test]
@@ -1499,5 +2049,52 @@ mod tests {
         assert!(ctype_ok("text/event-stream"));
         assert!(!ctype_ok("text/html"));
         assert!(!ctype_ok(""));
+    }
+
+    /// 小分块交付的 reader：每次 read 至多返回 chunk 字节（模拟慢速流式上游，
+    /// 逼 sniff_200_head 走多轮 read）
+    struct Chunked {
+        data: Vec<u8>,
+        off: usize,
+        chunk: usize,
+    }
+
+    impl Read for Chunked {
+        fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+            if self.off >= self.data.len() {
+                return Ok(0);
+            }
+            let n = out.len().min(self.chunk).min(self.data.len() - self.off);
+            out[..n].copy_from_slice(&self.data[self.off..self.off + n]);
+            self.off += n;
+            Ok(n)
+        }
+    }
+
+    #[test]
+    fn sniff_200_head_recombines_stream_transparently() {
+        // 核心不变量：正常流「先嗅探再原样续流」——sniff_200_head 返回的缓冲头经
+        // Cursor(head).chain(reader) 拼接后，读出的完整 body 必须逐字节等于原始响应
+        // （消费处同款拼法见 plan_request_once / replay_abnormal）
+        let body = b"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"model\":\"glm-5.3\",\"id\":\"msg_1\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}\n\n".to_vec();
+        let (head, rest) = sniff_200_head(Box::new(Chunked { data: body.clone(), off: 0, chunk: 7 }));
+        assert!(has_model_key(&head), "嗅探到模型键即停");
+        assert!(head.len() <= SNIFF_CAP);
+        let mut recombined = Vec::new();
+        std::io::Cursor::new(head).chain(rest).read_to_end(&mut recombined).unwrap();
+        assert_eq!(recombined, body, "缓冲头 + 剩余流拼接必须逐字节还原原始响应");
+    }
+
+    #[test]
+    fn sniff_200_head_caps_at_4k() {
+        // 无模型键的长体：head 恰好封顶 4KB（单次 read 裁到剩余配额，小分块下也不会
+        // 涨到 ~6KB），且拼接仍逐字节完整
+        let body = vec![b'x'; SNIFF_CAP + 2048];
+        let (head, rest) = sniff_200_head(Box::new(Chunked { data: body.clone(), off: 0, chunk: 2048 }));
+        assert_eq!(head.len(), SNIFF_CAP);
+        assert!(!has_model_key(&head));
+        let mut recombined = Vec::new();
+        std::io::Cursor::new(head).chain(rest).read_to_end(&mut recombined).unwrap();
+        assert_eq!(recombined, body);
     }
 }
