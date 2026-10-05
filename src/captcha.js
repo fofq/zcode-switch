@@ -24,7 +24,12 @@ document.addEventListener("securitypolicyviolation", (e) => {
   detail(t("c.cspBlocked", { directive: e.violatedDirective, uri: String(e.blockedURI).slice(0, 70) }));
 });
 
-const notifyStuck = () => { emit("captcha://interactive").catch(() => {}); };
+const notifyStuck = () => {
+  emit("captcha://interactive").catch(() => {});
+  // 窗口可能以隐藏形态起步（手动领取/2API 网关兜底）：无感失败需要人工介入时
+  // 请求后端真正弹窗（后端按「自动轮」门控，自动轮静默忽略）；失败静默
+  invoke("captcha_show").catch(() => {});
+};
 
 function loadSdk() {
   return new Promise((resolve, reject) => {

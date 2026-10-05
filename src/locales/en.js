@@ -332,6 +332,8 @@ export const en = {
   "two.models": "Model list",
   "two.account": "Traffic account",
   "two.accountFollow": "Follow current account",
+  "two.proxy": "Outbound proxy",
+  "two.proxyHint": "http:// or socks5://, empty = direct",
   "two.secToken": "Access token",
   "two.tokenEmpty": "No token set (open mode, local only)",
   "two.showToken": "Show / hide token",

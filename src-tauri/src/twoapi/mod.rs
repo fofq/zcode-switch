@@ -78,11 +78,13 @@ pub struct Cfg {
     /// None = 跟随当前激活账号
     pub account: Option<String>,
     pub models: Vec<String>,
+    /// 上游出站代理（None = 直连）；与 token 同机制热更新，不触发重启
+    pub proxy_url: Option<String>,
 }
 
 impl Cfg {
     fn same_service(&self, other: &Cfg) -> bool {
-        // token 热更新即可，不需要重启
+        // token / 出站代理热更新即可，不需要重启
         self.port == other.port && self.account == other.account && self.models == other.models
     }
 }
@@ -187,7 +189,10 @@ fn ensure_captcha_window() {
     let Some(app) = CAPTCHA_APP.lock().unwrap().clone() else { return };
     *solving = Some(std::time::Instant::now());
     drop(solving);
-    let _ = crate::open_captcha_window(&app, false);
+    // 网关 3007 兜底也静默起步（不立刻弹窗）；无感失败经 captcha_show 弹出解锁 75s
+    // 等待，故先清掉可能残留的「自动轮」门控（自动领取轮开过窗的场合）
+    crate::CAPTCHA_LAST_AUTO.store(false, Ordering::Relaxed);
+    let _ = crate::open_captcha_window(&app, true);
 }
 
 async fn wait_captcha_param() -> Option<(String, Option<String>)> {
@@ -289,6 +294,12 @@ enum PlanFail {
     Other,
 }
 
+/// 冷却落盘节流状态：窗口内跳过的写入由下次 cool_down 落整表补上（防故障风暴高频刷盘）
+#[derive(Default)]
+pub struct CooldownPersist {
+    last_flush: Option<std::time::Instant>,
+}
+
 pub struct SharedState {
     pub paths: Paths,
     pub token: Mutex<String>,
@@ -302,8 +313,13 @@ pub struct SharedState {
     pub pool: Mutex<Option<(std::time::Instant, Vec<PoolKey>, Duration)>>,
     /// 激活账号 id 短缓存（避免每个请求全量解密账号）
     pub active_cache: Mutex<Option<(std::time::Instant, Option<String>)>>,
-    /// 套餐路由账号冷却表：id -> 冷却截止时刻
+    /// 套餐路由账号冷却表：id -> 冷却截止时刻（落盘持久化，见 twoapi-cooldowns.json）
     pub cooldown: Mutex<HashMap<String, std::time::Instant>>,
+    /// 冷却落盘节流：距上次落盘 <5s 就跳过，由下次 cool_down 落整表补上
+    pub cooldown_persist: Mutex<CooldownPersist>,
+    /// 冷却落盘开关：true（默认）读/写 twoapi-cooldowns.json；仅 start_for_test 置
+    /// false，E2E 测试不读不写真实 store_dir 的冷却文件，测试与生产互不渗透
+    pub cooldown_persist_enabled: bool,
     /// 粘性路由：最近成功交付的账号 id；下一请求把它排到池候选最前（主账号未冷却时仍最先）
     pub sticky: Mutex<Option<String>>,
     /// 轮询游标
@@ -317,6 +333,10 @@ pub struct Manager {
 }
 
 static MANAGER: Mutex<Option<Manager>> = Mutex::new(None);
+
+/// 2API 上游出站代理（None = 直连）。服务是单例，随 Cfg 走：sync 热更新（与 token
+/// 同机制）和重建时刷新，upstream_agent 按它构建带代理的专用 Agent。
+static PROXY_URL: Mutex<Option<String>> = Mutex::new(None);
 
 pub fn parse_models(s: &str) -> Vec<String> {
     s.split(',')
@@ -335,8 +355,9 @@ pub async fn sync(paths: &Paths) -> Result<(), String> {
         token: s.two_api_token(),
         account: s.two_api_account(),
         models: parse_models(&s.two_api_models()),
+        proxy_url: s.two_api_proxy_url(),
     };
-    // 配置未变：只热更新 token；否则停掉旧实例
+    // 配置未变：只热更新 token / 出站代理；否则停掉旧实例
     {
         let mut mgr = MANAGER.lock().unwrap();
         let same = on && mgr.as_ref().map(|m| m.cfg.same_service(&cfg)).unwrap_or(false);
@@ -344,6 +365,7 @@ pub async fn sync(paths: &Paths) -> Result<(), String> {
             if let Some(m) = mgr.as_ref() {
                 *m.state.token.lock().unwrap() = cfg.token.clone();
             }
+            *PROXY_URL.lock().unwrap() = cfg.proxy_url.clone();
             return Ok(());
         }
         if let Some(m) = mgr.take() {
@@ -355,6 +377,7 @@ pub async fn sync(paths: &Paths) -> Result<(), String> {
     if !on {
         return Ok(());
     }
+    *PROXY_URL.lock().unwrap() = cfg.proxy_url.clone();
     let state = Arc::new(SharedState {
         paths: Paths::detect(),
         token: Mutex::new(cfg.token.clone()),
@@ -364,7 +387,9 @@ pub async fn sync(paths: &Paths) -> Result<(), String> {
         usage: Mutex::new(HashMap::new()),
         pool: Mutex::new(None),
         active_cache: Mutex::new(None),
-        cooldown: Mutex::new(HashMap::new()),
+        cooldown: Mutex::new(load_cooldowns()),
+        cooldown_persist: Mutex::new(CooldownPersist::default()),
+        cooldown_persist_enabled: true,
         sticky: Mutex::new(None),
         rr: AtomicU64::new(0),
     });
@@ -410,12 +435,14 @@ pub async fn start_for_test(paths: &Paths, port_override: Option<u16>) -> Result
         token: s.two_api_token(),
         account: s.two_api_account(),
         models: parse_models(&s.two_api_models()),
+        proxy_url: s.two_api_proxy_url(),
     };
     if let Some(m) = MANAGER.lock().unwrap().take() {
         if let Some(tx) = m.shutdown {
             let _ = tx.send(true);
         }
     }
+    *PROXY_URL.lock().unwrap() = cfg.proxy_url.clone();
     let state = Arc::new(SharedState {
         paths: Paths::detect(),
         token: Mutex::new(cfg.token.clone()),
@@ -425,7 +452,9 @@ pub async fn start_for_test(paths: &Paths, port_override: Option<u16>) -> Result
         usage: Mutex::new(HashMap::new()),
         pool: Mutex::new(None),
         active_cache: Mutex::new(None),
-        cooldown: Mutex::new(HashMap::new()),
+        cooldown: Mutex::new(HashMap::new()), // 测试态不读真实 twoapi-cooldowns.json
+        cooldown_persist: Mutex::new(CooldownPersist::default()),
+        cooldown_persist_enabled: false, // 测试态不写真实 twoapi-cooldowns.json
         sticky: Mutex::new(None),
         rr: AtomicU64::new(0),
     });
@@ -486,13 +515,39 @@ pub struct TestResult {
     pub error: Option<String>,
 }
 
+/// 2API 上游专用 Agent（不再克隆共享 http_agent，避免读超时/代理波及 quota/claim）：
+/// - 读间隔超时 600s：单次 read 之间的最大间隔，长流式响应活跃时永不触发，
+///   上游挂起（连上后不发数据）由它兜底；总超时仍由各调用点按需设置
+///   （quota 20s / claim 25s 走共享 http_agent 本体，不受影响）。
+/// - 出站代理：配置了 PROXY_URL 时构建带代理的 Agent，解析失败 flowlog 一行并
+///   回退直连（参照 zcode-pool gateway.rs）；Agent 按 proxy 缓存复用连接池，
+///   代理热更新（与 token 同机制）后下次请求自动重建。
 fn upstream_agent() -> ureq::Agent {
-    // 共享全局 Agent（连接池按 host 复用）；不设总超时：chat 转发是长流式响应，
-    // 挂起保护由 connect 超时 + 客户端断连兜底
-    crate::http_agent().clone()
+    static CACHED: Mutex<Option<(Option<String>, ureq::Agent)>> = Mutex::new(None);
+    let proxy = PROXY_URL.lock().unwrap().clone();
+    let mut cached = CACHED.lock().unwrap();
+    if let Some((p, a)) = cached.as_ref() {
+        if *p == proxy {
+            return a.clone();
+        }
+    }
+    let mut ab = ureq::AgentBuilder::new()
+        .timeout_connect(Duration::from_secs(10))
+        .timeout_read(Duration::from_secs(600));
+    if let Some(u) = proxy.as_deref() {
+        match ureq::Proxy::new(u) {
+            Ok(px) => ab = ab.proxy(px),
+            Err(e) => crate::flowlog::log("twoapi", "proxy-bad", &format!("{u}：{e} —— 按直连走")),
+        }
+    }
+    let agent = ab.build();
+    *cached = Some((proxy, agent.clone()));
+    agent
 }
 
-/// 测试专用：带总超时，避免上游挂起时测试一直不返回
+/// 测试专用：只打本机 127.0.0.1，刻意不带出站代理（外网代理会劫持回环请求，
+/// E2E 必挂；上游链路在本地服务内部走 upstream_agent 已覆盖代理）。带总超时，
+/// 避免上游挂起时测试一直不返回
 fn test_agent() -> ureq::Agent {
     ureq::AgentBuilder::new()
         .timeout_connect(Duration::from_secs(10))
@@ -680,12 +735,214 @@ fn cool_down(st: &Arc<SharedState>, id: &str, secs: u64) {
         .lock()
         .unwrap()
         .insert(id.to_string(), std::time::Instant::now() + Duration::from_secs(secs));
+    // 落盘兜底（5s 节流 + 静默失败）：节流窗口内的本次写入会跳过，由下一次 cool_down
+    // 落整表补上；因此窗口内最后一次冷却若之后再无写入、进程立即退出，该条不落盘
+    // （最多丢最近一个 5s 窗口内的条目）。已落盘部分在 twoapi::sync 重建 / 应用重启时恢复。
+    persist_cooldowns(st);
 }
 
 fn cooling_remaining(st: &Arc<SharedState>, id: &str) -> Option<Duration> {
     let map = st.cooldown.lock().unwrap();
     map.get(id)
         .and_then(|until| until.checked_duration_since(std::time::Instant::now()))
+}
+
+// ===== 冷却落盘（<store_dir>/twoapi-cooldowns.json） =====
+// 纯内存冷却表在 twoapi::sync 重建和应用重启时都会清零，这里整表落盘兜底：
+// {账号id: 截止时刻（unix 毫秒）}。Instant 不可序列化，落盘换算成绝对时间戳，
+// 恢复时换算回剩余时长（过期条目丢弃）。任何 IO 失败静默，不影响请求路径。
+
+const COOLDOWN_FLUSH_MIN: Duration = Duration::from_secs(5);
+
+fn cooldown_file() -> std::path::PathBuf {
+    Paths::detect().store_dir().join("twoapi-cooldowns.json")
+}
+
+fn unix_ms_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// 内存冷却表 → 落盘形态：剩余时长 + 当前时刻换算成绝对 unix 毫秒
+fn cooldown_to_disk(
+    map: &HashMap<String, std::time::Instant>,
+    now: std::time::Instant,
+    now_ms: u64,
+) -> HashMap<String, u64> {
+    map.iter()
+        .map(|(id, until)| {
+            let remain = until.checked_duration_since(now).unwrap_or_default();
+            (id.clone(), now_ms + remain.as_millis() as u64)
+        })
+        .collect()
+}
+
+/// 落盘形态 → 内存冷却表：过期条目丢弃，未过期恢复为剩余时长
+fn cooldown_from_disk(disk: &HashMap<String, u64>, now_ms: u64) -> HashMap<String, std::time::Instant> {
+    disk.iter()
+        .filter(|(_, deadline)| **deadline > now_ms)
+        .map(|(id, deadline)| {
+            (id.clone(), std::time::Instant::now() + Duration::from_millis(deadline.saturating_sub(now_ms)))
+        })
+        .collect()
+}
+
+/// 服务启动/SharedState 新建时恢复冷却表（读/解析失败当空表）
+fn load_cooldowns() -> HashMap<String, std::time::Instant> {
+    let Ok(text) = std::fs::read_to_string(cooldown_file()) else {
+        return HashMap::new();
+    };
+    match serde_json::from_str::<HashMap<String, u64>>(&text) {
+        Ok(disk) => cooldown_from_disk(&disk, unix_ms_now()),
+        Err(_) => HashMap::new(),
+    }
+}
+
+/// cool_down 后落盘：5s 节流窗口内跳过（落盘整表，窗口内被跳过的条目由下次
+/// cool_down 一并补写）；IO 失败静默
+fn persist_cooldowns(st: &Arc<SharedState>) {
+    if !st.cooldown_persist_enabled {
+        return; // 测试态（start_for_test）：不碰真实 twoapi-cooldowns.json
+    }
+    let mut ps = st.cooldown_persist.lock().unwrap();
+    let now = std::time::Instant::now();
+    if ps
+        .last_flush
+        .map(|t| now.duration_since(t) < COOLDOWN_FLUSH_MIN)
+        .unwrap_or(false)
+    {
+        return;
+    }
+    ps.last_flush = Some(now);
+    drop(ps);
+    flush_cooldowns(st);
+}
+
+/// 整表落盘（原子写 tmp+rename）；顺手清掉已过期条目，内存与磁盘保持一致
+fn flush_cooldowns(st: &Arc<SharedState>) {
+    let now = std::time::Instant::now();
+    let disk = {
+        let mut map = st.cooldown.lock().unwrap();
+        map.retain(|_, until| *until > now);
+        cooldown_to_disk(&map, now, unix_ms_now())
+    };
+    if disk.is_empty() {
+        // 全空只清文件，不落 "{}"
+        let _ = std::fs::remove_file(cooldown_file());
+        return;
+    }
+    if let Ok(text) = serde_json::to_string(&disk) {
+        let _ = store::atomic_write(&cooldown_file(), &text);
+    }
+}
+
+// ===== 前端额度快照（quota-snapshots.json）：配额感知选号 =====
+// 前端刷新额度后把整份 QuotaOverview 推给后端原子落盘（store::save_quota_snapshots，
+// 前端 ≥20s 节流）。这里按文件 mtime 做进程级缓存，套餐路由选号时用
+// 「快照显示该模型额度耗尽」预排除候选。宁可漏排不可误排：快照过期（>10 分钟）、
+// 字段缺失、没有任何 item 匹配模型都不排除；过期套餐槽（expired=true）不参与判定。
+// 到期排序（池候选按到期升序）不可行：快照里的 PlanSlot.expire / QuotaItem.period_end
+// 都是展示字符串（quota.rs extract_expire/expiry_field 的产物，period_end 还可能是
+// 「… 重置」标签），没有可比的 epoch 字段——拿不到可比到期时间就跳过排序，绝不为
+// 排序发起任何网络请求。
+
+/// 快照采样时间的可信窗口：超过就算陈旧，不参与排除判定
+const QUOTA_SNAPSHOT_FRESH_MS: i64 = 10 * 60 * 1000;
+
+/// (文件 mtime, 账号id -> (采样时刻 unix 毫秒, QuotaOverview JSON))
+type QuotaSnaps = Arc<HashMap<String, (i64, Value)>>;
+
+static QUOTA_SNAP_CACHE: Mutex<Option<(std::time::SystemTime, QuotaSnaps)>> = Mutex::new(None);
+
+/// 每次套餐路由调用：stat 快照文件 mtime，变了才重读（读文件放 spawn_blocking）。
+/// stat/读失败沿用旧缓存，没有旧缓存视为无快照（空表，不排除任何人）。
+async fn quota_snapshots() -> QuotaSnaps {
+    let mtime = std::fs::metadata(store::quota_snapshots_file(&Paths::detect()))
+        .and_then(|m| m.modified())
+        .ok();
+    {
+        let guard = QUOTA_SNAP_CACHE.lock().unwrap();
+        if let Some((at, map)) = guard.as_ref() {
+            match mtime {
+                Some(t) if t == *at => return map.clone(),
+                // 文件消失/stat 失败：沿用旧缓存（采样时间新鲜度另行把关）
+                None => return map.clone(),
+                _ => {}
+            }
+        }
+    }
+    let Some(t) = mtime else {
+        return Arc::new(HashMap::new());
+    };
+    let fresh = tauri::async_runtime::spawn_blocking(move || {
+        Arc::new(store::load_quota_snapshots(&Paths::detect()))
+    })
+    .await
+    .unwrap_or_else(|_| Arc::new(HashMap::new()));
+    let mut guard = QUOTA_SNAP_CACHE.lock().unwrap();
+    // 并发重载不回退：缓存已是同一 mtime（别请求刚写入）就保留
+    if guard.as_ref().map(|(at, _)| *at != t).unwrap_or(true) {
+        *guard = Some((t, fresh.clone()));
+    }
+    fresh
+}
+
+/// 模型名归一：小写、去空格/-/_、去 "glm" 前缀后比较（"GLM-5.3" ↔ "glm-5.3"）。
+/// 双方都做同样的归一，前缀去不留都等价。
+fn norm_model_key(s: &str) -> String {
+    let flat: String = s
+        .chars()
+        .filter(|c| !matches!(c, ' ' | '-' | '_'))
+        .map(|c| c.to_ascii_lowercase())
+        .collect();
+    flat.strip_prefix("glm").unwrap_or(&flat).to_string()
+}
+
+/// 快照配额排除判定（返回 Some(原因) = 本轮排除该账号）：
+/// - 该账号有可信快照（采样距今 ≤10 分钟）；
+/// - 其 plans 中至少一个未过期 slot 的 item 名与请求模型匹配，
+///   且这些匹配 item 的 remaining 之和 == 0（缺失/非法 remaining 视为未知，不排除）；
+/// - 没有任何 item 匹配 → 不排除（保守：快照没覆盖的模型不背书排除）。
+fn quota_exhausted_by_snapshot(
+    snaps: &HashMap<String, (i64, Value)>,
+    id: &str,
+    model: &str,
+    now_ms: i64,
+) -> Option<String> {
+    let key = norm_model_key(model);
+    if key.is_empty() {
+        return None;
+    }
+    let (t, data) = snaps.get(id)?;
+    if *t <= 0 || now_ms - *t > QUOTA_SNAPSHOT_FRESH_MS {
+        return None; // 无采样时间/快照过期：宁漏排不误排
+    }
+    let mut matched = false;
+    let mut remaining_sum = 0.0;
+    let mut unknown = false;
+    for slot in data.get("plans")?.as_array()?.iter() {
+        if slot.get("expired").and_then(Value::as_bool).unwrap_or(false) {
+            continue; // 过期套餐槽不参与（避免过期礼包余额误判）
+        }
+        for item in slot.get("items").and_then(Value::as_array).into_iter().flatten() {
+            let name = item.get("name").and_then(Value::as_str).unwrap_or("");
+            if name.is_empty() || norm_model_key(name) != key {
+                continue;
+            }
+            matched = true;
+            match item.get("remaining").and_then(Value::as_f64) {
+                Some(r) => remaining_sum += r,
+                None => unknown = true,
+            }
+        }
+    }
+    if matched && !unknown && remaining_sum == 0.0 {
+        Some("快照显示该模型额度耗尽".into())
+    } else {
+        None
+    }
 }
 
 fn clip(s: &str, n: usize) -> String {
@@ -854,6 +1111,19 @@ async fn relay_plan_multi(
         None
     };
     // 主候选解析：失败不再直接 502，落回 JWT 池候选继续（原因记入聚合）
+    // 配额感知：快照显示请求模型额度耗尽的候选（主账号与池候选一视同仁）直接排除，
+    // 免得烧一轮上游请求才拿到 402/额度词再冷却（快照来自前端节流推送，零上游请求）
+    let model = body_val
+        .and_then(|v| v.get("model"))
+        .and_then(|m| m.as_str())
+        .unwrap_or("")
+        .to_string();
+    let now_ms = unix_ms_now() as i64;
+    let snaps = if model.is_empty() {
+        Arc::new(HashMap::new())
+    } else {
+        quota_snapshots().await
+    };
     let mut candidates: Vec<Candidate> = Vec::new();
     let mut reasons: Vec<String> = Vec::new();
     match resolve::resolve_primary(st).await {
@@ -861,6 +1131,8 @@ async fn relay_plan_multi(
             if cooling_remaining(st, &p.id).is_some() {
                 // 冷却过滤同样作用于主账号（pinned/follow）：冷却中就跳过它
                 reasons.push(format!("主账号 {} 冷却中，跳过", p.id));
+            } else if let Some(qr) = quota_exhausted_by_snapshot(&snaps, &p.id, &model, now_ms) {
+                reasons.push(format!("主账号 {}: {}", p.id, qr));
             } else {
                 candidates.push(Candidate {
                     label: account_label("", &p.id),
@@ -899,6 +1171,10 @@ async fn relay_plan_multi(
                     continue;
                 }
                 if cooling_remaining(st, &id).is_some() {
+                    continue;
+                }
+                if let Some(qr) = quota_exhausted_by_snapshot(&snaps, &id, &model, now_ms) {
+                    reasons.push(format!("{}: {}", account_label(&name, &id), qr));
                     continue;
                 }
                 candidates.push(Candidate { label: account_label(&name, &id), id, info, mid });
@@ -1390,9 +1666,11 @@ async fn plan_request_once(
     mid: Option<String>,
     usage: UsageCtx,
 ) -> PlanSend {
+    // accept 对齐参考实现 CLIENT_HEADERS（"*/*"）：text/event-stream 会让上游对
+    // Anthropic 入站的非流式请求也按 SSE 对待；OpenAI 入站非流式仍要 JSON
     let accept = match &mode {
         PumpMode::OpenAiJson(_) => "application/json",
-        _ => "text/event-stream",
+        _ => "*/*",
     };
     let (meta_tx, meta_rx) = tokio::sync::oneshot::channel::<PlanMeta>();
     let (body_tx, body_rx) = tokio::sync::mpsc::channel::<Result<Vec<u8>, std::io::Error>>(32);
@@ -2097,5 +2375,173 @@ mod tests {
         let mut recombined = Vec::new();
         std::io::Cursor::new(head).chain(rest).read_to_end(&mut recombined).unwrap();
         assert_eq!(recombined, body);
+    }
+
+    #[test]
+    fn cooldown_disk_roundtrip_restores_remaining() {
+        // 恢复语义：未过期条目按剩余时长恢复；过期条目（直接构造的落盘残留）丢弃
+        let now = std::time::Instant::now();
+        let now_ms = unix_ms_now();
+        let mut disk = HashMap::new();
+        disk.insert("alive".to_string(), now_ms + 600_000);
+        disk.insert("stale".to_string(), now_ms.saturating_sub(1));
+        disk.insert("boundary".to_string(), now_ms); // 恰好到期 = 过期，丢弃
+        let restored = cooldown_from_disk(&disk, now_ms);
+        assert!(!restored.contains_key("stale"));
+        assert!(!restored.contains_key("boundary"));
+        let until = restored.get("alive").copied().expect("未过期条目应恢复");
+        let remain = until.checked_duration_since(std::time::Instant::now()).unwrap();
+        // 恢复为剩余时长（约 600s），不是从头再冷一遍
+        assert!(remain <= Duration::from_secs(600) && remain > Duration::from_secs(590), "{remain:?}");
+    }
+
+    #[test]
+    fn cooldown_to_disk_maps_deadlines() {
+        // 内存 → 落盘：截止时刻换算为绝对 unix 毫秒（Instant 不可序列化），
+        // 经 from_disk 回读后剩余时长保持
+        let now = std::time::Instant::now();
+        let now_ms = unix_ms_now();
+        let mut mem = HashMap::new();
+        mem.insert("acct".to_string(), now + Duration::from_secs(300));
+        let disk = cooldown_to_disk(&mem, now, now_ms);
+        let ms = disk.get("acct").copied().unwrap();
+        assert!(ms > now_ms, "绝对时间戳应晚于当前时刻");
+        let restored = cooldown_from_disk(&disk, now_ms);
+        let remain = restored.get("acct").unwrap().checked_duration_since(std::time::Instant::now()).unwrap();
+        assert!(remain <= Duration::from_secs(300) && remain > Duration::from_secs(290), "{remain:?}");
+    }
+
+    #[test]
+    fn cooldown_persist_disabled_writes_nothing() {
+        // 测试态开关：cooldown_persist_enabled=false 时 cool_down 只改内存表，
+        // 不读不写真实 store_dir 的 twoapi-cooldowns.json（文件前后字节一致）
+        let state = Arc::new(SharedState {
+            paths: Paths::detect(),
+            token: Mutex::new(String::new()),
+            account: Mutex::new(None),
+            models: Mutex::new(Vec::new()),
+            cache: Mutex::new(HashMap::new()),
+            usage: Mutex::new(HashMap::new()),
+            pool: Mutex::new(None),
+            active_cache: Mutex::new(None),
+            cooldown: Mutex::new(HashMap::new()),
+            cooldown_persist: Mutex::new(CooldownPersist::default()),
+            cooldown_persist_enabled: false,
+            sticky: Mutex::new(None),
+            rr: AtomicU64::new(0),
+        });
+        let before = std::fs::read(cooldown_file()).ok();
+        cool_down(&state, "test-persist-disabled", 60);
+        assert_eq!(
+            std::fs::read(cooldown_file()).ok(),
+            before,
+            "持久化关闭时不得写冷却文件"
+        );
+    }
+
+    #[test]
+    fn upstream_agent_bad_proxy_falls_back_to_direct() {
+        // 代理解析失败：flowlog 一行并回退直连（不 panic、照常出 Agent），
+        // 代理清空后同样恢复直连
+        *PROXY_URL.lock().unwrap() = Some("not a proxy".to_string());
+        let _ = upstream_agent();
+        *PROXY_URL.lock().unwrap() = None;
+        let _ = upstream_agent();
+    }
+
+    /// 构造单账号快照：plans 为 PlanSlot 数组 JSON（与 QuotaOverview 序列化形状一致）
+    fn snaps_one(id: &str, t: i64, plans: Value) -> HashMap<String, (i64, Value)> {
+        let mut m = HashMap::new();
+        m.insert(id.to_string(), (t, json!({ "plans": plans })));
+        m
+    }
+
+    #[test]
+    fn norm_model_key_strips_case_and_separators() {
+        // 实现只过滤空格/-/_、保留 '.'，再去 glm 前缀（见 norm_model_key）
+        assert_eq!(norm_model_key("GLM-5.3"), "5.3");
+        assert_eq!(norm_model_key("glm_5.3"), "5.3");
+        assert_eq!(norm_model_key(" GLM 5.3 "), "5.3");
+        // 无 glm 前缀：原样归一（双方同函数，前缀去不留都等价）
+        assert_eq!(norm_model_key("5.3"), "5.3");
+        assert_eq!(norm_model_key("GLM-4.7-Flash"), "4.7flash");
+        // 不同模型不得混淆：glm-5.3-flash → "5.3flash"，与 glm-5.3 → "5.3" 是不同键
+        assert_ne!(
+            norm_model_key("glm-5.3-flash"),
+            norm_model_key("glm-5.3"),
+            "不同模型不得混淆"
+        );
+    }
+
+    #[test]
+    fn quota_snapshot_excludes_only_fresh_zero_matched() {
+        let now = 1_800_000_000_000i64;
+        let item = |name: &str, remaining: f64| json!({ "name": name, "remaining": remaining });
+        // 匹配且匹配 item 全零 → 排除
+        let s = snaps_one("a", now, json!([{ "items": [item("GLM-5.3", 0.0)] }]));
+        assert_eq!(
+            quota_exhausted_by_snapshot(&s, "a", "glm-5.3", now).as_deref(),
+            Some("快照显示该模型额度耗尽")
+        );
+        // 大小写/分隔符差异照样匹配
+        assert!(quota_exhausted_by_snapshot(&s, "a", "GLM_5.3", now).is_some());
+        // 有剩余 → 不排除
+        let s2 = snaps_one("a", now, json!([{ "items": [item("GLM-5.3", 12.5)] }]));
+        assert!(quota_exhausted_by_snapshot(&s2, "a", "glm-5.3", now).is_none());
+        // 没有任何 item 匹配模型（哪怕全零）→ 不排除（保守）
+        let s3 = snaps_one("a", now, json!([{ "items": [item("glm-4.7-flash", 0.0)] }]));
+        assert!(quota_exhausted_by_snapshot(&s3, "a", "glm-5.3", now).is_none());
+        // 多个匹配 item：有任一剩余（和 >0）→ 不排除
+        let s4 = snaps_one(
+            "a",
+            now,
+            json!([{ "items": [item("GLM-5.3", 0.0), item("glm_5.3", 3.0)] }]),
+        );
+        assert!(quota_exhausted_by_snapshot(&s4, "a", "glm-5.3", now).is_none());
+        // remaining 缺失 → 未知，不排除
+        let s5 = snaps_one("a", now, json!([{ "items": [ { "name": "GLM-5.3" } ] }]));
+        assert!(quota_exhausted_by_snapshot(&s5, "a", "glm-5.3", now).is_none());
+    }
+
+    #[test]
+    fn quota_snapshot_guards_freshness_and_expired_slots() {
+        let now = 1_800_000_000_000i64;
+        let item = |name: &str, remaining: f64| json!({ "name": name, "remaining": remaining });
+        // 快照过期（>10 分钟）→ 不排除
+        let stale = snaps_one("a", now - QUOTA_SNAPSHOT_FRESH_MS - 1, json!([{ "items": [item("GLM-5.3", 0.0)] }]));
+        assert!(quota_exhausted_by_snapshot(&stale, "a", "glm-5.3", now).is_none());
+        // 临界（恰好 10 分钟）仍算新鲜 → 排除
+        let edge = snaps_one("a", now - QUOTA_SNAPSHOT_FRESH_MS, json!([{ "items": [item("GLM-5.3", 0.0)] }]));
+        assert!(quota_exhausted_by_snapshot(&edge, "a", "glm-5.3", now).is_some());
+        // 非法采样时间 → 不排除
+        let bad_t = snaps_one("a", 0, json!([{ "items": [item("GLM-5.3", 0.0)] }]));
+        assert!(quota_exhausted_by_snapshot(&bad_t, "a", "glm-5.3", now).is_none());
+        // 未知名/未知账号 → 不排除
+        assert!(quota_exhausted_by_snapshot(&bad_t, "other", "glm-5.3", now).is_none());
+        assert!(quota_exhausted_by_snapshot(&bad_t, "a", "", now).is_none());
+        // 过期套餐槽不参与：零余额匹配 item 挂在 expired=true 的槽里 → 不排除
+        let s = snaps_one(
+            "a",
+            now,
+            json!([
+                { "expired": true, "items": [item("GLM-5.3", 0.0)] },
+                { "items": [item("glm-4.7-flash", 0.0)] }
+            ]),
+        );
+        assert!(quota_exhausted_by_snapshot(&s, "a", "glm-5.3", now).is_none());
+        // 同形状但槽未过期 → 排除
+        let s2 = snaps_one(
+            "a",
+            now,
+            json!([
+                { "items": [item("GLM-5.3", 0.0)] },
+                { "expired": true, "items": [item("glm-4.7-flash", 9.0)] }
+            ]),
+        );
+        assert!(quota_exhausted_by_snapshot(&s2, "a", "glm-5.3", now).is_some());
+        // 无 plans 字段 → 不排除
+        let mut no_plans = HashMap::new();
+        no_plans.insert("a".to_string(), (now, json!({ "is_empty": false })));
+        assert!(quota_exhausted_by_snapshot(&no_plans, "a", "glm-5.3", now).is_none());
     }
 }

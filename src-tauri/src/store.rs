@@ -7,6 +7,7 @@ use chrono::Local;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -201,6 +202,9 @@ pub struct Settings {
     pub two_api_token: Option<String>,
     #[serde(default)]
     pub two_api_models: Option<String>,
+    /// 2API 上游出站代理（http:// 或 socks5://，空 = 直连）
+    #[serde(default)]
+    pub two_api_proxy_url: Option<String>,
 }
 
 impl Settings {
@@ -253,6 +257,14 @@ impl Settings {
             .clone()
             .unwrap_or_else(|| "glm-5.3-flash, glm-5.3".into())
     }
+    /// None = 直连（未配置或空白）
+    pub fn two_api_proxy_url(&self) -> Option<String> {
+        self.two_api_proxy_url
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(String::from)
+    }
 }
 
 #[derive(Serialize, Clone, Debug)]
@@ -302,6 +314,7 @@ pub struct AppState {
     pub two_api_account: Option<String>,
     pub two_api_token: String,
     pub two_api_models: String,
+    pub two_api_proxy_url: Option<String>,
 }
 
 #[derive(Serialize, Clone, Debug)]
@@ -370,6 +383,45 @@ pub fn atomic_write(path: &Path, data: &str) -> Result<(), String> {
         return Err(trf("err.rename_fail", &[("path", &path.display().to_string()), ("e", &e.to_string())]));
     }
     Ok(())
+}
+
+/// 前端推送的额度快照文件：<store_dir>/quota-snapshots.json
+pub fn quota_snapshots_file(paths: &Paths) -> PathBuf {
+    paths.store_dir().join("quota-snapshots.json")
+}
+
+/// 前端额度快照落盘（载荷形如 { 账号id: { t: 采样毫秒, data: QuotaOverview } }）。
+/// 原样存储不解析（解析在 2API 消费侧）；前端已节流（≥20s 且有更新才推），
+/// 文件 ≤ 几百 KB，来一次写一次（tmp+rename 原子写）。
+pub fn save_quota_snapshots(paths: &Paths, snapshots: &Value) -> Result<(), String> {
+    if !snapshots.is_object() {
+        return Err("额度快照载荷不是 JSON 对象".into());
+    }
+    paths.ensure_dirs()?;
+    let body = serde_json::to_string(snapshots).unwrap_or_default();
+    atomic_write(&quota_snapshots_file(paths), &body)
+}
+
+/// 只读加载（2API 配额感知选号用）：文件缺失/损坏/条目不合规一律静默跳过，
+/// 返回 账号id -> (采样时刻 unix 毫秒, QuotaOverview JSON)。
+pub fn load_quota_snapshots(paths: &Paths) -> HashMap<String, (i64, Value)> {
+    let mut out = HashMap::new();
+    let Ok(text) = fs::read_to_string(quota_snapshots_file(paths)) else {
+        return out;
+    };
+    let Ok(v) = serde_json::from_str::<Value>(&text) else {
+        return out;
+    };
+    let Some(map) = v.as_object() else { return out };
+    for (id, entry) in map {
+        let Some(t) = entry.get("t").and_then(Value::as_i64) else { continue };
+        let Some(data) = entry.get("data").filter(|d| d.is_object()) else { continue };
+        if id.is_empty() {
+            continue;
+        }
+        out.insert(id.clone(), (t, data.clone()));
+    }
+    out
 }
 
 pub fn read_live(paths: &Paths) -> Result<Option<Value>, String> {
@@ -2069,5 +2121,6 @@ pub fn get_state(paths: &Paths) -> Result<AppState, String> {
         two_api_account: settings.two_api_account(),
         two_api_token: settings.two_api_token(),
         two_api_models: settings.two_api_models(),
+        two_api_proxy_url: settings.two_api_proxy_url(),
     })
 }

@@ -327,6 +327,8 @@ export const zh = {
   "two.models": "模型列表",
   "two.account": "流量账号",
   "two.accountFollow": "跟随当前账号",
+  "two.proxy": "出站代理",
+  "two.proxyHint": "http:// 或 socks5://，留空 = 直连",
   "two.secToken": "访问令牌",
   "two.tokenEmpty": "未设置令牌（开放模式，仅限本机）",
   "two.showToken": "显示 / 隐藏令牌",

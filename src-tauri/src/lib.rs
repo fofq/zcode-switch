@@ -28,6 +28,7 @@ pub(crate) fn http_agent() -> &'static ureq::Agent {
 }
 
 use serde_json::{json, Value};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use store::*;
 use tauri::menu::{MenuBuilder, MenuItem};
@@ -311,6 +312,14 @@ async fn get_account_quota(id: String, quick: Option<bool>) -> Result<quota::Quo
     Ok(ov)
 }
 
+/// 前端额度快照落盘：main.js 节流推送（≥20s 且有更新才推），原子写
+/// <store_dir>/quota-snapshots.json，供 2API 套餐路由做配额感知选号。
+/// 轻量本地文件操作（≤几百 KB），无需 spawn_blocking；失败由前端静默吞掉。
+#[tauri::command]
+async fn push_quota_snapshots(snapshots: Value) -> Result<(), String> {
+    store::save_quota_snapshots(&Paths::detect(), &snapshots)
+}
+
 #[tauri::command]
 async fn account_api_key(id: String) -> Result<Option<store::ApiKeyInfo>, String> {
     // 无自有 key 时会现场铸 key（网络请求），必须放阻塞线程避免卡 UI
@@ -326,6 +335,7 @@ async fn set_two_api(
     port: u16,
     account: Option<String>,
     models: Option<String>,
+    proxy_url: Option<String>,
 ) -> Result<(), String> {
     let paths = Paths::detect();
     {
@@ -335,6 +345,7 @@ async fn set_two_api(
         s.two_api_port = Some(port.clamp(1024, 65535));
         s.two_api_account = account.filter(|x| !x.trim().is_empty());
         s.two_api_models = models;
+        s.two_api_proxy_url = proxy_url.filter(|x| !x.trim().is_empty());
         save_settings(&paths, &s)?;
     }
     twoapi::sync(&paths).await?;
@@ -457,7 +468,10 @@ async fn claim_start(
         config: acc.config,
         device_mid: mid,
     });
-    open_captcha_window(&app, auto.unwrap_or(false))?;
+    // 门控记录：只有显式 auto=true（自动领取轮）才算「自动轮」。缺省改 true 只表示
+    // 隐藏起步——手动路径无感失败要经 captcha_show 弹出解锁，门控必须放行。
+    CAPTCHA_LAST_AUTO.store(matches!(auto, Some(true)), Ordering::Relaxed);
+    open_captcha_window(&app, auto.unwrap_or(true))?;
     Ok(json!({ "account": acc.name, "plan": display }))
 }
 
@@ -1051,6 +1065,26 @@ fn spawn_poll_loop(app: AppHandle, provider: String, flow: String, mid: String, 
     });
 }
 
+/// 最近一次验证码开窗的「自动轮」标记（captcha_show 的门控）：只有自动领取轮
+/// （claim_start 显式 auto=true）置 true——自动轮无感失败由前端 interactive 监听
+/// 取消+停靠 1h，绝不能把窗口弹到用户脸上；手动领取与 2API 网关兜底都是
+/// 「隐藏起步、失败经 captcha_show 弹出」，必须放行。开窗点（claim_start /
+/// ensure_captcha_window）在开窗前各自写入。
+pub(crate) static CAPTCHA_LAST_AUTO: AtomicBool = AtomicBool::new(false);
+
+/// 验证码窗口请求显示（captcha.js 无感失败时调用）：仅非自动轮真正弹出。
+#[tauri::command]
+async fn captcha_show(app: AppHandle) -> Result<(), String> {
+    if CAPTCHA_LAST_AUTO.load(Ordering::Relaxed) {
+        return Ok(()); // 自动轮：静默忽略（永不弹窗是既有不变量）
+    }
+    if let Some(w) = app.get_webview_window("captcha") {
+        let _ = w.show();
+        let _ = w.set_focus();
+    }
+    Ok(())
+}
+
 pub(crate) fn open_captcha_window(app: &AppHandle, auto: bool) -> Result<(), String> {
     let (w, h) = (380.0, 320.0);
     if let Some(win) = app.get_webview_window("captcha") {
@@ -1439,6 +1473,7 @@ pub fn run() {
             switch_to,
             get_live_quota,
             get_account_quota,
+            push_quota_snapshots,
             account_api_key,
             set_two_api,
             regen_two_api_token,
@@ -1450,6 +1485,7 @@ pub fn run() {
             claim_start,
             claim_captcha_config,
             captcha_submit,
+            captcha_show,
             claim_cancel,
             oauth_providers,
             oauth_begin,

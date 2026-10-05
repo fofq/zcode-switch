@@ -1046,6 +1046,9 @@ function twoSnippet(name, st) {
             <button class="btn-ghost has-ic" click="actions.twoDetectModels()" title="${esc(t("two.detectModelsTitle"))}">${ic("refresh", 13)} ${t("two.detectModels")}</button>
           </span>
         </label>
+        <label class="two-cfg wide"><span>${t("two.proxy")}</span>
+          <input class="two-input two-proxy" type="text" value="${esc(st.two_api_proxy_url || "")}" placeholder="${esc(t("two.proxyHint"))}">
+        </label>
         <div class="two-cfg-actions">
           <span class="two-test-result"></span>
           <button class="btn-ghost has-ic" click="actions.twoTest()">${ic("bolt", 14)} ${t("two.test")}</button>
@@ -2673,6 +2676,7 @@ const actions = {
         port: state?.two_api_port || 8117,
         account: state?.two_api_account || null,
         models: state?.two_api_models || null,
+        proxyUrl: state?.two_api_proxy_url || null,
       });
       await refresh();
       syncTwoApiModal();
@@ -2684,11 +2688,13 @@ const actions = {
     try {
       const raw = Number(document.querySelector(".two-port")?.value);
       const models = (document.querySelector(".two-models")?.value || "").trim() || autoModelList();
+      const proxyUrl = (document.querySelector(".two-proxy")?.value || "").trim() || null;
       await invoke("set_two_api", {
         on: !!state?.two_api_on,
         port: Number.isFinite(raw) && raw > 0 ? raw : 8117,
         account: state?.two_api_account || null,
         models: models || null,
+        proxyUrl,
       });
       await refresh();
       syncTwoApiModal();
@@ -2704,6 +2710,7 @@ const actions = {
         port: state?.two_api_port || 8117,
         account: v || null,
         models: state?.two_api_models || null,
+        proxyUrl: state?.two_api_proxy_url || null,
       });
       await refresh();
       syncTwoApiModal();
@@ -4433,11 +4440,19 @@ function flushQuotaCache(force = false) {
   quotaCacheDirty = false;
   try {
     const out = {};
+    const snaps = {};
     for (const [id, q] of Object.entries(acctQuota)) {
       if (!q?.data || q.err) continue;
       out[id] = { t: quotaSampleAt[id] || now, data: q.data, hist: (quotaHist[id] || []).slice(-8) };
+      // 后端快照只要 t+data（2API 配额感知选号消费），不拖 hist
+      snaps[id] = { t: out[id].t, data: q.data };
     }
     localStorage.setItem(QUOTA_CACHE_KEY, JSON.stringify(out));
+    // 复用同一节流：推给后端原子落盘（quota-snapshots.json），2API 选号做配额感知
+    // 排除用；失败静默——后端不在/旧版不该污染控制台，下次脏了再推
+    if (Object.keys(snaps).length) {
+      invoke("push_quota_snapshots", { snapshots: snaps }).catch(() => {});
+    }
   } catch { /* 存储不可用则退化为无缓存（冷启动全量刷新） */ }
 }
 function loadQuotaCache() {
