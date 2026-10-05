@@ -365,6 +365,7 @@ export const zh = {
   "m.quotaRefreshed": "「{name}」已刷新：剩 {pct}%",
   "m.quotaRefreshEmpty": "「{name}」暂无套餐数据（若异常会自动复查）",
   "m.quotaRefreshFail": "「{name}」刷新失败：{err}",
+  "m.quotaNetRetry": "（网络波动 · 自动重试中）",
   "m.refreshInFlight": "「{name}」正在刷新中，请稍候…",
   "m.claimRiskPaused": "领取请求连续被风控拦截：整轮暂停 {min} 分钟",
   "m.claimRiskPausedDetail": "上游 WAF 在关窗期会拦下所有提交（报价未领期间一直挂在 preview，不会丢单）。暂停到点后自动恢复，通常落在放行窗口内一次领到。",

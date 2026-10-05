@@ -319,16 +319,27 @@ fn coding_plan_api_keys(config: Option<&Value>) -> Vec<String> {
 
 /// 新代际客户端把个人 coding-plan 的 API key 存在 credentials.json 的
 /// account-provider:*:api-key 键里（config.json 已是遗留物），从这里提取。
-fn coding_plan_keys_from_creds(creds: &Value, secret: &str) -> Vec<String> {
+/// 返回 (key, 凭据键名)——键名供家族判定用（见 cred_key_is_zai_family）。
+fn coding_plan_keys_from_creds(creds: &Value, secret: &str) -> Vec<(String, String)> {
     let Some(map) = creds.as_object() else { return vec![] };
-    let mut out: Vec<String> = vec![];
+    let mut out: Vec<(String, String)> = vec![];
     for (k, v) in map {
         if !k.starts_with("account-provider:") || !k.ends_with(":api-key") { continue; }
         if !k.contains("coding-plan") { continue; }
         let Some(p) = v.as_str().and_then(|v| safe_decrypt(Some(v), secret)) else { continue };
-        if looks_like_token(&p) && !out.contains(&p) { out.push(p); }
+        if looks_like_token(&p) && !out.iter().any(|(existing, _)| existing == &p) {
+            out.push((p, k.clone()));
+        }
     }
     out
+}
+
+/// newgen 凭据键的家族判定：`account-provider:coding-plan:account:zai-individual-…:api-key`
+/// 第 4 段（plan 名）含 `zai` 即 z.ai 国际家族。它们的 key 打 open.bigmodel.cn 一律回
+/// 「当前用户不存在coding plan」（假无套餐信号，2026-10-05 实测 code 500），其额度
+/// 只认 ZaiBilling（JWT）频道——与下方 legacy 分支的 builtin:zai 守卫同因。
+fn cred_key_is_zai_family(k: &str) -> bool {
+    k.split(':').nth(3).map(|seg| seg.contains("zai")).unwrap_or(false)
 }
 
 pub fn candidate_tokens(creds: &Value, config: Option<&Value>, secret: &str, new_gen: bool) -> Vec<String> {
@@ -342,7 +353,9 @@ pub fn candidate_tokens(creds: &Value, config: Option<&Value>, secret: &str, new
     };
     let creds_keys = coding_plan_keys_from_creds(creds, secret);
     if new_gen {
-        for k in &creds_keys {
+        // 兜底 token 列表保留全部家族：query_with_token_via 对 monitor 的
+        // 频道错配消息已有防御（先 monitor 后 balance，错配不当账号状态）
+        for (k, _) in &creds_keys {
             add(Some(k.clone()), &mut tokens);
         }
     }
@@ -447,7 +460,8 @@ fn http_get_json(url: &str, token: &str, mid: Option<&str>, retry_429: bool) -> 
                     .and_then(|v| ["message", "msg", "error"].iter().find_map(|k| v.get(k).and_then(|x| x.as_str()).map(String::from)));
                 return Err(crate::i18n::trf("err.quota.http", &[("code", &code.to_string()), ("msg", &msg.unwrap_or_default())]));
             }
-            Err(e) => return Err(crate::i18n::trf("err.network", &[("e", &e.to_string())])),
+            // 网络 code 供前端区分退避策略（net 类封顶短、无风控代价）与展示口径
+            Err(e) => return Err(crate::i18n::coded("net", "err.network", &[("e", &e.to_string())])),
         }
     }
 }
@@ -619,7 +633,10 @@ pub(crate) fn zai_billing_token(creds: &Value, config: Option<&Value>, secret: &
 pub(crate) fn pick_channels(creds: &Value, config: Option<&Value>, secret: &str, new_gen: bool) -> Vec<Channel> {
     let mut chans: Vec<Channel> = vec![];
     if new_gen {
-        for k in coding_plan_keys_from_creds(creds, secret) {
+        for (k, prov) in coding_plan_keys_from_creds(creds, secret) {
+            // z.ai 家族 key 不进 Monitor：打 bigmodel 必然假「无套餐」，若 ZaiBilling
+            // 恰好网络失败，该假信号会把故障掩盖成「账号无套餐」（cred_key_is_zai_family）
+            if cred_key_is_zai_family(&prov) { continue; }
             if !chans.contains(&Channel::Monitor(k.clone())) {
                 chans.push(Channel::Monitor(k));
             }
@@ -1676,6 +1693,29 @@ mod no_plan_tests {
         });
         let ov = r.expect("billing 无套餐必须是 Ok");
         assert!(ov.is_empty);
+    }
+
+    /// newgen 凭据的家族过滤：z.ai 家族的 coding-plan key 不得进 Monitor 渠道
+    /// （打 bigmodel 必然假「无套餐」，会掩盖 ZaiBilling 的真实错误/故障），
+    /// bigmodel 家族照常；兜底 token 列表两个家族都保留。
+    #[test]
+    fn newgen_zai_coding_plan_key_never_goes_to_monitor() {
+        let secret = "s";
+        let creds = json!({
+            "account-provider:coding-plan:account:zai-individual-coding-plan:account:11111111-1111-4111-8111-111111111111:api-key": "zai-key-1234567890abcdef1234",
+            "account-provider:coding-plan:account:bigmodel-coding-plan:account:22222222-2222-4222-8222-222222222222:api-key": "bm-key-1234567890abcdefghij"
+        });
+        let pairs = coding_plan_keys_from_creds(&creds, secret);
+        assert_eq!(pairs.len(), 2, "两个家族的 key 都要进兜底 token 列表");
+        let chans = pick_channels(&creds, None, secret, true);
+        assert!(
+            chans.contains(&Channel::Monitor("bm-key-1234567890abcdefghij".into())),
+            "bigmodel 家族 key 照常进 Monitor: {chans:?}"
+        );
+        assert!(
+            !chans.contains(&Channel::Monitor("zai-key-1234567890abcdef1234".into())),
+            "z.ai 家族 key 不得出现在 Monitor 渠道: {chans:?}"
+        );
     }
 
     /// Monitor 频道对 zai 家族 key 一律回「不存在coding plan」——那是频道错配。

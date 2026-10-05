@@ -333,10 +333,11 @@ let quotaForceAt = {};
 let quotaFailStreak = {};
 // 空快照抖动计数：上游间歇性返回「成功但空」时，快速非 quick 复查的已试次数
 let quotaFlapRetry = {};
-/** 连续失败 N 次后的重试间隔：6s 起指数退避，上限 30 分钟 */
-function failBackoffMs(streak) {
+/** 连续失败 N 次后的重试间隔：6s 起指数退避；网络类失败封顶 2 分钟（请求根本
+ *  没到上游，无风控代价，网络恢复后快速自愈），其余（429/3012/鉴权）上限 30 分钟 */
+function failBackoffMs(streak, net = false) {
   const shift = Math.min(Math.max((streak || 1) - 1, 0), 9);
-  return Math.min(6000 * (2 ** shift), 30 * 60 * 1000);
+  return Math.min(6000 * (2 ** shift), (net ? 2 : 30) * 60 * 1000);
 }
 // 重活窗口里被要求「尽快重查」的账号（窗口结束后补一轮）
 const staleWant = new Set();
@@ -1617,14 +1618,15 @@ async function loadAcctQuota(id, opts = {}) {
     flushQuotaCache();
   } catch (e) {
     // 失败时也保留旧数据展示，错误信息进明细区；没旧数据才回落到错误态
-    acctQuota[id] = { data: cur.data || null, err: stripErr(e), code: errCode(e), busy: false };
+    const code = errCode(e);
+    acctQuota[id] = { data: cur.data || null, err: stripErr(e), code, busy: false };
     quotaFailStreak[id] = (quotaFailStreak[id] || 0) + 1;
     // 解冻证据要求「连续」刷新：失败一次就双计数清零
     if (autoFrozenAt[id]) { autoUnfreezeHits[id] = 0; autoUnfreezeEmpty[id] = 0; }
-    // 拉取失败（429/3012/网络）→ 指数退避（6s → 12s → 24s → …上限 30 分钟；成功清零），
+    // 拉取失败（429/3012/网络）→ 指数退避（6s → 12s → 24s → …；成功清零），
     // 持续失败的账号不再以 6s 频率轰炸接口；活跃号 hardDown 只需连续 2 次失败，仍可在 ~20s 内触发
-    // 归档号不排自动重试（手动刷新是它唯一的拉取来源）
-    if (!isArchived(id)) quotaDue[id] = Date.now() + failBackoffMs(quotaFailStreak[id]);
+    // 网络类失败封顶 2 分钟（见 failBackoffMs）；归档号不排自动重试（手动刷新是它唯一的拉取来源）
+    if (!isArchived(id)) quotaDue[id] = Date.now() + failBackoffMs(quotaFailStreak[id], code === "net");
   }
   if (!uiLocked()) render();
   // 任意账号的额度数据更新 → 立即跑一次切换判定（目标账号拿到额度/当前账号耗尽都能秒级反应）
@@ -3527,7 +3529,9 @@ function quotaDetailHtml(id) {
   // 刷新中但已有旧数据：继续渲染旧数据，避免展开明细塌缩成一行导致高度/宽度抖动
   if (q?.busy && !q?.data) return `<span class="aq-loading">${t("q.loading")}</span>`;
   if (q?.err) {
-    const msg = q.err.length > 46 ? q.err.slice(0, 46) + "…" : q.err;
+    let msg = q.err.length > 46 ? q.err.slice(0, 46) + "…" : q.err;
+    // 网络类失败标注「自动重试中」，与账号真实状态区分开（避免误读成卡死/耗尽）
+    if (q.code === "net") msg += t("m.quotaNetRetry");
     return `<span class="aq-err">${esc(msg)}</span>`;
   }
   if (!q?.data) return "";
