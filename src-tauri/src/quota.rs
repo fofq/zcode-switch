@@ -383,7 +383,7 @@ pub fn candidate_tokens(creds: &Value, config: Option<&Value>, secret: &str, new
         );
     }
     if !new_gen {
-        for k in creds_keys {
+        for (k, _) in creds_keys {
             add(Some(k), &mut tokens);
         }
     }
