@@ -6,12 +6,12 @@
 //!   实测套餐额度只挂在 zcode-plan 体系下，平台 key 在 api.z.ai 花不了它（1113 无资源包），
 //!   故套餐路由一律 JWT；该端点的阿里云验证码墙（3007）自官方 v3.14.4 起可被服务端
 //!   远程关闭（skip_model_request），见下方验证码桥接。
-//!   套餐路由是多账号降级链（参考 .temp-zcode-proxy relay.go）：主候选（锁定/跟随账号）
-//!   失败后按需拉全账号 JWT 池继续试（≤5 个），按错误分类冷却：
+//!   套餐路由是纯账号池（网关不跟随/不锁定账号）：候选一律来自全账号 JWT 池
+//!   （store::jwt_pool 懒加载，≤5 个），按错误分类冷却：
 //!   401/403→600s、429（Retry-After 退避后）→30s、402/额度词→1800s、3012 风控与 WAF
 //!   （3xx / 2xx 非 JSON 挑战页）→120s、连接失败→60s；全败聚合 503。
-//!   冷却过滤对主账号与池候选一视同仁；主候选解析失败也落池继续试；池候选按粘性
-//!   排序（最近成功账号优先，见 SharedState.sticky）。
+//!   池候选排序：粘性置顶（最近成功账号优先，见 SharedState.sticky）+ 到期优先
+//!   （快照 ends_at 升序）；请求模型建不出候选时按配置模型顺序自动兜底（glm-5.3 系内）。
 //!   上游请求带官方客户端全套伪装头（quota::zai_billing_headers_with_mid，
 //!   每账号配自己的虚拟 device_mid 防 3001 错位，另补 x-api-key/sec-fetch-mode/
 //!   accept-language）+ metadata.user_id（恒覆盖，session_id 每账号每日）+ max_tokens
@@ -25,7 +25,6 @@
 
 pub mod meter;
 pub mod openai_map;
-pub mod resolve;
 pub mod sysprompt;
 
 use axum::body::Body;
@@ -75,8 +74,6 @@ pub fn is_free_model(m: &str) -> bool {
 pub struct Cfg {
     pub port: u16,
     pub token: String,
-    /// None = 跟随当前激活账号
-    pub account: Option<String>,
     pub models: Vec<String>,
     /// 上游出站代理（None = 直连）；与 token 同机制热更新，不触发重启
     pub proxy_url: Option<String>,
@@ -85,7 +82,7 @@ pub struct Cfg {
 impl Cfg {
     fn same_service(&self, other: &Cfg) -> bool {
         // token / 出站代理热更新即可，不需要重启
-        self.port == other.port && self.account == other.account && self.models == other.models
+        self.port == other.port && self.models == other.models
     }
 }
 
@@ -303,24 +300,20 @@ pub struct CooldownPersist {
 pub struct SharedState {
     pub paths: Paths,
     pub token: Mutex<String>,
-    pub account: Mutex<Option<String>>,
     pub models: Mutex<Vec<String>>,
-    /// 套餐路由 JWT 缓存：(时间, info, 账号配对的虚拟 device_mid)
-    pub cache: Mutex<HashMap<String, (std::time::Instant, store::ApiKeyInfo, Option<String>)>>,
-    /// 2API 每账号累计请求数（跟随/锁定/故障切换都以解析到的账号 id 计）
+    /// 2API 每账号累计请求数（按实际尝试的账号 id 计）
     pub usage: Mutex<HashMap<String, u64>>,
     /// 免费模型 key 池（全账号平台 key）缓存：(时间, 池, 缓存时长——空池短缓存)
     pub pool: Mutex<Option<(std::time::Instant, Vec<PoolKey>, Duration)>>,
-    /// 激活账号 id 短缓存（避免每个请求全量解密账号）
-    pub active_cache: Mutex<Option<(std::time::Instant, Option<String>)>>,
-    /// 套餐路由账号冷却表：id -> 冷却截止时刻（落盘持久化，见 twoapi-cooldowns.json）
-    pub cooldown: Mutex<HashMap<String, std::time::Instant>>,
+    /// 套餐路由账号冷却表：id -> (冷却截止时刻, 冷却分类标签)（落盘持久化，见
+    /// twoapi-cooldowns.json；分类供前端「网关冷却」面板展示）
+    pub cooldown: Mutex<HashMap<String, (std::time::Instant, &'static str)>>,
     /// 冷却落盘节流：距上次落盘 <5s 就跳过，由下次 cool_down 落整表补上
     pub cooldown_persist: Mutex<CooldownPersist>,
     /// 冷却落盘开关：true（默认）读/写 twoapi-cooldowns.json；仅 start_for_test 置
     /// false，E2E 测试不读不写真实 store_dir 的冷却文件，测试与生产互不渗透
     pub cooldown_persist_enabled: bool,
-    /// 粘性路由：最近成功交付的账号 id；下一请求把它排到池候选最前（主账号未冷却时仍最先）
+    /// 粘性路由：最近成功交付的账号 id；下一请求把它排到池候选最前
     pub sticky: Mutex<Option<String>>,
     /// 轮询游标
     pub rr: AtomicU64,
@@ -353,7 +346,6 @@ pub async fn sync(paths: &Paths) -> Result<(), String> {
     let cfg = Cfg {
         port: s.two_api_port(),
         token: s.two_api_token(),
-        account: s.two_api_account(),
         models: parse_models(&s.two_api_models()),
         proxy_url: s.two_api_proxy_url(),
     };
@@ -381,12 +373,9 @@ pub async fn sync(paths: &Paths) -> Result<(), String> {
     let state = Arc::new(SharedState {
         paths: Paths::detect(),
         token: Mutex::new(cfg.token.clone()),
-        account: Mutex::new(cfg.account.clone()),
         models: Mutex::new(cfg.models.clone()),
-        cache: Mutex::new(HashMap::new()),
         usage: Mutex::new(HashMap::new()),
         pool: Mutex::new(None),
-        active_cache: Mutex::new(None),
         cooldown: Mutex::new(load_cooldowns()),
         cooldown_persist: Mutex::new(CooldownPersist::default()),
         cooldown_persist_enabled: true,
@@ -433,7 +422,6 @@ pub async fn start_for_test(paths: &Paths, port_override: Option<u16>) -> Result
     let cfg = Cfg {
         port: port_override.unwrap_or_else(|| s.two_api_port()),
         token: s.two_api_token(),
-        account: s.two_api_account(),
         models: parse_models(&s.two_api_models()),
         proxy_url: s.two_api_proxy_url(),
     };
@@ -446,12 +434,9 @@ pub async fn start_for_test(paths: &Paths, port_override: Option<u16>) -> Result
     let state = Arc::new(SharedState {
         paths: Paths::detect(),
         token: Mutex::new(cfg.token.clone()),
-        account: Mutex::new(cfg.account.clone()),
         models: Mutex::new(cfg.models.clone()),
-        cache: Mutex::new(HashMap::new()),
         usage: Mutex::new(HashMap::new()),
         pool: Mutex::new(None),
-        active_cache: Mutex::new(None),
         cooldown: Mutex::new(HashMap::new()), // 测试态不读真实 twoapi-cooldowns.json
         cooldown_persist: Mutex::new(CooldownPersist::default()),
         cooldown_persist_enabled: false, // 测试态不写真实 twoapi-cooldowns.json
@@ -474,6 +459,15 @@ pub async fn start_for_test(paths: &Paths, port_override: Option<u16>) -> Result
     Ok(())
 }
 
+/// 冷却中账号条目（前端「网关冷却」面板：展示 + 手动解除）
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CooldownEntry {
+    pub id: String,
+    pub remaining_secs: u64,
+    pub kind: &'static str,
+}
+
 #[derive(serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Status {
@@ -484,14 +478,41 @@ pub struct Status {
     pub last_request_at: i64,
     /// 每账号累计请求数（id -> count）
     pub usage: HashMap<String, u64>,
+    /// 冷却中账号（剩余>0，按剩余升序，最多 20 条）
+    pub cooldowns: Vec<CooldownEntry>,
+}
+
+/// 冷却表快照：剩余>0 的条目按剩余升序，最多 20 条（配合手动解除，不做全量导出）
+fn cooldown_snapshot(st: &Arc<SharedState>) -> Vec<CooldownEntry> {
+    let now = std::time::Instant::now();
+    let mut list: Vec<CooldownEntry> = st
+        .cooldown
+        .lock()
+        .unwrap()
+        .iter()
+        .filter_map(|(id, (until, kind))| {
+            let d = until.checked_duration_since(now)?;
+            Some(CooldownEntry { id: id.clone(), remaining_secs: d.as_secs().max(1), kind: *kind })
+        })
+        .collect();
+    list.sort_by_key(|e| e.remaining_secs);
+    list.truncate(20);
+    list
 }
 
 pub fn status() -> Status {
     let mgr = MANAGER.lock().unwrap();
-    let (running, port, usage) = mgr
+    let (running, port, usage, cooldowns) = mgr
         .as_ref()
-        .map(|m| (true, m.cfg.port, m.state.usage.lock().unwrap().clone()))
-        .unwrap_or((false, 0, HashMap::new()));
+        .map(|m| {
+            (
+                true,
+                m.cfg.port,
+                m.state.usage.lock().unwrap().clone(),
+                cooldown_snapshot(&m.state),
+            )
+        })
+        .unwrap_or((false, 0, HashMap::new(), Vec::new()));
     let st = stats();
     Status {
         running,
@@ -500,7 +521,119 @@ pub fn status() -> Status {
         errors: st.errors.load(Ordering::Relaxed),
         last_request_at: st.last_request_at.load(Ordering::Relaxed),
         usage,
+        cooldowns,
     }
+}
+
+/// 手动解除某账号冷却（前端「网关冷却」面板）：清内存条目并立即落盘；
+/// 服务未运行 / unknown id 静默返回；落盘开关关闭（测试态）时只改内存
+pub fn unfreeze(id: &str) {
+    let mgr = MANAGER.lock().unwrap();
+    let Some(m) = mgr.as_ref() else { return };
+    m.state.cooldown.lock().unwrap().remove(id);
+    if m.state.cooldown_persist_enabled {
+        flush_cooldowns(&m.state);
+    }
+}
+
+// ===== 今日用量聚合（前端「今日用量」面板，two_api_usage 命令） =====
+// 读 store_dir()/usage.jsonl（meter::append_usage 落盘，>8MB 轮转），按本地时区
+// 当天（t >= 本地零点 epoch 秒）聚合请求数 / token 数 + 按请求数降序的前 10 账号。
+// 进程内 30s 缓存：弹窗 2s 状态轮询不必反复解析文件。文件缺失 / 行损坏 / 读失败
+// 一律返回零值结构（静默）；异常超大文件读满上限即截尾，只算已读部分。
+
+/// 单次解析的最大读取字节数（轮转上限 8MB，再留一条余量）
+const USAGE_TODAY_READ_CAP: u64 = 9 * 1024 * 1024;
+const USAGE_TODAY_CACHE: Duration = Duration::from_secs(30);
+
+/// 本地时区当日零点的 epoch 秒（本地日界与 usage.rs 的 local_day_start_ms 同口径）
+fn local_day_start_secs() -> i64 {
+    let now = chrono::Local::now();
+    let midnight = now.date_naive().and_hms_opt(0, 0, 0).unwrap();
+    midnight
+        .and_local_timezone(now.timezone())
+        .single()
+        .unwrap_or(now)
+        .timestamp()
+}
+
+fn compute_usage_today(date: &str, start_secs: i64) -> Value {
+    // 同时读 .1（轮转前半）与当前文件：当日中途发生 8MB 轮转时，早前记录在 .1 里，
+    // 只读当前文件会把当天面板算小。两文件都缺失时聚合自然为 0 值结构。
+    let dir = Paths::detect().store_dir();
+    let mut total_req = 0u64;
+    let mut total_in = 0u64;
+    let mut total_out = 0u64;
+    let mut total_cache = 0u64;
+    let mut by_acct: HashMap<String, (u64, u64)> = HashMap::new();
+    for name in ["usage.jsonl.1", "usage.jsonl"] {
+        let Ok(f) = std::fs::File::open(dir.join(name)) else { continue };
+        let mut read_bytes = 0u64;
+        let mut line = String::new();
+        let mut rdr = std::io::BufReader::new(f);
+        loop {
+            line.clear();
+            match rdr.read_line(&mut line) {
+                Ok(0) => break,
+                Ok(n) => {
+                    read_bytes += n as u64;
+                    if read_bytes > USAGE_TODAY_READ_CAP {
+                        break; // 截尾：只算已读部分
+                    }
+                    let Ok(v) = serde_json::from_str::<Value>(line.trim()) else { continue };
+                    let Some(t) = v.get("t").and_then(Value::as_u64) else { continue };
+                    if (t as i64) < start_secs {
+                        continue;
+                    }
+                    let inp = v.get("input_tokens").and_then(Value::as_u64).unwrap_or(0);
+                    let out = v.get("output_tokens").and_then(Value::as_u64).unwrap_or(0);
+                    let cache = v.get("cache_read").and_then(Value::as_u64).unwrap_or(0);
+                    total_req += 1;
+                    total_in += inp;
+                    total_out += out;
+                    total_cache += cache;
+                    if let Some(acct) = v.get("acct").and_then(Value::as_str) {
+                        let e = by_acct.entry(acct.to_string()).or_insert((0, 0));
+                        e.0 += 1;
+                        e.1 += out;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    }
+    let mut rows: Vec<(String, u64, u64)> =
+        by_acct.into_iter().map(|(a, (r, o))| (a, r, o)).collect();
+    rows.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    rows.truncate(10);
+    json!({
+        "date": date,
+        "requests": total_req,
+        "inputTokens": total_in,
+        "outputTokens": total_out,
+        "cacheRead": total_cache,
+        "byAccount": rows
+            .into_iter()
+            .map(|(a, r, o)| json!({ "acct": a, "requests": r, "outputTokens": o }))
+            .collect::<Vec<_>>(),
+    })
+}
+
+/// 今日用量聚合（带 30s 进程内缓存）。任何失败（文件缺失/读错误）返回零值结构，
+/// 前端按 0 值展示即可
+pub fn usage_today() -> Value {
+    static CACHE: Mutex<Option<(std::time::Instant, Value)>> = Mutex::new(None);
+    let mut cache = CACHE.lock().unwrap();
+    if let Some((at, v)) = cache.as_ref() {
+        if at.elapsed() < USAGE_TODAY_CACHE {
+            return v.clone();
+        }
+    }
+    let now = chrono::Local::now();
+    let date = now.format("%Y-%m-%d").to_string();
+    let v = compute_usage_today(&date, local_day_start_secs());
+    *cache = Some((std::time::Instant::now(), v.clone()));
+    v
 }
 
 #[derive(serde::Serialize)]
@@ -666,7 +799,7 @@ async fn models(State(st): State<Arc<SharedState>>) -> impl IntoResponse {
 
 async fn messages(State(st): State<Arc<SharedState>>, headers: HeaderMap, body: axum::body::Bytes) -> Response {
     // 免费模型：全账号 org key 池 + anthropic coding endpoint 纯透传（实测可用，无需翻译）。
-    // 套餐模型：多账号降级链（主候选=锁定/跟随账号，失败后换下一个有 JWT 的账号）。
+    // 套餐模型：账号池降级链（全账号 JWT 池，冷却/粘性/到期排序，见 relay_plan_multi）。
     let parsed: Option<Value> = serde_json::from_slice(&body).ok();
     let model = parsed
         .as_ref()
@@ -730,11 +863,11 @@ fn account_label(name: &str, id: &str) -> String {
     if name.trim().is_empty() { id.to_string() } else { name.to_string() }
 }
 
-fn cool_down(st: &Arc<SharedState>, id: &str, secs: u64) {
+fn cool_down(st: &Arc<SharedState>, id: &str, secs: u64, kind: &'static str) {
     st.cooldown
         .lock()
         .unwrap()
-        .insert(id.to_string(), std::time::Instant::now() + Duration::from_secs(secs));
+        .insert(id.to_string(), (std::time::Instant::now() + Duration::from_secs(secs), kind));
     // 落盘兜底（5s 节流 + 静默失败）：节流窗口内的本次写入会跳过，由下一次 cool_down
     // 落整表补上；因此窗口内最后一次冷却若之后再无写入、进程立即退出，该条不落盘
     // （最多丢最近一个 5s 窗口内的条目）。已落盘部分在 twoapi::sync 重建 / 应用重启时恢复。
@@ -744,15 +877,29 @@ fn cool_down(st: &Arc<SharedState>, id: &str, secs: u64) {
 fn cooling_remaining(st: &Arc<SharedState>, id: &str) -> Option<Duration> {
     let map = st.cooldown.lock().unwrap();
     map.get(id)
-        .and_then(|until| until.checked_duration_since(std::time::Instant::now()))
+        .and_then(|(until, _)| until.checked_duration_since(std::time::Instant::now()))
 }
 
 // ===== 冷却落盘（<store_dir>/twoapi-cooldowns.json） =====
 // 纯内存冷却表在 twoapi::sync 重建和应用重启时都会清零，这里整表落盘兜底：
-// {账号id: 截止时刻（unix 毫秒）}。Instant 不可序列化，落盘换算成绝对时间戳，
-// 恢复时换算回剩余时长（过期条目丢弃）。任何 IO 失败静默，不影响请求路径。
+// {账号id: {"until": 截止时刻 unix 毫秒, "kind": 冷却分类}}。Instant 不可序列化，
+// 落盘换算成绝对时间戳，恢复时换算回剩余时长（过期条目丢弃）；旧格式（纯数字
+// 毫秒）兼容读入，分类记 unknown。任何 IO 失败静默，不影响请求路径。
 
 const COOLDOWN_FLUSH_MIN: Duration = Duration::from_secs(5);
+
+/// 冷却分类标签白名单：内存表值必须 'static，落盘读回的任意字符串经此归一
+/// （unknown = 旧格式条目 / 未识别分类）
+fn cool_kind(s: &str) -> &'static str {
+    match s {
+        "invalid" => "invalid",
+        "rate" => "rate",
+        "exhausted" => "exhausted",
+        "risk" => "risk",
+        "net" => "net",
+        _ => "unknown",
+    }
+}
 
 fn cooldown_file() -> std::path::PathBuf {
     Paths::detect().store_dir().join("twoapi-cooldowns.json")
@@ -765,36 +912,59 @@ fn unix_ms_now() -> u64 {
         .unwrap_or(0)
 }
 
-/// 内存冷却表 → 落盘形态：剩余时长 + 当前时刻换算成绝对 unix 毫秒
+/// 内存冷却表 → 落盘形态：剩余时长 + 当前时刻换算成绝对 unix 毫秒（带分类）
 fn cooldown_to_disk(
-    map: &HashMap<String, std::time::Instant>,
+    map: &HashMap<String, (std::time::Instant, &'static str)>,
     now: std::time::Instant,
     now_ms: u64,
-) -> HashMap<String, u64> {
+) -> HashMap<String, Value> {
     map.iter()
-        .map(|(id, until)| {
+        .map(|(id, (until, kind))| {
             let remain = until.checked_duration_since(now).unwrap_or_default();
-            (id.clone(), now_ms + remain.as_millis() as u64)
+            (
+                id.clone(),
+                json!({ "until": now_ms + remain.as_millis() as u64, "kind": *kind }),
+            )
         })
         .collect()
 }
 
-/// 落盘形态 → 内存冷却表：过期条目丢弃，未过期恢复为剩余时长
-fn cooldown_from_disk(disk: &HashMap<String, u64>, now_ms: u64) -> HashMap<String, std::time::Instant> {
+/// 落盘形态 → 内存冷却表：过期条目丢弃，未过期恢复为剩余时长；纯数字（旧格式）
+/// 视为 unknown 分类
+fn cooldown_from_disk(
+    disk: &HashMap<String, Value>,
+    now_ms: u64,
+) -> HashMap<String, (std::time::Instant, &'static str)> {
     disk.iter()
-        .filter(|(_, deadline)| **deadline > now_ms)
-        .map(|(id, deadline)| {
-            (id.clone(), std::time::Instant::now() + Duration::from_millis(deadline.saturating_sub(now_ms)))
+        .filter_map(|(id, entry)| {
+            let (deadline, kind) = if let Some(ms) = entry.as_u64() {
+                (ms, "unknown")
+            } else {
+                (
+                    entry.get("until")?.as_u64()?,
+                    cool_kind(entry.get("kind").and_then(Value::as_str).unwrap_or("unknown")),
+                )
+            };
+            if deadline <= now_ms {
+                return None; // 恰好到期 = 过期
+            }
+            Some((
+                id.clone(),
+                (
+                    std::time::Instant::now() + Duration::from_millis(deadline.saturating_sub(now_ms)),
+                    kind,
+                ),
+            ))
         })
         .collect()
 }
 
 /// 服务启动/SharedState 新建时恢复冷却表（读/解析失败当空表）
-fn load_cooldowns() -> HashMap<String, std::time::Instant> {
+fn load_cooldowns() -> HashMap<String, (std::time::Instant, &'static str)> {
     let Ok(text) = std::fs::read_to_string(cooldown_file()) else {
         return HashMap::new();
     };
-    match serde_json::from_str::<HashMap<String, u64>>(&text) {
+    match serde_json::from_str::<HashMap<String, Value>>(&text) {
         Ok(disk) => cooldown_from_disk(&disk, unix_ms_now()),
         Err(_) => HashMap::new(),
     }
@@ -825,7 +995,7 @@ fn flush_cooldowns(st: &Arc<SharedState>) {
     let now = std::time::Instant::now();
     let disk = {
         let mut map = st.cooldown.lock().unwrap();
-        map.retain(|_, until| *until > now);
+        map.retain(|_, (until, _)| *until > now);
         cooldown_to_disk(&map, now, unix_ms_now())
     };
     if disk.is_empty() {
@@ -843,10 +1013,9 @@ fn flush_cooldowns(st: &Arc<SharedState>) {
 // 前端 ≥20s 节流）。这里按文件 mtime 做进程级缓存，套餐路由选号时用
 // 「快照显示该模型额度耗尽」预排除候选。宁可漏排不可误排：快照过期（>10 分钟）、
 // 字段缺失、没有任何 item 匹配模型都不排除；过期套餐槽（expired=true）不参与判定。
-// 到期排序（池候选按到期升序）不可行：快照里的 PlanSlot.expire / QuotaItem.period_end
-// 都是展示字符串（quota.rs extract_expire/expiry_field 的产物，period_end 还可能是
-// 「… 重置」标签），没有可比的 epoch 字段——拿不到可比到期时间就跳过排序，绝不为
-// 排序发起任何网络请求。
+// 到期优先排序用同一份快照：PlanSlot.ends_at（quota.rs normalize_balance 填充的
+// epoch 毫秒，见 snapshot_expire_for_model）；monitor 链路无 plan 级到期（None），
+// 无可比到期时间的账号稳定垫后，绝不为排序发起任何网络请求。
 
 /// 快照采样时间的可信窗口：超过就算陈旧，不参与排除判定
 const QUOTA_SNAPSHOT_FRESH_MS: i64 = 10 * 60 * 1000;
@@ -943,6 +1112,38 @@ fn quota_exhausted_by_snapshot(
     } else {
         None
     }
+}
+
+/// 快照里请求模型对应的最早到期时刻（epoch 毫秒，供池候选到期优先排序）：
+/// 取「未过期（expired != true）且 items 命中请求模型」的套餐槽的槽级 ends_at 最小值。
+/// 槽匹配口径与 quota_exhausted_by_snapshot 一致（expired 过滤 + norm_model_key 名字匹配）；
+/// 无匹配槽 / 全部槽没有可比 epoch（monitor 链路无 plan 级到期）→ None。
+fn snapshot_expire_for_model(snap: &Value, mkey: &str) -> Option<i64> {
+    if mkey.is_empty() {
+        return None;
+    }
+    let mut best: Option<i64> = None;
+    for slot in snap.get("plans").and_then(Value::as_array).into_iter().flatten() {
+        if slot.get("expired").and_then(Value::as_bool).unwrap_or(false) {
+            continue; // 过期套餐槽不参与，与 quota_exhausted_by_snapshot 同口径
+        }
+        let hit = slot
+            .get("items")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .any(|item| {
+                let name = item.get("name").and_then(Value::as_str).unwrap_or("");
+                !name.is_empty() && norm_model_key(name) == mkey
+            });
+        if !hit {
+            continue;
+        }
+        if let Some(ends) = slot.get("ends_at").and_then(Value::as_i64) {
+            best = Some(best.map_or(ends, |b| b.min(ends)));
+        }
+    }
+    best
 }
 
 fn clip(s: &str, n: usize) -> String {
@@ -1049,6 +1250,85 @@ fn sticky_first(
     pool
 }
 
+/// 到期优先排序（sticky_first 之后调用，稳定排序）：
+/// sticky 账号恒守首位（键 (0,0) 严格最小，稳定排序不挪它）；其余有到期时刻
+/// （ends_at epoch 毫秒，见 snapshot_expire_for_model）的按升序在前，无到期信息
+/// （不在快照里 / 无 epoch）稳定垫后；同到期保持原序。
+fn expire_first(
+    mut pool: Vec<(String, String, ApiKeyInfo, Option<String>)>,
+    expires: &HashMap<String, Option<i64>>,
+    sticky: Option<&str>,
+) -> Vec<(String, String, ApiKeyInfo, Option<String>)> {
+    pool.sort_by_key(|(id, ..)| {
+        if Some(id.as_str()) == sticky {
+            (0u8, 0i64)
+        } else {
+            match expires.get(id) {
+                Some(Some(ends)) => (1u8, *ends),
+                _ => (2u8, 0),
+            }
+        }
+    });
+    pool
+}
+
+/// glm-5.3 系判定（模型自动兜底用）：归一键以 "5.3" 开头（glm-5.3 / glm-5.3-flash / …）
+fn is_glm53_family(m: &str) -> bool {
+    norm_model_key(m).starts_with("5.3")
+}
+
+/// 模型自动兜底的替代模型有序列表：保持配置模型列表顺序，过滤非 glm-5.3 系与
+/// 当前模型本身（兜底只在套餐体系内换模型，免费模型有自己的路由）
+fn fallback_models(models: &[String], current: &str) -> Vec<String> {
+    let cur = norm_model_key(current);
+    models
+        .iter()
+        .filter(|m| norm_model_key(m) != cur && is_glm53_family(m))
+        .cloned()
+        .collect()
+}
+
+/// 从 JWT 池构建某模型的候选（纯同步，池已由调用方加载）：
+/// 冷却过滤 → 快照配额排除（原因记入 reasons）→ 粘性置顶 → 到期优先排序。
+/// 请求模型与其兜底替代模型复用同一份池加载结果。
+fn build_pool_candidates(
+    st: &Arc<SharedState>,
+    pool: &[(String, String, ApiKeyInfo, Option<String>)],
+    snaps: &HashMap<String, (i64, Value)>,
+    model: &str,
+    now_ms: i64,
+    tried: &[String],
+    reasons: &mut Vec<String>,
+) -> Vec<Candidate> {
+    // 粘性：最近成功的账号排到池候选最前（到期排序在其后做，稳定排序保持其首位）
+    let sticky = st.sticky.lock().unwrap().clone();
+    let pool = sticky_first(pool.to_vec(), sticky.as_deref());
+    let mkey = norm_model_key(model);
+    let expires: HashMap<String, Option<i64>> = pool
+        .iter()
+        .map(|(id, ..)| {
+            let e = snaps.get(id).and_then(|(_, data)| snapshot_expire_for_model(data, &mkey));
+            (id.clone(), e)
+        })
+        .collect();
+    let pool = expire_first(pool, &expires, sticky.as_deref());
+    let mut out: Vec<Candidate> = Vec::new();
+    for (id, name, info, mid) in pool {
+        if tried.contains(&id) || out.iter().any(|c| c.id == id) {
+            continue;
+        }
+        if cooling_remaining(st, &id).is_some() {
+            continue;
+        }
+        if let Some(qr) = quota_exhausted_by_snapshot(snaps, &id, model, now_ms) {
+            reasons.push(format!("{}: {}", account_label(&name, &id), qr));
+            continue;
+        }
+        out.push(Candidate { label: account_label(&name, &id), id, info, mid });
+    }
+    out
+}
+
 /// 全部候选失败：503 + 去重原因聚合（≤300 字符）+ 最近冷却恢复倒计时。
 fn final_unavailable(mode: &PumpMode, reasons: &[String], st: &Arc<SharedState>) -> Response {
     let mut uniq: Vec<String> = Vec::new();
@@ -1067,7 +1347,7 @@ fn final_unavailable(mode: &PumpMode, reasons: &[String], st: &Arc<SharedState>)
         .lock()
         .unwrap()
         .values()
-        .filter_map(|t| t.checked_duration_since(std::time::Instant::now()))
+        .filter_map(|(t, _)| t.checked_duration_since(std::time::Instant::now()))
         .min();
     if let Some(d) = soonest {
         msg.push_str(&format!("（冷却中，约 {} 秒后自动恢复）", d.as_secs().max(1)));
@@ -1082,11 +1362,13 @@ fn final_unavailable(mode: &PumpMode, reasons: &[String], st: &Arc<SharedState>)
     (StatusCode::SERVICE_UNAVAILABLE, axum::Json(body)).into_response()
 }
 
-/// 套餐路由统一入口（anthropic 入站 Raw / OpenAI 入站翻译模式共用）：多账号降级链。
-/// 主候选 = 锁定账号或跟随激活账号（与池候选同受冷却过滤：主账号冷却中就跳过）；
-/// 主候选解析失败**不再终止请求**——原因记入聚合后同样落回全账号 JWT 池
-/// （store::jwt_pool，纯本地）继续试，最多 MAX_PLAN_ATTEMPTS 个候选。
-/// 池候选按粘性排序：最近成功账号（st.sticky）排最前（主账号未冷却时仍最先）。
+/// 套餐路由统一入口（anthropic 入站 Raw / OpenAI 入站翻译模式共用）：账号池降级链。
+/// 候选一律来自全账号 JWT 池（store::jwt_pool，纯本地，首需时懒加载）：
+/// 冷却过滤 → 快照配额排除（零上游请求）→ 粘性置顶（最近成功账号，见 SharedState.sticky）
+/// → 到期优先（快照 ends_at 升序，无到期信息垫后），最多 MAX_PLAN_ATTEMPTS 个候选。
+/// 模型自动兜底（对齐 zcode-pool gateway.rs）：请求模型建不出任何候选且是 glm-5.3 系时，
+/// 按 Cfg.models 顺序逐个换替代模型重建候选，第一个非空者胜出（flowlog 一行，usage/
+/// 请求体/响应翻译的模型跟随替代模型）；只在「建候选时为空」触发，尝试失败中途不换模型。
 /// 每次尝试带官方客户端伪装头（quota::zai_billing_headers_with_mid，账号配对 mid），
 /// 非 2xx 缓冲分类处置（验证码桥接 / 冷却换号 / 如实透传）；每次尝试都以异常 200 收场
 /// （无任何其他失败原因）时把最后一份异常响应回放（Raw 原样 / OpenAI 入站按协议翻译，
@@ -1110,8 +1392,7 @@ async fn relay_plan_multi(
     } else {
         None
     };
-    // 主候选解析：失败不再直接 502，落回 JWT 池候选继续（原因记入聚合）
-    // 配额感知：快照显示请求模型额度耗尽的候选（主账号与池候选一视同仁）直接排除，
+    // 配额感知与到期优先共用同一份快照：快照显示请求模型额度耗尽的候选直接排除，
     // 免得烧一轮上游请求才拿到 402/额度词再冷却（快照来自前端节流推送，零上游请求）
     let model = body_val
         .and_then(|v| v.get("model"))
@@ -1124,60 +1405,64 @@ async fn relay_plan_multi(
     } else {
         quota_snapshots().await
     };
-    let mut candidates: Vec<Candidate> = Vec::new();
     let mut reasons: Vec<String> = Vec::new();
-    match resolve::resolve_primary(st).await {
-        Ok(p) => {
-            if cooling_remaining(st, &p.id).is_some() {
-                // 冷却过滤同样作用于主账号（pinned/follow）：冷却中就跳过它
-                reasons.push(format!("主账号 {} 冷却中，跳过", p.id));
-            } else if let Some(qr) = quota_exhausted_by_snapshot(&snaps, &p.id, &model, now_ms) {
-                reasons.push(format!("主账号 {}: {}", p.id, qr));
-            } else {
-                candidates.push(Candidate {
-                    label: account_label("", &p.id),
-                    id: p.id,
-                    info: p.info,
-                    mid: p.mid,
-                });
-            }
-        }
-        Err(e) => reasons.push(format!("主账号解析失败: {e}")),
-    }
     let mut tried: Vec<String> = vec![];
     let mut ablog = AbnormalLog::default();
-    let mut pool_loaded = false;
+    // 全账号 JWT 池懒加载一次（重活 spawn_blocking）；请求模型与其兜底替代模型共用
+    let mut pool: Option<Vec<(String, String, ApiKeyInfo, Option<String>)>> = None;
+    let mut candidates: Vec<Candidate> = Vec::new();
+    // 兜底命中时改写后的请求体 / 响应翻译模式（None = 未兜底，保持入站原样；
+    // usage 记录的模型随 plan_attempt 从改写后的请求体里取，自然跟随替代模型）
+    let mut eff_val: Option<Value> = None;
+    let mut eff_mode: Option<PumpMode> = None;
     for _ in 0..MAX_PLAN_ATTEMPTS {
         let cand = loop {
             if let Some(pos) = candidates.iter().position(|c| !tried.contains(&c.id)) {
                 break Some(candidates.swap_remove(pos));
             }
-            if pool_loaded {
+            if pool.is_some() {
                 break None;
             }
-            pool_loaded = true;
-            // 无主候选可试（解析失败/冷却跳过/已败）：按需拉全账号 JWT 池（排除已试与冷却中）
-            let others = tauri::async_runtime::spawn_blocking(move || store::jwt_pool(&Paths::detect()))
+            // 首次建候选：拉全账号 JWT 池（排除已试与冷却中），再按快照配额排除
+            let loaded = tauri::async_runtime::spawn_blocking(move || store::jwt_pool(&Paths::detect()))
                 .await
                 .map_err(|e| format!("内部任务失败: {e}"))
                 .ok()
                 .and_then(|r| r.ok())
                 .unwrap_or_default();
-            // 粘性：最近成功的账号排到池候选最前（主账号未冷却时本就在最前）
-            let sticky = st.sticky.lock().unwrap().clone();
-            let others = sticky_first(others, sticky.as_deref());
-            for (id, name, info, mid) in others {
-                if tried.contains(&id) || candidates.iter().any(|c| c.id == id) {
-                    continue;
+            pool = Some(loaded);
+            let loaded = pool.as_deref().unwrap_or(&[]);
+            candidates = build_pool_candidates(st, loaded, &snaps, &model, now_ms, &tried, &mut reasons);
+            // 模型自动兜底：请求模型建不出候选且是 glm-5.3 系时，按配置模型顺序换
+            // 替代模型重建候选，第一个非空者胜出（只在本建候选点触发，中途不换）。
+            // 仅 /v1/messages：count_tokens 不静默换模型（计数口径要跟请求模型一致）
+            if candidates.is_empty() && is_glm53_family(&model) && path.ends_with("/v1/messages") {
+                let models_cfg = st.models.lock().unwrap().clone();
+                for alt in fallback_models(&models_cfg, &model) {
+                    let c2 = build_pool_candidates(st, loaded, &snaps, &alt, now_ms, &tried, &mut reasons);
+                    if !c2.is_empty() {
+                        crate::flowlog::log(
+                            "twoapi",
+                            "model-fallback",
+                            &format!("{model} 无可用候选 → 回退到 {alt}"),
+                        );
+                        candidates = c2;
+                        // 上游按替代模型执行：改写请求体模型，usage/响应翻译同步跟随
+                        if let Some(v) = body_val {
+                            if let Some(obj) = v.as_object() {
+                                let mut obj = obj.clone();
+                                obj.insert("model".to_string(), json!(alt.clone()));
+                                eff_val = Some(Value::Object(obj));
+                            }
+                        }
+                        eff_mode = Some(match mode {
+                            PumpMode::Raw => PumpMode::Raw,
+                            PumpMode::OpenAiJson(_) => PumpMode::OpenAiJson(alt),
+                            PumpMode::OpenAiStream(_) => PumpMode::OpenAiStream(alt),
+                        });
+                        break;
+                    }
                 }
-                if cooling_remaining(st, &id).is_some() {
-                    continue;
-                }
-                if let Some(qr) = quota_exhausted_by_snapshot(&snaps, &id, &model, now_ms) {
-                    reasons.push(format!("{}: {}", account_label(&name, &id), qr));
-                    continue;
-                }
-                candidates.push(Candidate { label: account_label(&name, &id), id, info, mid });
             }
         };
         let Some(c) = cand else { break };
@@ -1186,14 +1471,16 @@ async fn relay_plan_multi(
             let mut u = st.usage.lock().unwrap();
             *u.entry(c.id.clone()).or_insert(0) += 1;
         }
+        let body_val_eff = eff_val.as_ref().or(body_val);
+        let mode_eff = eff_mode.as_ref().unwrap_or(mode);
         match plan_attempt(
             st,
             &c,
             anthropic_version,
             body,
-            body_val,
+            body_val_eff,
             path,
-            mode,
+            mode_eff,
             tried.len() as u32,
             sys_blocks.as_deref(),
             &mut ablog,
@@ -1277,23 +1564,23 @@ fn post_captcha_failure(e: PlanErr, st: &Arc<SharedState>, id: &str, mode: &Pump
             AttemptOutcome::Next("带验证码请求仍被上游拒绝".into())
         }
         PlanFail::Risk => {
-            cool_down(st, id, COOL_RISK);
+            cool_down(st, id, COOL_RISK, "risk");
             AttemptOutcome::Next("带验证码仍被风控拦截（unusual activity）".into())
         }
         PlanFail::Invalid => {
-            cool_down(st, id, COOL_INVALID);
+            cool_down(st, id, COOL_INVALID, "invalid");
             AttemptOutcome::Next(format!("鉴权失败 HTTP {}", e.status))
         }
         PlanFail::Exhausted => {
-            cool_down(st, id, COOL_EXHAUSTED);
+            cool_down(st, id, COOL_EXHAUSTED, "exhausted");
             AttemptOutcome::Next("额度已用完".into())
         }
         PlanFail::RateLimited => {
-            cool_down(st, id, COOL_RATE);
+            cool_down(st, id, COOL_RATE, "rate");
             AttemptOutcome::Next("上游限流 429".into())
         }
         PlanFail::NetError => {
-            cool_down(st, id, COOL_NET);
+            cool_down(st, id, COOL_NET, "net");
             AttemptOutcome::Next(format!("上游请求失败: {}", clip(&e.text, 120)))
         }
         _ => AttemptOutcome::Done(buffered_error_response(e.status, &e.text, mode)),
@@ -1353,7 +1640,7 @@ fn abnormal_outcome(
     id: &str,
     log: &mut AbnormalLog,
 ) -> AttemptOutcome {
-    cool_down(st, id, COOL_RISK);
+    cool_down(st, id, COOL_RISK, "risk");
     log.count += 1;
     log.last = Some(ab);
     AttemptOutcome::Next("HTTP 200 但响应异常（无模型数据，疑似错误信封伪装）".into())
@@ -1420,7 +1707,7 @@ async fn plan_attempt(
                 PlanSend::Ok(ok) => finish_plan_ok(ok, st, &c.id),
                 PlanSend::Abnormal(ab) => abnormal_outcome(ab, st, &c.id, ablog),
                 PlanSend::Err(e2) => {
-                    cool_down(st, &c.id, COOL_RATE);
+                    cool_down(st, &c.id, COOL_RATE, "rate");
                     if let PlanFail::RateLimited = classify_plan_err(e2.status, &e2.text) {
                         AttemptOutcome::Next("上游限流 429".into())
                     } else {
@@ -1453,19 +1740,19 @@ async fn plan_attempt(
             }
         }
         PlanFail::Invalid => {
-            cool_down(st, &c.id, COOL_INVALID);
+            cool_down(st, &c.id, COOL_INVALID, "invalid");
             AttemptOutcome::Next(format!("鉴权失败 HTTP {}", err.status))
         }
         PlanFail::Exhausted => {
-            cool_down(st, &c.id, COOL_EXHAUSTED);
+            cool_down(st, &c.id, COOL_EXHAUSTED, "exhausted");
             AttemptOutcome::Next("额度已用完".into())
         }
         PlanFail::Risk => {
-            cool_down(st, &c.id, COOL_RISK);
+            cool_down(st, &c.id, COOL_RISK, "risk");
             AttemptOutcome::Next("上游风控拦截（unusual activity）".into())
         }
         PlanFail::NetError => {
-            cool_down(st, &c.id, COOL_NET);
+            cool_down(st, &c.id, COOL_NET, "net");
             AttemptOutcome::Next(format!("上游请求失败: {}", clip(&err.text, 120)))
         }
         PlanFail::Other => AttemptOutcome::Done(buffered_error_response(err.status, &err.text, mode)),
@@ -1475,7 +1762,7 @@ async fn plan_attempt(
 /// 2xx 响应收尾：WAF 挑战页（非 JSON/SSE）按风控冷却换号，否则交付客户端并记粘性账号。
 fn finish_plan_ok(ok: PlanOk, st: &Arc<SharedState>, id: &str) -> AttemptOutcome {
     if (200..300).contains(&ok.status) && !ctype_ok(&ok.ctype) {
-        cool_down(st, id, COOL_RISK);
+        cool_down(st, id, COOL_RISK, "risk");
         return AttemptOutcome::Next(format!(
             "上游返回非 JSON 内容（{}，疑似 WAF 挑战页）",
             clip(&ok.ctype, 40)
@@ -1798,7 +2085,7 @@ async fn chat_completions(State(st): State<Arc<SharedState>>, body: axum::body::
         return free_call(&st, b.to_string().into_bytes(), free_url_paas, free_auth_paas, PumpMode::Raw).await;
     }
 
-    // 套餐模型 → 多账号降级链：账号登录态 JWT 走 zcode-plan 端点（套餐额度唯一可消费路径）
+    // 套餐模型 → 账号池降级链：账号登录态 JWT 走 zcode-plan 端点（套餐额度唯一可消费路径）
     let translated = match openai_map::translate_request(&v) {
         Ok(r) => r,
         Err(e) => return err_json(StatusCode::BAD_REQUEST, &e),
@@ -2314,6 +2601,98 @@ mod tests {
     }
 
     #[test]
+    fn expire_first_orders_ascending_none_last_stable() {
+        let info = || ApiKeyInfo {
+            label: String::new(),
+            api_key: String::new(),
+            base_url: String::new(),
+            provider: "zai".into(),
+            kind: "jwt".into(),
+            mint_error: None,
+        };
+        let mk = |id: &str| -> (String, String, ApiKeyInfo, Option<String>) {
+            (id.to_string(), String::new(), info(), None)
+        };
+        let mut expires = HashMap::new();
+        expires.insert("a".to_string(), Some(3_000i64));
+        expires.insert("b".to_string(), Some(1_000i64));
+        expires.insert("c".to_string(), None);
+        // 无 sticky：到期升序（b<a）在前，无到期信息（c / 不在快照里的 d）稳定垫后
+        let pool = vec![mk("c"), mk("a"), mk("d"), mk("b")];
+        let out = expire_first(pool, &expires, None);
+        let ids: Vec<&str> = out.iter().map(|(id, ..)| id.as_str()).collect();
+        assert_eq!(ids, vec!["b", "a", "c", "d"]);
+        // sticky="a"：恒守首位（到期排序在 sticky_first 之后做），其余按到期排
+        let pool = vec![mk("c"), mk("a"), mk("d"), mk("b")];
+        let out = expire_first(pool, &expires, Some("a"));
+        let ids: Vec<&str> = out.iter().map(|(id, ..)| id.as_str()).collect();
+        assert_eq!(ids, vec!["a", "b", "c", "d"]);
+        // 稳定性：同到期（e/f 均 2_000）保持原序；不在快照里的账号视同无到期垫后
+        let mut same = HashMap::new();
+        same.insert("e".to_string(), Some(2_000i64));
+        same.insert("f".to_string(), Some(2_000i64));
+        let pool = vec![mk("f"), mk("e"), mk("g")];
+        let out = expire_first(pool, &same, None);
+        let ids: Vec<&str> = out.iter().map(|(id, ..)| id.as_str()).collect();
+        assert_eq!(ids, vec!["f", "e", "g"]);
+    }
+
+    #[test]
+    fn snapshot_expire_takes_earliest_matching_live_slot() {
+        let item = |name: &str| json!({ "name": name });
+        // 未过期匹配槽取最小 ends_at；过期槽（expired=true）与不匹配槽（glm-5.3-flash）
+        // 都不参与
+        let snap = json!({ "plans": [
+            { "ends_at": 3_000, "items": [item("GLM-5.3")] },
+            { "expired": true, "ends_at": 1_000, "items": [item("glm-5.3")] },
+            { "ends_at": 2_000, "items": [item("glm-5.3-flash")] },
+            { "ends_at": 9_000, "items": [item("GLM_5.3")] }
+        ] });
+        assert_eq!(snapshot_expire_for_model(&snap, "5.3"), Some(3_000i64));
+        // 无 plans / 空归一键 / 匹配槽全无 ends_at → None
+        assert_eq!(snapshot_expire_for_model(&json!({}), "5.3"), None);
+        assert_eq!(snapshot_expire_for_model(&snap, ""), None);
+        let no_epoch = json!({ "plans": [ { "items": [item("glm-5.3")] } ] });
+        assert_eq!(snapshot_expire_for_model(&no_epoch, "5.3"), None);
+        // 部分槽有 ends_at：取有者的最小值
+        let partial = json!({ "plans": [
+            { "items": [item("glm-5.3")] },
+            { "ends_at": 7_000, "items": [item("glm-5.3")] }
+        ] });
+        assert_eq!(snapshot_expire_for_model(&partial, "5.3"), Some(7_000i64));
+    }
+
+    #[test]
+    fn fallback_models_keeps_config_order_glm53_only() {
+        let models = vec![
+            "glm-5.3-flash".to_string(),
+            "glm-4.7-flash".to_string(),
+            "glm-5.3".to_string(),
+            "GLM-5.3-Air".to_string(),
+        ];
+        // 保持配置顺序；排除自身与非 glm-5.3 系（glm-4.7-flash）
+        assert_eq!(
+            fallback_models(&models, "glm-5.3"),
+            vec!["glm-5.3-flash".to_string(), "GLM-5.3-Air".to_string()]
+        );
+        // 归一判定：glm_5.3 与 glm-5.3 同键，替代列表一致
+        assert_eq!(
+            fallback_models(&models, "GLM_5.3"),
+            vec!["glm-5.3-flash".to_string(), "GLM-5.3-Air".to_string()]
+        );
+        // 非 glm-5.3 系的当前模型：全部 glm-5.3 系都是候选（触发端另有 is_glm53_family 把关）
+        assert_eq!(
+            fallback_models(&models, "glm-4.7-flash"),
+            vec!["glm-5.3-flash".to_string(), "glm-5.3".to_string(), "GLM-5.3-Air".to_string()]
+        );
+        // glm-5.3 系判定：归一键 "5.3" 前缀
+        assert!(is_glm53_family("glm-5.3"));
+        assert!(is_glm53_family("GLM-5.3-Flash"));
+        assert!(!is_glm53_family("glm-4.7-flash"));
+        assert!(!is_glm53_family(""));
+    }
+
+    #[test]
     fn free_acct_tag_masks_key() {
         let pk = PoolKey { api_key: "abcdef123456".into(), provider: "zai".into() };
         assert_eq!(free_acct_tag(&pk), "zai:…3456");
@@ -2379,17 +2758,23 @@ mod tests {
 
     #[test]
     fn cooldown_disk_roundtrip_restores_remaining() {
-        // 恢复语义：未过期条目按剩余时长恢复；过期条目（直接构造的落盘残留）丢弃
+        // 恢复语义：未过期条目按剩余时长恢复；过期条目（直接构造的落盘残留）丢弃；
+        // 旧格式（纯数字毫秒）兼容读入且分类记 unknown，新格式分类原样恢复
         let now = std::time::Instant::now();
         let now_ms = unix_ms_now();
         let mut disk = HashMap::new();
-        disk.insert("alive".to_string(), now_ms + 600_000);
-        disk.insert("stale".to_string(), now_ms.saturating_sub(1));
-        disk.insert("boundary".to_string(), now_ms); // 恰好到期 = 过期，丢弃
+        disk.insert("alive".to_string(), json!({ "until": now_ms + 600_000, "kind": "risk" }));
+        disk.insert("legacy".to_string(), json!(now_ms + 300_000));
+        disk.insert("stale".to_string(), json!(now_ms.saturating_sub(1)));
+        disk.insert("boundary".to_string(), json!(now_ms)); // 恰好到期 = 过期，丢弃
         let restored = cooldown_from_disk(&disk, now_ms);
         assert!(!restored.contains_key("stale"));
         assert!(!restored.contains_key("boundary"));
-        let until = restored.get("alive").copied().expect("未过期条目应恢复");
+        let (_, alive_kind) = restored.get("alive").copied().expect("未过期条目应恢复");
+        assert_eq!(alive_kind, "risk");
+        let (_, legacy_kind) = restored.get("legacy").copied().expect("旧格式条目应兼容读入");
+        assert_eq!(legacy_kind, "unknown");
+        let until = restored.get("alive").unwrap().0;
         let remain = until.checked_duration_since(std::time::Instant::now()).unwrap();
         // 恢复为剩余时长（约 600s），不是从头再冷一遍
         assert!(remain <= Duration::from_secs(600) && remain > Duration::from_secs(590), "{remain:?}");
@@ -2397,18 +2782,21 @@ mod tests {
 
     #[test]
     fn cooldown_to_disk_maps_deadlines() {
-        // 内存 → 落盘：截止时刻换算为绝对 unix 毫秒（Instant 不可序列化），
-        // 经 from_disk 回读后剩余时长保持
+        // 内存 → 落盘：截止时刻换算为绝对 unix 毫秒（Instant 不可序列化），分类随行；
+        // 经 from_disk 回读后剩余时长与分类保持
         let now = std::time::Instant::now();
         let now_ms = unix_ms_now();
         let mut mem = HashMap::new();
-        mem.insert("acct".to_string(), now + Duration::from_secs(300));
+        mem.insert("acct".to_string(), (now + Duration::from_secs(300), "exhausted"));
         let disk = cooldown_to_disk(&mem, now, now_ms);
-        let ms = disk.get("acct").copied().unwrap();
+        let ms = disk.get("acct").unwrap().get("until").and_then(Value::as_u64).unwrap();
         assert!(ms > now_ms, "绝对时间戳应晚于当前时刻");
+        assert_eq!(disk.get("acct").unwrap().get("kind").and_then(Value::as_str), Some("exhausted"));
         let restored = cooldown_from_disk(&disk, now_ms);
-        let remain = restored.get("acct").unwrap().checked_duration_since(std::time::Instant::now()).unwrap();
+        let (until, kind) = restored.get("acct").unwrap();
+        let remain = until.checked_duration_since(std::time::Instant::now()).unwrap();
         assert!(remain <= Duration::from_secs(300) && remain > Duration::from_secs(290), "{remain:?}");
+        assert_eq!(*kind, "exhausted");
     }
 
     #[test]
@@ -2418,12 +2806,9 @@ mod tests {
         let state = Arc::new(SharedState {
             paths: Paths::detect(),
             token: Mutex::new(String::new()),
-            account: Mutex::new(None),
             models: Mutex::new(Vec::new()),
-            cache: Mutex::new(HashMap::new()),
             usage: Mutex::new(HashMap::new()),
             pool: Mutex::new(None),
-            active_cache: Mutex::new(None),
             cooldown: Mutex::new(HashMap::new()),
             cooldown_persist: Mutex::new(CooldownPersist::default()),
             cooldown_persist_enabled: false,
@@ -2431,7 +2816,7 @@ mod tests {
             rr: AtomicU64::new(0),
         });
         let before = std::fs::read(cooldown_file()).ok();
-        cool_down(&state, "test-persist-disabled", 60);
+        cool_down(&state, "test-persist-disabled", 60, "risk");
         assert_eq!(
             std::fs::read(cooldown_file()).ok(),
             before,

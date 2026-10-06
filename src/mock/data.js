@@ -176,7 +176,6 @@ const state = {
   language: "zh",
   two_api_on: false,
   two_api_port: 8117,
-  two_api_account: null,
   two_api_token: "zsw-mock-token-0123456789abcdef",
   two_api_models: "glm-5.3-flash, glm-4.7-flash, glm-4.6v-flash",
 };

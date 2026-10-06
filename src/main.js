@@ -140,10 +140,21 @@ function claimTierCapMs(tier) {
 }
 // 入库/切号触发的紧急检查：激活上报走 180s 快槽（区别于例行轮询的 4h 槽）
 let claimUrgent = {};
-// 切号/入库后统一入口：清冷却 + 稍后 tick（轮次忙则下个 tick 以 T0 优先接续）
-function armClaimCheck(id) {
+// 新号首领延迟（仅入库调用点）：30–90min 随机推迟首次领取尝试——批量入库的
+// 同批新号不再以同一节奏撞领取端点；到点后由 autoClaimTick 正常尝试并删除该键。
+// 落盘：批量入库后 30–90min 窗口内重启应用，延迟不能丢（丢了会集体同步撞端点）
+let claimNotBefore = (() => {
+  try { return JSON.parse(localStorage.getItem("zsw-claim-notbefore-v1") || "{}") || {}; } catch { return {}; }
+})();
+function saveClaimNotBefore() {
+  try { localStorage.setItem("zsw-claim-notbefore-v1", JSON.stringify(claimNotBefore)); } catch {}
+}
+// 切号/入库后统一入口：清冷却 + 稍后 tick（轮次忙则下个 tick 以 T0 优先接续）。
+// deferred=true（仅入库调用点）：不立即 urgent，改设首领延迟
+function armClaimCheck(id, deferred = false) {
   if (!id || isArchived(id)) return; // 归档号不主动领取
-  claimUrgent[id] = true;
+  if (deferred) { claimNotBefore[id] = Date.now() + 30 * 60e3 + Math.random() * 60 * 60e3; saveClaimNotBefore(); }
+  else claimUrgent[id] = true;
   autoClaimCooldown[id] = 0;
   saveClaimCooldown(); // 清零也落盘：入库/切号的紧急检查不能在重启后复活成旧停靠
   setTimeout(() => autoClaimTick(), 4000);
@@ -922,6 +933,71 @@ let twoOnKey = null;
 let twoShowToken = false;
 let twoLastStatus = null;
 let twoUsageMap = new Map();
+// 今日用量面板：数据 + 上次拉取时刻（弹窗 2s 状态轮询里 15s 节流复用）
+let twoLastUsage = null;
+let twoUsageAt = 0;
+
+// 冷却分类 → 词条键（后端 kind 白名单：invalid/rate/exhausted/risk/net/unknown）
+const TWO_COOL_KIND_KEY = {
+  invalid: "two.coolInvalid",
+  rate: "two.coolRate",
+  exhausted: "two.coolExhausted",
+  risk: "two.coolRisk",
+  net: "two.coolNet",
+  unknown: "two.coolUnknown",
+};
+
+/** 剩余秒 → 紧凑时长（<60s 原样秒，以上 m/h 进位） */
+function twoRemainText(secs) {
+  const s = Math.max(1, Math.floor(Number(secs) || 0));
+  if (s >= 3600) return `${Math.floor(s / 3600)}h${Math.ceil((s % 3600) / 60)}m`;
+  if (s >= 60) return `${Math.floor(s / 60)}m${s % 60}s`;
+  return `${s}s`;
+}
+
+/** token 数 → 紧凑数字（k/M 进位，纯展示用） */
+function twoTokText(n) {
+  n = Number(n) || 0;
+  if (n >= 1e6) return (n / 1e6).toFixed(1) + "M";
+  if (n >= 1e3) return (n / 1e3).toFixed(1) + "k";
+  return String(n);
+}
+
+/** 「网关冷却」区块：冷却中账号（名称/分类/剩余）+ 逐行解除；随状态轮询整块刷新 */
+function twoCooldownHtml() {
+  const list = twoLastStatus?.cooldowns || [];
+  const rows = list
+    .map((c) => {
+      const kindKey = TWO_COOL_KIND_KEY[c.kind] || TWO_COOL_KIND_KEY.unknown;
+      return `<div class="two-ep">
+        <code title="${esc(c.id)}">${esc(accountName(c.id))}</code>
+        <span class="two-ep-note">${esc(t(kindKey))}</span>
+        <span class="two-ep-note">${twoRemainText(c.remainingSecs)}</span>
+        <button class="btn-ghost" click="actions.twoUnfreeze('${esc(c.id)}')">${esc(t("two.cooldownUnfreeze"))}</button>
+      </div>`;
+    })
+    .join("");
+  return `<div class="two-cooldowns">${rows || `<div class="two-ep"><span class="two-ep-note">${esc(t("two.cooldownEmpty"))}</span></div>`}</div>`;
+}
+
+/** 「今日用量」区块：总量一行 + 按账号 Top 行；随状态轮询（15s 节流拉数据）整块刷新 */
+function twoUsageHtml() {
+  const u = twoLastUsage;
+  if (!u || !(Number(u.requests) > 0)) {
+    return `<div class="two-usage"><div class="two-ep"><span class="two-ep-note">${esc(t("two.usageEmpty"))}</span></div></div>`;
+  }
+  const head = `<div class="two-ep"><code>${esc(t("two.usageRequests", { n: u.requests }))} · ${esc(t("two.usageIn"))} ${twoTokText(u.inputTokens)} · ${esc(t("two.usageOut"))} ${twoTokText(u.outputTokens)} · ${esc(t("two.usageCache"))} ${twoTokText(u.cacheRead)}</code></div>`;
+  const top = (u.byAccount || []);
+  const topHtml = top.length
+    ? `<div class="two-ep"><span class="two-ep-note">${esc(t("two.usageByAccount"))}</span></div>` +
+      top.map((r) => `<div class="two-ep">
+        <code title="${esc(r.acct)}">${esc(accountName(r.acct))}</code>
+        <span class="two-ep-note">${esc(t("two.usageRequests", { n: r.requests }))}</span>
+        <span class="two-ep-note">${esc(t("two.usageOut"))} ${twoTokText(r.outputTokens)}</span>
+      </div>`).join("")
+    : "";
+  return `<div class="two-usage">${head}${topHtml}</div>`;
+}
 
 function twoStatusHtml() {
   const on = !!state?.two_api_on;
@@ -1007,10 +1083,6 @@ function twoSnippet(name, st) {
   const base = `http://127.0.0.1:${port}`;
   const token = st.two_api_token || "";
   const tokenShown = !token ? t("two.tokenEmpty") : twoShowToken ? token : token.slice(0, 10) + "••••••••";
-  const acctOpts = [
-    `<option value=""${!st.two_api_account ? " selected" : ""}>${esc(t("two.accountFollow"))}</option>`,
-    ...(st.accounts || []).map((a) => `<option value="${esc(a.id)}"${st.two_api_account === a.id ? " selected" : ""}>${esc(a.name)}</option>`),
-  ].join("");
   const epRow = (path, note) => `
     <div class="two-ep"><code>${base}${path}</code><span class="two-ep-note">${esc(note)}</span>
       <button class="icon-btn" title="${esc(t("two.copied"))}" click="actions.twoCopyEndpoint('${path}')">${ic("copy", 13)}</button>
@@ -1033,14 +1105,19 @@ function twoSnippet(name, st) {
         <button class="toggle${on ? " on" : ""}" role="switch" aria-checked="${on}" aria-label="${esc(t("two.on"))}" click="actions.twoToggle()"><span class="knob"></span></button>
       </div>
 
+      <div class="st-sec">${t("two.cooldownTitle")}</div>
+      ${twoCooldownHtml()}
+      <div class="st-sec">${t("two.usageTitle")}</div>
+      ${twoUsageHtml()}
+
       <div class="st-sec">${t("two.secConfig")}</div>
       <div class="two-cfg-grid">
         <label class="two-cfg"><span>${t("two.port")}</span>
           <input class="two-input two-port" type="number" min="1024" max="65535" value="${port}">
         </label>
-        <label class="two-cfg"><span>${t("two.account")}</span>
-          <select class="two-input two-account" change="actions.twoSetAccount(event)">${acctOpts}</select>
-        </label>
+        <div class="two-cfg wide"><span>${t("two.account")}</span>
+          <span class="two-ep-note">${t("two.poolHint")}</span>
+        </div>
         <label class="two-cfg wide"><span>${t("two.models")}</span>
           <span class="two-models-row">
             <input class="two-input two-models" type="text" value="${esc(st.two_api_models || autoModelList())}" placeholder="${esc(autoModelList())}">
@@ -1100,6 +1177,9 @@ function closeTwoApiModal() {
 async function openTwoApiModal() {
   closeTwoApiModal();
   twoLastStatus = await invoke("two_api_status").catch(() => null);
+  // 今日用量：开窗即拉一次，之后走 15s 节流（与 2s 状态轮询合并，见下方 interval）
+  twoUsageAt = Date.now();
+  twoLastUsage = await invoke("two_api_usage").catch(() => null);
   const mask = document.createElement("div");
   mask.className = "st-mask two-mask pv-mask";
   mask.innerHTML = twoApiFormHtml();
@@ -1113,6 +1193,15 @@ async function openTwoApiModal() {
     twoLastStatus = await invoke("two_api_status").catch(() => null);
     const old = twoApiModalEl.querySelector(".two-status");
     if (old) old.outerHTML = twoStatusHtml();
+    const cool = twoApiModalEl.querySelector(".two-cooldowns");
+    if (cool) cool.outerHTML = twoCooldownHtml();
+    // 今日用量 15s 节流：usage.jsonl 聚合在后端还有 30s 缓存，双保险
+    if (Date.now() - twoUsageAt >= 15000) {
+      twoUsageAt = Date.now();
+      twoLastUsage = await invoke("two_api_usage").catch(() => null);
+      const us = twoApiModalEl.querySelector(".two-usage");
+      if (us) us.outerHTML = twoUsageHtml();
+    }
   }, 2000);
 }
 
@@ -1733,8 +1822,9 @@ const actions = {
       // 新账号入库：稍等 ZCode 落盘凭据后立刻拉额度（立即拉可能与写盘竞争）
       setTimeout(() => loadAcctQuota(r.id), 1500);
       // 新号上游还没有任何套餐（Start Plan 余额行跟着首次领取事件一起发放），
-      // urgent 检查尽快进入自动领取（激活走 180s 快槽），领完才有额度可查
-      armClaimCheck(r.id);
+      // 领完才有额度可查；激活心跳仍由入库即时触发（180s 快槽）——领取检查本身
+      // 走首领延迟（30–90min 随机），避免批量入库的新号以同一节奏撞领取端点
+      armClaimCheck(r.id, true);
     });
   },
 
@@ -2676,7 +2766,6 @@ const actions = {
       await invoke("set_two_api", {
         on: !state?.two_api_on,
         port: state?.two_api_port || 8117,
-        account: state?.two_api_account || null,
         models: state?.two_api_models || null,
         proxyUrl: state?.two_api_proxy_url || null,
       });
@@ -2694,28 +2783,12 @@ const actions = {
       await invoke("set_two_api", {
         on: !!state?.two_api_on,
         port: Number.isFinite(raw) && raw > 0 ? raw : 8117,
-        account: state?.two_api_account || null,
         models: models || null,
         proxyUrl,
       });
       await refresh();
       syncTwoApiModal();
       toast(t("two.saved"));
-    } catch (e) { toast(stripErr(e), "err"); }
-  },
-
-  async twoSetAccount(ev) {
-    const v = ev?.target?.value || "";
-    try {
-      await invoke("set_two_api", {
-        on: !!state?.two_api_on,
-        port: state?.two_api_port || 8117,
-        account: v || null,
-        models: state?.two_api_models || null,
-        proxyUrl: state?.two_api_proxy_url || null,
-      });
-      await refresh();
-      syncTwoApiModal();
     } catch (e) { toast(stripErr(e), "err"); }
   },
 
@@ -2748,6 +2821,18 @@ const actions = {
       twoShowToken = true;
       syncTwoApiModal();
       toast(t("two.tokenRegenDone"));
+    } catch (e) { toast(stripErr(e), "err"); }
+  },
+
+  /** 手动解除某账号网关冷却：unknown id 后端静默；成功后立即刷新状态与冷却面板 */
+  async twoUnfreeze(id) {
+    try {
+      await invoke("two_api_unfreeze", { id });
+      twoLastStatus = await invoke("two_api_status").catch(() => null);
+      const old = twoApiModalEl?.querySelector(".two-status");
+      if (old) old.outerHTML = twoStatusHtml();
+      const cool = twoApiModalEl?.querySelector(".two-cooldowns");
+      if (cool) cool.outerHTML = twoCooldownHtml();
     } catch (e) { toast(stripErr(e), "err"); }
   },
 
@@ -3042,6 +3127,20 @@ function noteClaimRisk(id) {
   // 同时修复原「result 风控失败被轮内与 claim://result 监听各计 1 次」的双喂，
   // 15min≥4 阈值恢复「4 个独立信号」的设计语义
   noteFleetRiskFail();
+  // 跨账号连败升级（长层）：短窗熔断逻辑不动，这里只在其上加更长暂停——2h 时间窗
+  // 内不同账号数 ≥3 视为出口 IP 被整体拦截（单号停靠救不了整个出口），pause 取 max；
+  // 仅在 distinct 跨过 3/6 时各升级一次，避免同波内每条信号都把暂停指数翻倍
+  const prevDistinct = new Set(fleetRiskRing.map((e) => e.id)).size;
+  fleetRiskRing.push({ id, at: now });
+  while (fleetRiskRing.length && now - fleetRiskRing[0].at > 2 * 60 * 60 * 1000) fleetRiskRing.shift();
+  if (fleetRiskRing.length > 6) fleetRiskRing.splice(0, fleetRiskRing.length - 6);
+  const distinct = new Set(fleetRiskRing.map((e) => e.id)).size;
+  if ((prevDistinct < 3 && distinct >= 3) || (prevDistinct < 6 && distinct >= 6)) {
+    fleetEscalation++;
+    const pause = Math.min(2 * 60 * 60 * 1000 * 2 ** Math.min(fleetEscalation - 1, 4), 24 * 60 * 60 * 1000);
+    claimPauseUntil = Math.max(claimPauseUntil, now + pause);
+    toast(t("m.claimFleetBlocked", { min: Math.round(pause / 60e3) }), "warn");
+  }
   // 手动冻结 = 风控冻结代位：复测撞墙同样顺延停靠；不夺取所有权、
   // 不记 streak——b/c) 证据机不盘点手动冻结，streak 只是它的观测计数
   if (isFrozen(id) && !autoFrozenAt[id]) {
@@ -3135,6 +3234,11 @@ let claimRiskBurst = 0;
 let claimRiskBurstAt = 0;
 let claimPauseStreak = 0;
 let claimPauseUntil = 0;
+// 跨账号连败升级熔断（长层）：尾部 6 个风控信号的滚动环内出现 ≥3 个不同账号 =
+// 出口 IP 级被拉黑——noteFleetRiskFail 短窗熔断之上再加 2h 起步指数升级暂停
+// （封顶 24h），两者 pause 取 max；任一账号领取成功即整体复位
+let fleetRiskRing = [];
+let fleetEscalation = 0;
 function noteFleetRiskFail() {
   const now = Date.now();
   if (now - claimRiskBurstAt > CLAIM_RISK_BURST_WINDOW) claimRiskBurst = 0;
@@ -3151,6 +3255,40 @@ function noteFleetRiskFail() {
 function noteFleetRiskOk() {
   claimRiskBurst = 0;
   claimPauseStreak = 0;
+}
+
+// ===== 每日领取总量自律（仅自动轮）=====
+// 自动轮每发起一次 claim_start 计数 +1，达上限后本轮跳过领取（toast 每日一次）；
+// 跨日自动重置、随写随存。只约束自动轮——手动单领/一键领取不计数、不受限
+const CLAIM_DAY_CAP = 6;
+const CLAIM_DAY_CAP_KEY = "zsw-claim-day-cap-v1";
+let claimDayStats = (() => {
+  try { return JSON.parse(localStorage.getItem(CLAIM_DAY_CAP_KEY) || "null"); }
+  catch { return null; }
+})();
+let claimDayCapToasted = "";
+function localDayStr() {
+  const d = new Date();
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+}
+function claimDayRoll() {
+  const day = localDayStr();
+  if (!claimDayStats || claimDayStats.date !== day) claimDayStats = { date: day, attempts: 0 };
+}
+function claimDayCapReached() {
+  claimDayRoll();
+  return claimDayStats.attempts >= CLAIM_DAY_CAP;
+}
+function noteClaimDayAttempt() {
+  claimDayRoll();
+  claimDayStats.attempts += 1;
+  try { localStorage.setItem(CLAIM_DAY_CAP_KEY, JSON.stringify(claimDayStats)); } catch { /* 忽略 */ }
+}
+function claimDayCapToastOnce() {
+  const day = localDayStr();
+  if (claimDayCapToasted === day) return;
+  claimDayCapToasted = day;
+  toast(t("m.claimDayCap"), "warn");
 }
 function autoClaimCooldownFor(r) {
   const now = Date.now();
@@ -3187,6 +3325,13 @@ async function autoClaimTick() {
     for (const id of ids) {
       if (!state?.auto_claim || autoAbortRequested || autoClaimPaused) break;
       if (!(state.accounts || []).some((a) => a.id === id)) continue;
+      // 新号首领延迟：入库触发的首查未到随机延迟点 → 跳过该号（不写冷却、不清
+      // urgent，切号触发的 urgent 不受影响）；到点删除该键后正常尝试
+      if (claimNotBefore[id] != null) {
+        if (Date.now() < claimNotBefore[id]) continue;
+        delete claimNotBefore[id];
+        saveClaimNotBefore();
+      }
       let gotAny = false;
       let failed = false;
       claimable[id] = { ...(claimable[id] || {}), busy: true };
@@ -3219,6 +3364,10 @@ async function autoClaimTick() {
         progressed = false;
         const plan = claimable[id]?.plans?.[0];
         if (!plan) break;
+        // 每日领取总量自律：今日自动轮 claim_start 已达上限 → 本轮不再发起领取
+        //（toast 每日一次）；报价未领期间一直挂在 preview 不会丢单，跨日重置后接续
+        if (claimDayCapReached()) { claimDayCapToastOnce(); break; }
+        noteClaimDayAttempt();
         try {
           await invoke("claim_start", { id, planId: plan.plan_id, auto: true });
           // 手动操作抢占：claim_start 刚挂上的 pending 立即撤销，避免与新手动领取争抢全局槽位
@@ -4227,6 +4376,9 @@ listen("claim://result", (ev) => {
     if (claimFailureRisk(p)) noteClaimRisk(p.accountId); // 风控信号记账（首信号即冻结；熔断喂给在 noteClaimRisk 内统一）
   } else {
     noteFleetRiskOk();
+    // 跨账号连败环复位：任一账号领取成功 = 领取链路未被整体封锁
+    fleetRiskRing.length = 0;
+    fleetEscalation = 0;
     autoRiskStreak[p.accountId] = 0; // 领取成功：风控怀疑清零
     if (isFrozen(p.accountId)) autoUnfreeze(p.accountId); // 探测通过 → 解冻（手动/自动一视同仁）
     // 礼物账本：领到的实例记账（global 族终身免快检；weekend 族按期比对）

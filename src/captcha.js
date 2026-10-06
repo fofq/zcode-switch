@@ -84,12 +84,45 @@ async function run() {
 
   status(t("c.traceless"));
 
-  const submit = (param) => {
+  const submit = async (param) => {
     if (submitted || !param || !param.trim()) return;
     submitted = true;
     clearTimeout(tracelessTimer);
     status(t("c.passed"));
-    // 统一路由：有待领奖 → 领奖；否则 → 2API 套餐路由的验证码桥接
+    // 统一路由：有待领奖 → 页内直发 claim（验证码通过的真实 Chromium 传输直接过
+    // WAF；ureq 的传输指纹已被上游机器级封锁 405）；否则 → 2API 套餐路由的验证码桥接
+    let ctx = null;
+    try { ctx = await invoke("claim_context"); } catch { ctx = null; }
+    if (ctx?.planId && ctx.jwt) {
+      let result;
+      try {
+        const uuid = crypto.randomUUID
+          ? crypto.randomUUID()
+          : "xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx".replace(/[xy]/g, (c) => {
+              const r = (Math.random() * 16) | 0;
+              return (c === "x" ? r : (r & 0x3) | 0x8).toString(16);
+            });
+        const resp = await fetch("https://zcode.z.ai/api/v1/zcode-plan/billing/claim", {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            "authorization": "Bearer " + ctx.jwt,
+            "x-device-mid": ctx.mid,
+            "x-request-id": uuid,
+            "x-aliyun-captcha-verify-param": param,
+            ...(region ? { "x-aliyun-captcha-verify-region": region } : {}),
+          },
+          body: JSON.stringify({ plan_id: ctx.planId }),
+        });
+        const body = await resp.text();
+        result = { status: resp.status, body };
+      } catch (e) {
+        // 页内 fetch 抛错（断网/CSP 拦截等）：status 0 = 传输层失败，后端按 code:-1 落账
+        result = { status: 0, body: String(e) };
+      }
+      invoke("claim_result", result).catch(() => {});
+      return;
+    }
     invoke("captcha_submit", { param, region }).catch((e) => {
       status(t("c.claimReqFail"), "err");
       detail(stripErr(e));

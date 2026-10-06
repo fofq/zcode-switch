@@ -197,8 +197,6 @@ pub struct Settings {
     #[serde(default)]
     pub two_api_port: Option<u16>,
     #[serde(default)]
-    pub two_api_account: Option<String>,
-    #[serde(default)]
     pub two_api_token: Option<String>,
     #[serde(default)]
     pub two_api_models: Option<String>,
@@ -244,13 +242,6 @@ impl Settings {
     }
     pub fn two_api_on(&self) -> bool { self.two_api_on.unwrap_or(false) }
     pub fn two_api_port(&self) -> u16 { self.two_api_port.unwrap_or(8117) }
-    pub fn two_api_account(&self) -> Option<String> {
-        self.two_api_account
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(String::from)
-    }
     pub fn two_api_token(&self) -> String { self.two_api_token.clone().unwrap_or_default() }
     pub fn two_api_models(&self) -> String {
         self.two_api_models
@@ -311,7 +302,6 @@ pub struct AppState {
     pub language: String,
     pub two_api_on: bool,
     pub two_api_port: u16,
-    pub two_api_account: Option<String>,
     pub two_api_token: String,
     pub two_api_models: String,
     pub two_api_proxy_url: Option<String>,
@@ -610,12 +600,35 @@ pub fn open_url(url: &str) -> Result<(), String> {
 }
 
 pub fn load_settings(paths: &Paths) -> Settings {
-    match fs::read_to_string(paths.settings_file()) {
-        Ok(s) => serde_json::from_str(&s).unwrap_or_else(|e| {
+    // 读失败不静默重置：40ms 后重试一次（与保存侧原子写竞争时的短暂窗口），
+    // 仍失败才回退默认值并响亮记录——静默重置会吞掉用户的全部设置
+    let body = match fs::read_to_string(paths.settings_file()) {
+        Ok(s) => Some(s),
+        // 全新安装本就没有 settings.json：正常状态，不重试不告警
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => {
+            std::thread::sleep(Duration::from_millis(40));
+            match fs::read_to_string(paths.settings_file()) {
+                Ok(s) => Some(s),
+                Err(e2) => {
+                    eprintln!("settings.json 读取失败（重试后仍失败），已回退默认值：{e2}（首次：{e}）");
+                    crate::flowlog::log("store", "settings-read-fail", &e2.to_string());
+                    None
+                }
+            }
+        }
+    };
+    let Some(s) = body else {
+        return Settings::default();
+    };
+    match serde_json::from_str(&s) {
+        Ok(v) => v,
+        // 解析失败（文件损坏）：不重试，同一日志口径
+        Err(e) => {
             eprintln!("settings.json 损坏，已回退默认值：{e}");
+            crate::flowlog::log("store", "settings-read-fail", &e.to_string());
             Settings::default()
-        }),
-        Err(_) => Settings::default(),
+        }
     }
 }
 
@@ -2118,7 +2131,6 @@ pub fn get_state(paths: &Paths) -> Result<AppState, String> {
         language: crate::i18n::current().as_str().to_string(),
         two_api_on: settings.two_api_on(),
         two_api_port: settings.two_api_port(),
-        two_api_account: settings.two_api_account(),
         two_api_token: settings.two_api_token(),
         two_api_models: settings.two_api_models(),
         two_api_proxy_url: settings.two_api_proxy_url(),

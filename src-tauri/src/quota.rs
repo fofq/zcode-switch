@@ -255,6 +255,10 @@ pub struct PlanSlot {
     /// 套餐已过期（status != active，或 active 但 ends_at 已过服务器时间）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub expired: Option<bool>,
+    /// balance 原始 ends_at（epoch 秒）×1000 的 epoch 毫秒，供 2API 池候选到期优先排序；
+    /// monitor 链路暂无 plan 级到期，恒 None
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ends_at: Option<i64>,
     /// 套餐 entitlements 的 id 集合：部分套餐（Trust Build 等新礼物）的 balances 行
     /// 只带 entitlement_id 不带 plan_id，余额归属匹配靠它兜底
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -841,6 +845,11 @@ fn merge_parts(parts: Vec<QuotaOverview>) -> QuotaOverview {
                             slots[i].expire = s.expire.clone();
                         }
                     }
+                    // 到期 epoch 同步补缺：monitor 槽（None）在前、billing 槽（Some）
+                    // 并入时不回填会让双渠道账号的到期优先排序退化为未知垫后
+                    if slots[i].ends_at.is_none() {
+                        slots[i].ends_at = s.ends_at;
+                    }
                 }
             }
         }
@@ -1183,6 +1192,7 @@ fn normalize_quota_limit(limit_resp: &Value, sub_resp: Option<&Value>) -> QuotaO
             expire: plan_expire.clone(),
             gift: None,
             expired: None,
+            ends_at: None,
             ent_ids: Vec::new(),
             total,
             used,
@@ -1446,6 +1456,7 @@ fn normalize_balance(balance_data: &Value) -> QuotaOverview {
                         expire: extract_expire(pl),
                         gift: Some(gift),
                         expired: expired.then_some(true),
+                        ends_at: (ends_at > 0).then(|| ends_at * 1000),
                         ent_ids,
                         ..Default::default()
                     }

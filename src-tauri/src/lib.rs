@@ -333,7 +333,6 @@ async fn set_two_api(
     app: AppHandle,
     on: bool,
     port: u16,
-    account: Option<String>,
     models: Option<String>,
     proxy_url: Option<String>,
 ) -> Result<(), String> {
@@ -343,7 +342,6 @@ async fn set_two_api(
         let mut s = load_settings(&paths);
         s.two_api_on = Some(on);
         s.two_api_port = Some(port.clamp(1024, 65535));
-        s.two_api_account = account.filter(|x| !x.trim().is_empty());
         s.two_api_models = models;
         s.two_api_proxy_url = proxy_url.filter(|x| !x.trim().is_empty());
         save_settings(&paths, &s)?;
@@ -373,6 +371,18 @@ async fn regen_two_api_token(app: AppHandle) -> Result<String, String> {
 #[tauri::command]
 async fn two_api_status() -> twoapi::Status {
     twoapi::status()
+}
+
+/// 手动解除某账号的网关冷却（2API 弹窗「网关冷却」面板）；unknown id 后端静默
+#[tauri::command]
+async fn two_api_unfreeze(id: String) {
+    twoapi::unfreeze(&id);
+}
+
+/// 今日用量聚合（usage.jsonl → 2API 弹窗「今日用量」面板）
+#[tauri::command]
+async fn two_api_usage() -> serde_json::Value {
+    twoapi::usage_today()
 }
 
 #[tauri::command]
@@ -480,7 +490,13 @@ async fn claim_captcha_config() -> Result<claim::CaptchaConfig, String> {
     claim::fetch_captcha_config()
 }
 
-/// 验证码窗口统一提交入口：有 pending 领奖 → 走领奖；否则 → 2API 套餐路由验证码桥接
+/// 验证码窗口提交入口（旧路径，向后兼容回退）：正常领取流程里 captcha 页已改为
+/// 页内直发 claim（claim_context 取 JWT → 页内 POST → claim_result 回执落账）——
+/// ureq 的传输指纹已进上游 WAF 信誉键被机器级封锁（405 unusual activity），而
+/// 验证码通过时的真实 Chromium 传输（WebView）可直接过 WAF。本命令保留两条语义：
+/// 有 pending 领奖 → Rust 发 claim POST（旧页面/claim_context 异常时的回退）；
+/// 无 pending → 2API 套餐路由的验证码桥接（网关侧模型请求触发验证码，参数回传
+/// 仍由 Rust 发，语义不变）。
 #[tauri::command]
 async fn captcha_submit(
     app: AppHandle,
@@ -509,10 +525,16 @@ async fn claim_captcha_submit_inner(
         &pending.plan_id,
         &param,
         region.as_deref(),
-        Some(pending.device_mid),
+        Some(pending.device_mid.clone()),
     );
-    close_captcha_window(&app);
-    let payload = match res {
+    Ok(claim_finish(&app, &pending, res))
+}
+
+/// 领取提交结果统一收尾（Rust 直发回退与页内直发共用）：解析 → ClaimOutcome/
+/// 失败载荷 → flowlog → emit claim://result → 关验证码窗；pending 由调用方 take。
+fn claim_finish(app: &AppHandle, pending: &PendingClaim, res: Result<Value, claim::ClaimError>) -> Value {
+    close_captcha_window(app);
+    match res {
         Ok(v) => {
             let ms = |k: &str| -> Option<i64> {
                 v.pointer(&format!("/data/plan/{k}"))
@@ -554,10 +576,70 @@ async fn claim_captcha_submit_inner(
                 &format!("acct={} plan={} code={} {}", pending.account_name, pending.plan_name, e.code, e.message),
             );
             let _ = app.emit("claim://result", &p);
-            return Ok(p);
+            p
+        }
+    }
+}
+
+/// 领取上下文：captcha 页无感通过后据此在页内直发 claim POST（同一 JWT/IP 经
+/// 真实 Chromium 传输可过 WAF，见 captcha_submit 注释）。JWT 经 IPC 注入本应用
+/// 自带的 captcha.html 页——同一信任域，与 App 其他 IPC 等价。无 pending（2API
+/// 网关验证码桥接）时返回 null，页面回落旧 captcha_submit 路径。
+#[tauri::command]
+async fn claim_context() -> Result<Option<serde_json::Value>, String> {
+    let pending = pending_guard().as_ref().map(|p| {
+        (
+            p.account_id.clone(),
+            p.account_name.clone(),
+            p.plan_id.clone(),
+            p.credentials.clone(),
+            p.config.clone(),
+            p.device_mid.clone(),
+        )
+    });
+    let Some((account_id, account_name, plan_id, credentials, config, mid)) = pending else {
+        return Ok(None);
+    };
+    let secret = zcrypto::default_secret(&Paths::detect().home);
+    let jwt = claim::claim_token(&credentials, config.as_ref(), &secret)?;
+    Ok(Some(json!({
+        "accountId": account_id,
+        "accountName": account_name,
+        "planId": plan_id,
+        "jwt": jwt,
+        "mid": mid,
+    })))
+}
+
+/// captcha 页内直发的回执：页面 fetch 完成后把 (HTTP status, body 文本) 交回后端，
+/// 复用与 Rust 直发完全相同的解析/落账/事件/关窗逻辑（claim_finish）。
+/// status==0（页内 fetch 抛错：断网/CSP 拦截等）或 body 非 JSON → 按 code:-1 失败。
+/// 无 pending（窗口已取消/非领取验证码）时静默忽略。
+#[tauri::command]
+async fn claim_result(app: AppHandle, status: i64, body: String) -> Result<serde_json::Value, String> {
+    let Some(pending) = pending_guard().take() else {
+        return Ok(json!({ "ignored": true }));
+    };
+    let res = if status == 0 {
+        Err(claim::ClaimError {
+            code: -1,
+            message: body,
+            next_at: None,
+        })
+    } else {
+        match serde_json::from_str::<Value>(&body) {
+            // 业务 JSON（对象且带 code）走统一解析；非 JSON 体（WAF 拦截页等）合成
+            // 与 Rust 直发 http_err 同形的「HTTP <status>: …」文案——riskInText 的
+            // 405/429 支路靠它命中，机器级封锁的冻结/车队升级才不会失效
+            Ok(v) if v.is_object() && v.get("code").is_some() => claim::parse_claim_body(&v),
+            _ => Err(claim::ClaimError {
+                code: -1,
+                message: format!("HTTP {status}: {body}"),
+                next_at: None,
+            }),
         }
     };
-    Ok(payload)
+    Ok(claim_finish(&app, &pending, res))
 }
 
 #[tauri::command]
@@ -1478,6 +1560,8 @@ pub fn run() {
             set_two_api,
             regen_two_api_token,
             two_api_status,
+            two_api_unfreeze,
+            two_api_usage,
             two_api_test,
             all_account_api_keys,
             claim_preview,
@@ -1485,6 +1569,8 @@ pub fn run() {
             claim_start,
             claim_captcha_config,
             captcha_submit,
+            claim_context,
+            claim_result,
             captcha_show,
             claim_cancel,
             oauth_providers,

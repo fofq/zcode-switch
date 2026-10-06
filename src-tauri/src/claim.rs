@@ -102,7 +102,9 @@ pub fn failure_payload(
     })
 }
 
-fn claim_token(creds: &Value, config: Option<&Value>, secret: &str) -> Result<String, String> {
+/// 取账号的 billing JWT：zcodejwttoken 优先，缺失时回落 getCustomerInfo 令牌。
+/// lib.rs 的 claim_context（captcha 页内直发）与 submit_claim 共用同一取 token 路径
+pub(crate) fn claim_token(creds: &Value, config: Option<&Value>, secret: &str) -> Result<String, String> {
     let jwt = creds
         .get("zcodejwttoken")
         .and_then(|v| v.as_str())
@@ -386,11 +388,17 @@ pub fn submit_claim(
             next_at: None,
         })?;
     let v: Value = serde_json::from_str(&resp).unwrap_or(Value::String(resp));
+    parse_claim_body(&v)
+}
+
+/// 领取响应体统一解析（Rust 直发 submit_claim 与 captcha 页内直发 claim_result 共用）：
+/// code != 0 → 业务失败（1005 附带 nextAt）；body 非 JSON / 缺 code → 按 code:-1 失败
+pub(crate) fn parse_claim_body(v: &Value) -> Result<Value, ClaimError> {
     let code = v.get("code").and_then(|c| c.as_i64()).unwrap_or(-1);
     if code != 0 {
-        return Err(claim_error(code, &v));
+        return Err(claim_error(code, v));
     }
-    Ok(v)
+    Ok(v.clone())
 }
 
 pub fn fetch_captcha_config() -> Result<CaptchaConfig, String> {
