@@ -181,6 +181,8 @@ export const zh = {
   "m.unarchivedDetail": "账号重新参与自动刷新与领取轮次",
   "m.autoArchivedToast": "已自动归档 {n} 个账号",
   "m.autoArchivedDetail": "命中自动归档规则：{names}",
+  "m.autoUnarchivedToast": "检测到有效额度，已自动取消归档 {n} 个账号",
+  "m.autoUnarchivedDetail": "重新入轮：{names}",
   "m.autoArchivedHint": "（规则可在设置中调整；手动刷新/领取仍可用）",
 "grp.health.ok": "额度充足",
   "grp.health.low": "额度紧张",

@@ -2077,13 +2077,16 @@ const actions = {
     const ids = selectedIds();
     if (!ids.length) return;
     for (const id of ids) {
-      if (archive) archivedIds.add(id);
-      else {
+      if (archive) {
+        archivedIds.add(id);
+        autoArchivedIds.delete(id); // 手动批量归档撤销自动来源：不参与自动纠偏
+      } else {
         archivedIds.delete(id);
         delete autoClaimCooldown[id];
       }
     }
     saveArchived();
+    saveAutoArchived();
     ui.selected.clear();
     ui.lastCheckedId = null;
     toast(t(archive ? "list.toastBulkArchived" : "list.toastBulkUnarchived", { n: ids.length }), "ok",
@@ -2185,6 +2188,7 @@ const actions = {
       // 冻结/归档集合与停靠冷却是 localStorage 持久化的：不删会让已删号的 id 永久残留
       frozenIds.delete(id); saveFrozen();
       archivedIds.delete(id); saveArchived();
+      autoArchivedIds.delete(id); saveAutoArchived();
       saveClaimCooldown();
       ui.selected.delete(id); ui.expanded.delete(id);
       markQuotaCacheDirty(); flushQuotaCache(true);
@@ -4506,8 +4510,25 @@ function saveArchived() {
   try { localStorage.setItem(ARCHIVED_KEY, JSON.stringify([...archivedIds])); } catch { /* 忽略 */ }
 }
 function isArchived(id) { return archivedIds.has(id); }
+// 自动归档的来源标记（与手动归档区分）：仅自动归档的号参与「检测到有效额度自动
+// 取消归档」的纠偏——手动归档是用户拍板，永远不自动解除
+const AUTO_ARCHIVED_KEY = "zsw-auto-archived-ids";
+let autoArchivedIds = (() => {
+  try { return new Set(JSON.parse(localStorage.getItem(AUTO_ARCHIVED_KEY) || "[]")); }
+  catch { return new Set(); }
+})();
+function saveAutoArchived() {
+  try { localStorage.setItem(AUTO_ARCHIVED_KEY, JSON.stringify([...autoArchivedIds])); } catch { /* 忽略 */ }
+}
 function toggleArchived(id) {
-  if (archivedIds.has(id)) archivedIds.delete(id); else archivedIds.add(id);
+  if (archivedIds.has(id)) {
+    archivedIds.delete(id);
+  } else {
+    archivedIds.add(id);
+    // 手动归档撤销自动归档来源：用户拍板后不再参与「有效额度自动取消归档」纠偏
+    autoArchivedIds.delete(id);
+    saveAutoArchived();
+  }
   saveArchived();
 }
 
@@ -4534,10 +4555,43 @@ const noFutureQuota = (id) => {
   const plans = data.plans || [];
   return plans.length > 0 && plans.every((p) => planExpired(p));
 };
+// 「仍有未到期额度」的正面口径：有数据、非空、且存在未过期套餐（到期判定按实时
+// 时间，缓存里的旧数据依然回答得准）。与 noFutureQuota 相反但更严——无数据的号
+// 返回 false：判断不了的号不参与自动纠偏（维持现状）
+const hasFutureQuota = (id) => {
+  const q = acctQuota[id];
+  const data = q?.data;
+  if (!data || q.busy || q.err) return false;
+  if (data.is_empty === true) return false;
+  const plans = data.plans || [];
+  return plans.some((p) => !planExpired(p));
+};
 function autoArchiveTick() {
   const deadH = Number(state?.auto_archive_dead_hours ?? 0);
   const ageD = Number(state?.auto_archive_age_days ?? 0);
   const now = Date.now();
+  // 自动纠偏：自动归档的号若缓存数据显示仍有未到期额度（建号超期规则历史上不
+  // 看额度导致的误归档，如领到 Trust Build 的号）→ 自动取消归档并立即回轮
+  const recovered = [];
+  for (const id of [...autoArchivedIds]) {
+    if (!archivedIds.has(id)) { autoArchivedIds.delete(id); continue; }
+    if (hasFutureQuota(id)) {
+      archivedIds.delete(id);
+      autoArchivedIds.delete(id);
+      recovered.push(id);
+      // 与手动取消归档同路径：立即安排额度刷新，领取冷却清零尽快接续
+      pokeAccount(id);
+      delete autoClaimCooldown[id];
+    }
+  }
+  if (recovered.length) {
+    saveArchived();
+    saveAutoArchived();
+    saveClaimCooldown();
+    const names = recovered.map((id) => accountName(id)).slice(0, 3).join(t("common.listSep"));
+    toast(t("m.autoUnarchivedToast", { n: recovered.length }), "ok",
+      t("m.autoUnarchivedDetail", { names }));
+  }
   let tracking = false;
   for (const a of state?.accounts || []) {
     if (isArchived(a.id)) { if (deadSince[a.id]) { delete deadSince[a.id]; tracking = true; } continue; }
@@ -4568,15 +4622,25 @@ function autoArchiveTick() {
     if (isFrozen(a.id)) continue;
     if (ageD > 0) {
       const created = Date.parse(String(a.created_at || "").replace(" ", "T"));
-      if (isFinite(created) && now - created >= ageD * 86_400e3) { hits.push([a.id, "age"]); continue; }
+      if (isFinite(created) && now - created >= ageD * 86_400e3) {
+        // 建号超期但仍有未到期额度（如刚领到的大额礼包）→ 延迟归档：每 tick 重查，
+        // 额度耗尽/过期后自然满足 noFutureQuota 归档（修复：挂着 1 亿未到期
+        // Trust Build 的号被建号超期规则无视额度直接归档）
+        if (noFutureQuota(a.id)) hits.push([a.id, "age"]);
+        continue;
+      }
     }
     if (deadH > 0 && deadSince[a.id] && now - deadSince[a.id] >= deadH * 3_600e3) {
       hits.push([a.id, "dead"]);
     }
   }
   if (!hits.length) return;
-  for (const [id] of hits) archivedIds.add(id);
+  for (const [id] of hits) {
+    archivedIds.add(id);
+    autoArchivedIds.add(id); // 来源标记：自动归档才参与「有效额度自动取消归档」纠偏
+  }
   saveArchived();
+  saveAutoArchived();
   const names = hits.map(([id]) => accountName(id)).slice(0, 3).join(t("common.listSep"));
   toast(t("m.autoArchivedToast", { n: hits.length }), "ok",
     t("m.autoArchivedDetail", { names }) + t("m.autoArchivedHint"));

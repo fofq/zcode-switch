@@ -185,6 +185,8 @@ export const en = {
   "m.unarchivedDetail": "Account rejoins auto refresh and claim rounds",
   "m.autoArchivedToast": "{n} accounts auto-archived",
   "m.autoArchivedDetail": "Matched auto-archive rules: {names}",
+  "m.autoUnarchivedToast": "Live quota detected — {n} accounts auto-unarchived",
+  "m.autoUnarchivedDetail": "Back in rotation: {names}",
   "m.autoArchivedHint": " (rules configurable in Settings; manual refresh/claim still available)",
 "grp.health.ok": "Quota available",
   "grp.health.low": "Quota low",
