@@ -149,6 +149,42 @@ let claimNotBefore = (() => {
 function saveClaimNotBefore() {
   try { localStorage.setItem("zsw-claim-notbefore-v1", JSON.stringify(claimNotBefore)); } catch {}
 }
+// 1004 资格判定缓存：preview 把营销计划列给不在当期群体的号，资格只在 claim 时
+// 揭晓（1004 no permission）。实测计划期内 1004 从未转化成功，但上游文案是 "yet"，
+// 不能排除期内后移开窗——所以三重保守：①同号同计划吃到第二次 1004 才标记（单发
+// 抖动免疫，seen 为内存态重启即清）②全标记的号每 24h 仍低频重探一次（见自动轮）
+// ③TTL 只有 2 天（计划有效期本身 1-2 天）。键 `${accountId}|${planId}`
+let claimNotEligible = {};
+const CLAIM_NOT_ELIGIBLE_KEY = "zsw-claim-noteligible-v1";
+const CLAIM_1004_SEEN_TTL = 2 * 86400e3;
+function loadClaimNotEligible() {
+  try {
+    const raw = JSON.parse(localStorage.getItem(CLAIM_NOT_ELIGIBLE_KEY) || "{}");
+    const now = Date.now();
+    for (const [k, v] of Object.entries(raw)) if (now - (v || 0) > CLAIM_1004_SEEN_TTL) delete raw[k];
+    claimNotEligible = raw;
+  } catch { claimNotEligible = {}; }
+}
+loadClaimNotEligible();
+function saveClaimNotEligible() {
+  try { localStorage.setItem(CLAIM_NOT_ELIGIBLE_KEY, JSON.stringify(claimNotEligible)); } catch {}
+}
+let claim1004Seen = {}; // 第一次 1004 的记录（内存）：第二次才升级为标记
+function isClaimNotEligible(accountId, planId) {
+  return planId != null && claimNotEligible[`${accountId}|${planId}`] != null;
+}
+function markClaimNotEligible(accountId, planId) {
+  if (!accountId || planId == null) return;
+  claimNotEligible[`${accountId}|${planId}`] = Date.now();
+  saveClaimNotEligible();
+}
+function claimablePlansOf(id) {
+  return (claimable[id]?.plans || []).filter((p) => !isClaimNotEligible(id, p.plan_id));
+}
+// 本次尝试的 plan 关联：claim://result 失败载荷不含 planId，用发起时的记录回填标记
+let claimAttemptPlan = {};
+// 全 1004 标记账号的最近一次低频重探时刻（每 24h 一次，防期内后移开窗漏领）
+let claimReprobeAt = {};
 // 切号/入库后统一入口：清冷却 + 稍后 tick（轮次忙则下个 tick 以 T0 优先接续）。
 // deferred=true（仅入库调用点）：不立即 urgent，改设首领延迟
 function armClaimCheck(id, deferred = false) {
@@ -2893,9 +2929,13 @@ const actions = {
     // 一键领取批处理与资格刷新仍互斥
     if (claimAllRunning) { toast(t("m.claimBusy"), "warn"); return; }
     if (claimActive && !autoClaimRunning) return;
-    const plans = claimable[id]?.plans || [];
-    const plan = plans[0];
-    if (!plan) { toast(t("m.noClaimable"), "warn"); return; }
+    const plan = claimablePlansOf(id)[0];
+    if (!plan) {
+      // 有报价但全部计划已被上游判不符合本期资格（1004 终局判定）
+      toast((claimable[id]?.plans || []).length ? t("m.claimNotEligible") : t("m.noClaimable"), "warn");
+      return;
+    }
+    claimAttemptPlan[id] = plan.plan_id;
     const preemptRound = autoClaimRunning;
     if (preemptRound) {
       await preemptAutoClaim();
@@ -2929,12 +2969,15 @@ const actions = {
   },
 
   async claimAll() {
-    // 批处理进行中：再点一次 = 停止（当前账号完成后收尾）
+    // 批处理进行中：再点一次 = 立即停止（关验证码窗 + 唤醒在途等待，不等 120s 超时）
     if (claimAllState.running) {
       claimAllAbort = true;
+      await invoke("claim_cancel").catch(() => {});
+      if (claimWaiter && claimWaiter.finish) claimWaiter.finish({ ok: false, code: "aborted", message: "用户停止" });
       toast(t("m.claimAllStopping"), "warn");
       return;
     }
+    if (Date.now() < claimPauseUntil) { toast(t("m.claimFleetPaused"), "warn"); return; }
     const ids = accountsNewFirst(
       (state?.accounts || [])
         .map((a) => a.id)
@@ -2957,10 +3000,14 @@ const actions = {
     try {
       for (let i = 0; i < ids.length; i++) {
         if (claimAllAbort) { stopped = true; break; }
+        // 车队熔断生效中（B3 升级）：停止批处理——继续只会加重出口 IP 画像
+        if (Date.now() < claimPauseUntil) { stopped = true; break; }
         const id = ids[i];
         claimAllState.done = i;
         if (!isTyping()) render();
-        const plan = claimable[id].plans[0];
+        const plan = claimablePlansOf(id)[0];
+        if (!plan) continue; // 全部计划已被判不符合本期资格（1004），静默出列
+        claimAttemptPlan[id] = plan.plan_id;
         const name = state.accounts.find((a) => a.id === id)?.name || id;
         try {
           await invoke("claim_start", { id, planId: plan.plan_id });
@@ -2988,9 +3035,13 @@ const actions = {
           continue;
         }
         if (r.ok === false) {
+          // 用户停止（claimAll 中断）：不进冷却、不记失败，直接收尾
+          if (r.code === "aborted") { stopped = true; break; }
           // 单账号失败 ≠ 其他账号也会失败：该号进入冷却（风控信号则冻结数小时），
-          // 批次继续但降速
-          autoClaimCooldown[id] = Math.max(autoClaimCooldown[id] ?? 0, autoClaimCooldownFor(r));
+          // 批次继续但降速。1004 已标记计划（资格终局），无需再冷却账号
+          if (r.code !== 1004) {
+            autoClaimCooldown[id] = Math.max(autoClaimCooldown[id] ?? 0, autoClaimCooldownFor(r));
+          }
           if (claimFailureRisk(r)) {
             // 同自动轮（G7 残余补全）：claim://result 的 noteClaimRisk 刚写入的顺延停靠不得被固定 3h 覆盖
             autoClaimCooldown[id] = Math.max(autoClaimCooldown[id] ?? 0,
@@ -3008,8 +3059,9 @@ const actions = {
           continue;
         }
         pokeAccount(id);
+        // 弹性节奏：8-15s 随机间隔；风控失败后 5min 内 ×2.5（与自动轮同哲学）
         if (i < ids.length - 1) await new Promise((res) => setTimeout(res,
-          (1200 + Math.random() * 1200) * (Date.now() < autoClaimSlowUntil ? 2.5 : 1)));
+          (8000 + Math.random() * 7000) * (Date.now() < autoClaimSlowUntil ? 2.5 : 1)));
       }
     } finally {
       const done = claimAllState.done;
@@ -3317,7 +3369,7 @@ async function autoClaimTick() {
       .filter((id) => !isArchived(id) && (autoClaimCooldown[id] ?? 0) <= Date.now()),
   ).sort((x, y) => claimTierOf(x) - claimTierOf(y)).slice(0, AUTO_CLAIM_ROUND_CAP);
   if (!ids.length) {
-    if ((state.accounts || []).some((a) => !isArchived(a.id) && (claimable[a.id]?.plans || []).length > 0)) {
+    if ((state.accounts || []).some((a) => !isArchived(a.id) && claimablePlansOf(a.id).length > 0)) {
       lastAutoRound = { at: Date.now(), claimed: 0, skipped: 0, cooldownAll: true };
     }
     return;
@@ -3366,8 +3418,17 @@ async function autoClaimTick() {
         if (autoAbortRequested || autoClaimPaused) break;
         attempts++;
         progressed = false;
-        const plan = claimable[id]?.plans?.[0];
-        if (!plan) break;
+        let plan = claimablePlansOf(id)[0];
+        if (!plan) {
+          // 全部计划已 1004 标记 ≠ 绝对终局（上游文案是 "yet"，资格可能期内
+          // 后移开窗）：每 24h 低频重探一次第一个已标记计划，防漏开后窗
+          const all = claimable[id]?.plans || [];
+          if (!all.length) break;
+          if (Date.now() - (claimReprobeAt[id] || 0) < 24 * 3600e3) break;
+          claimReprobeAt[id] = Date.now();
+          plan = all[0];
+        }
+        claimAttemptPlan[id] = plan.plan_id;
         // 每日领取总量自律：今日自动轮 claim_start 已达上限 → 本轮不再发起领取
         //（toast 每日一次）；报价未领期间一直挂在 preview 不会丢单，跨日重置后接续
         if (claimDayCapReached()) { claimDayCapToastOnce(); break; }
@@ -3918,7 +3979,7 @@ function patchProgressDom() {
         ${ic("refresh", 17)}${refreshAllBadge()}
       </button>`);
   }
-  const claimableCount = (state?.accounts || []).filter((a) => !isArchived(a.id) && (claimable[a.id]?.plans || []).length > 0).length;
+  const claimableCount = (state?.accounts || []).filter((a) => !isArchived(a.id) && claimablePlansOf(a.id).length > 0).length;
   if (claimableCount > 0 || claimAllState.running) {
     replace("[data-gift-btn]", giftBtnHtml(claimableCount));
   }
@@ -4255,7 +4316,7 @@ function render(force = false) {
           ? `<div class="card-grid">${pinActiveFirst(visible).map((a, i) => cardRowHtml(a, i + 1)).join("")}</div>`
           : pinActiveFirst(visible).map((a, i) => rowHtml(a, i + 1)).join("");
 
-  const claimableCount = s.accounts.filter((a) => !isArchived(a.id) && (claimable[a.id]?.plans || []).length > 0).length;
+  const claimableCount = s.accounts.filter((a) => !isArchived(a.id) && claimablePlansOf(a.id).length > 0).length;
 
   $app.innerHTML = `
     <header class="topbar">
@@ -4370,8 +4431,17 @@ listen("tray-action", (ev) => {
 
 listen("claim://result", (ev) => {
   const p = ev.payload || {};
+  const attemptPlan = claimAttemptPlan[p.accountId];
+  delete claimAttemptPlan[p.accountId];
   if (claimWaiter && claimWaiter.accountId === p.accountId) claimWaiter.finish(p);
   if (p.ok === false) {
+    // 1004 no permission = 上游资格判定（非风控、非临时限流）：第一次只记录，
+    // 同号同计划第二次才标记（防单发误判）；标记后自动轮跳过但保留 24h 重探
+    if (p.code === 1004 && attemptPlan != null) {
+      const key = `${p.accountId}|${attemptPlan}`;
+      if (claim1004Seen[key] != null) { markClaimNotEligible(p.accountId, attemptPlan); delete claim1004Seen[key]; }
+      else claim1004Seen[key] = Date.now();
+    }
     let msg = p.message || t("m.unknownErr");
     if (p.code === 1005 && p.nextAt) {
       msg += t("m.claimNextAt", { time: new Date(p.nextAt).toLocaleString(localeTag(), { hour12: false }) });
