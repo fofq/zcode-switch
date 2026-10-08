@@ -180,7 +180,7 @@ export const en = {
   "m.frozenUpgradeDetail": "User-decided parking is never bypassed by auto-unfreeze (probe/exhausted); click the freeze button again to unfreeze",
   "m.tagRiskTitle": "Risk-auto-frozen: the system froze this account after claim requests triggered risk control; it unfreezes automatically once a recovery probe passes. Click the freeze button to make it manual",
   "m.tagDockTitle": "Manually frozen and docked: excluded from auto-switching and the auto-claim cadence; recovers on a successful submit or manual unfreeze",
-  "m.tagNewTitle": "Newly enrolled (created <24h): new-account grants usually land within hours; persistent no-quota usually means the account isn't in the current campaign population or activation was blocked — refresh manually or check the claim log. No-quota accounts enter the exhaustion clock after 24h and auto-archive when the rule is on",
+  "m.tagNewTitle": "Newly enrolled (created <12h): new-account grants are issued at enrollment (observed seconds-to-hours to land); no quota after 12h almost certainly means the account isn't in the current campaign population — refresh manually or check the claim log. No-quota accounts enter the exhaustion clock after 12h and auto-archive when the rule is on",
   "m.tagNewNoEligibleTitle": "Upstream 1004 verdict: this campaign plan does not cover this account's population (not a risk-control block; the account is healthy). Re-probed once every 24h in case the window opens later in the period",
   "m.tagNewRiskTitle": "New account's claim path hit risk control (405): auto-frozen; claim re-probe slowed to once per 24h (protects the fleet breaker and IP heat). Quota-refresh-based auto-unfreeze is unaffected",
   "m.archivedToast": "{name} archived",

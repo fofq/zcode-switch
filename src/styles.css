@@ -1533,7 +1533,7 @@ select.two-input { cursor: pointer; }
   padding: 0 4px;
   flex: none;
 }
-/* 新入库标记：建号 24h 内（诊断信号——新入库却始终无额度多为不在当期活动人群/被拦） */
+/* 新入库标记：建号 12h 内（入库即发放实测秒级~3h；12h 仍无额度基本坐实非当期人群/被拦） */
 .tag-new {
   font-family: var(--mono);
   font-size: 11.5px;

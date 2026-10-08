@@ -109,13 +109,16 @@ function markClaimedPlan(id, planName, planId) {
   led[fam] = planId;
   saveClaimLedger();
 }
-// 分层：0=当前账号 1=新号(<24h)/GlobalBuild未证词 2=有额度 3=其余(含用尽)。
+// 分层：0=当前账号 1=新号(<12h)/GlobalBuild未证词 2=有额度 3=其余(含用尽)。
 // 有额度与否跟资格无关（满额老号也不可见），但决定请求预算的先后
-const CLAIM_NEW_MS = 24 * 3600e3;
-/** 新入库：建号 24h 内（与领取分层的新号口径一致；10-08 由 48h 收紧——新号权益
- *  实测数小时内到账，24h 仍无额度基本坐实「非当期人群/被拦」，继续留快检层只会
- *  白烧领取端点预算并给风控号喂复测信号）。新入库且风控的号不出列（见 claimTierOf），
- *  无额度的号 24h 后进入耗尽时钟射程，按规则自动归档 */
+const CLAIM_NEW_MS = 12 * 3600e3;
+/** 新入库：建号 12h 内（与领取分层的新号口径一致；10-08 由 48h→24h→12h 逐步收紧——
+ *  入库即发放实测 13s~3h（#148 建号 16:58:00 快照 16:58:13 已带 Start Plan，preview 恒
+ *  plans=0 证实走 billing 定向发放非领取链路），非人群号 36h+ 仍无额度且 1004 为终局
+ *  判定（期内零转化）。窗口只保每日营销开窗（Global Build 09:00 / Trust Build 00:00）
+ *  的快检覆盖：12h 保证任何建号时刻都留到次日 11:59 前（晚建 23:59 也覆盖 09:00 窗）；
+ *  8h 会让 16:00 后建的号错过 00:00 窗、23:xx 建的号错过 09:00 窗——故选 12h 不选 8h。
+ *  窗口外的无额度号进耗尽时钟射程（12h+72h≈4d 归档），领取快检降 30min→4h 退避档 */
 function isNewEnrolled(a) {
   const c = Date.parse(String(a?.created_at || "").replace(" ", "T"));
   return Number.isFinite(c) && Date.now() - c < CLAIM_NEW_MS;
@@ -133,7 +136,7 @@ function accountCreatedTs(id) {
 const isNewAccount = (id) => { const c = accountCreatedTs(id); return !!c && Date.now() - c < CLAIM_NEW_MS; };
 function claimTierOf(id) {
   if (id === state?.active_account_id) return 0;
-  // 风控新号（<24h 且已吃 405 信号）不出快检层：已知风控号的复测只喂 WAF IP 热度
+  // 风控新号（<12h 且已吃 405 信号）不出快检层：已知风控号的复测只喂 WAF IP 热度
   // 与熔断 distinct 计数（热窗口里凑数触发全车队 2-24h 暂停，挤掉健康新号的礼包窗），
   // 且其领取冷却已按 24h 节律降频（noteClaimRisk riskBase）——降 T3 快检 30min 档，
   // 恢复判定走额度刷新面（b/c 证据机），不依赖领取快检
@@ -3194,7 +3197,7 @@ function claimFailureRisk(r) {
  *  对无额度号同样成立（防抖与解冻出路见 noteFrozenQuotaSeen 注释）。 */
 function noteClaimRisk(id) {
   const now = Date.now();
-  // 风控新号（<24h）复测降为一天一次（24h 基底）：已知风控号的复测只喂 WAF IP 热度
+  // 风控新号（<12h）复测降为一天一次（24h 基底）：已知风控号的复测只喂 WAF IP 热度
   // 与熔断 distinct 计数（凑满 2h 窗 3 distinct 即全车队暂停 2-24h，健康新号错礼包窗）；
   // 老号维持 3h±50% 原节律（解冻证据机 b/c 走额度刷新面，两条路径互不影响）
   const riskBase = isNewAccount(id) ? 24 * 3600e3 : 3 * 60 * 60 * 1000;
@@ -4706,8 +4709,9 @@ function autoArchiveTick() {
     // 是 noFutureQuota，有未到期额度的号本就不会满足，冻结只是「停泊」不阻止退役。
     // 注意：冻结前积累的 deadSince 保留不清（上方只清归档号），解冻/归档互不重置。
     if (a.is_active) continue;
-    // 新入库宽限（建号 24h 内，与 CLAIM_NEW_MS 同口径）：权益数小时内到账，这是要
-    // 「看见」的诊断态（新入库 tag），不是耗尽；这类号由建号超期/耗尽时钟规则兜底
+    // 新入库宽限（建号 12h 内，与 CLAIM_NEW_MS 同口径）：入库即发放的权益秒级~数小时
+    // 到账（#148 实测 13s），这是要「看见」的诊断态（新入库 tag），不是耗尽；
+    // 12h 后仍无额度的号基本坐实非当期人群，由建号超期/耗尽时钟规则兜底
     const createdTs = Date.parse(String(a.created_at || "").replace(" ", "T"));
     if (Number.isFinite(createdTs) && now - createdTs < CLAIM_NEW_MS) continue;
     if (noFutureQuota(a.id)) {
