@@ -4666,11 +4666,10 @@ function autoArchiveTick() {
   for (const a of state?.accounts || []) {
     if (isArchived(a.id)) { if (deadSince[a.id]) { delete deadSince[a.id]; tracking = true; } continue; }
     if (deadH <= 0) break; // deadSince 只为耗尽规则服务
-    // 在用号与冻结号（手动=用户拍板、自动=风控停靠）不自动归档：语义都是可恢复的
-    // 探测，不是退役；自动冻结号的出路由 b/c) 证据机与提交成功探测裁决。
-    // 注意：冻结前积累的 deadSince 保留不清（上方只清归档号），c) 解冻后若 deadH
-    // 已满，号会在当轮 autoArchiveTick 被归档——解冻即恢复归档射程
-    if (a.is_active || isFrozen(a.id)) continue;
+    // 在用号不追踪；冻结号（手动停靠/风控停靠）同样纳入耗尽追踪——归档判定核心
+    // 是 noFutureQuota，有未到期额度的号本就不会满足，冻结只是「停泊」不阻止退役。
+    // 注意：冻结前积累的 deadSince 保留不清（上方只清归档号），解冻/归档互不重置。
+    if (a.is_active) continue;
     // 新入库宽限（建号 48h 内）：套餐可能尚未发放或激活被拦——这是要「看见」的
     // 诊断态（新入库 tag），不是耗尽；这类号由建号超期规则兜底
     const createdTs = Date.parse(String(a.created_at || "").replace(" ", "T"));
@@ -4689,7 +4688,9 @@ function autoArchiveTick() {
   const hits = [];
   for (const a of state?.accounts || []) {
     if (isArchived(a.id) || a.is_active) continue;
-    if (isFrozen(a.id)) continue;
+    // 冻结号（停靠/风控）不再豁免：两条规则各自自带额度保护——超期规则需
+    // noFutureQuota、耗尽规则需 deadSince 时钟（该时钟只在 noFutureQuota 时累加），
+    // 有未到期额度的号两条都天然不命中，不会误退役
     if (ageD > 0) {
       const created = Date.parse(String(a.created_at || "").replace(" ", "T"));
       if (isFinite(created) && now - created >= ageD * 86_400e3) {
