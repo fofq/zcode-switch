@@ -1533,7 +1533,7 @@ select.two-input { cursor: pointer; }
   padding: 0 4px;
   flex: none;
 }
-/* 新入库标记：建号 48h 内（诊断信号——新入库却始终无额度可能是激活/风控被拦） */
+/* 新入库标记：建号 24h 内（诊断信号——新入库却始终无额度多为不在当期活动人群/被拦） */
 .tag-new {
   font-family: var(--mono);
   font-size: 11.5px;
@@ -1544,6 +1544,10 @@ select.two-input { cursor: pointer; }
   padding: 0 4px;
   flex: none;
 }
+/* 新入库·无资格：上游 1004 资格判定（非风控，号健康）——中性灰 */
+.tag-new.noelig { color: var(--ink-dim); border-color: var(--hairline); }
+/* 新入库·疑风控：领取链路 405 坐实——与 风控 tag 同色的警示 */
+.tag-new.risk { color: var(--amber); border-color: var(--amber-deep); }
 .row.archived:not(.active) .rn-text, .card.archived:not(.active) .rn-text { opacity: .55; }
 .row.archived:not(.active) .row-meta, .card.archived:not(.active) .row-meta { opacity: .7; }
 

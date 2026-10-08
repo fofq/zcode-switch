@@ -109,11 +109,13 @@ function markClaimedPlan(id, planName, planId) {
   led[fam] = planId;
   saveClaimLedger();
 }
-// 分层：0=当前账号 1=新号(<48h)/GlobalBuild未证词 2=有额度 3=其余(含用尽)。
+// 分层：0=当前账号 1=新号(<24h)/GlobalBuild未证词 2=有额度 3=其余(含用尽)。
 // 有额度与否跟资格无关（满额老号也不可见），但决定请求预算的先后
-const CLAIM_NEW_MS = 48 * 3600e3;
-/** 新入库：建号 48h 内（与领取分层的新号口径一致）。新入库却始终无额度/停留在
- *  待激活，多半是激活或领取风控被拦——行内「新入库」tag 是给用户的目视诊断信号 */
+const CLAIM_NEW_MS = 24 * 3600e3;
+/** 新入库：建号 24h 内（与领取分层的新号口径一致；10-08 由 48h 收紧——新号权益
+ *  实测数小时内到账，24h 仍无额度基本坐实「非当期人群/被拦」，继续留快检层只会
+ *  白烧领取端点预算并给风控号喂复测信号）。新入库且风控的号不出列（见 claimTierOf），
+ *  无额度的号 24h 后进入耗尽时钟射程，按规则自动归档 */
 function isNewEnrolled(a) {
   const c = Date.parse(String(a?.created_at || "").replace(" ", "T"));
   return Number.isFinite(c) && Date.now() - c < CLAIM_NEW_MS;
@@ -121,8 +123,21 @@ function isNewEnrolled(a) {
 const CLAIM_T0_POLL_MS = 12 * 60e3;
 const CLAIM_T1_CAP_MS = 30 * 60e3;
 const CLAIM_T2_CAP_MS = 2 * 3600e3;
+/** 建号时间戳（未知=0）：领取分层/新入库判定/风控复测节律共用 */
+function accountCreatedTs(id) {
+  const a = (state?.accounts || []).find((x) => x.id === id);
+  const c = Date.parse(String(a?.created_at || "").replace(" ", "T"));
+  return Number.isFinite(c) ? c : 0;
+}
+/** 新入库口径（< CLAIM_NEW_MS） */
+const isNewAccount = (id) => { const c = accountCreatedTs(id); return !!c && Date.now() - c < CLAIM_NEW_MS; };
 function claimTierOf(id) {
   if (id === state?.active_account_id) return 0;
+  // 风控新号（<24h 且已吃 405 信号）不出快检层：已知风控号的复测只喂 WAF IP 热度
+  // 与熔断 distinct 计数（热窗口里凑数触发全车队 2-24h 暂停，挤掉健康新号的礼包窗），
+  // 且其领取冷却已按 24h 节律降频（noteClaimRisk riskBase）——降 T3 快检 30min 档，
+  // 恢复判定走额度刷新面（b/c 证据机），不依赖领取快检
+  if (autoFrozenAt[id] && isNewAccount(id)) return 3;
   const a = (state?.accounts || []).find((x) => x.id === id);
   const created = Date.parse(String(a?.created_at || "").replace(" ", "T")) || 0;
   if (created && Date.now() - created < CLAIM_NEW_MS) return 1;
@@ -173,6 +188,8 @@ let claim1004Seen = {}; // 第一次 1004 的记录（内存）：第二次才�
 function isClaimNotEligible(accountId, planId) {
   return planId != null && claimNotEligible[`${accountId}|${planId}`] != null;
 }
+/** 该号是否有任何计划的 1004 无资格标记：「新入库·无资格」tag 档判定 */
+const hasClaimNotEligible = (id) => Object.keys(claimNotEligible).some((k) => k.startsWith(id + "|"));
 function markClaimNotEligible(accountId, planId) {
   if (!accountId || planId == null) return;
   claimNotEligible[`${accountId}|${planId}`] = Date.now();
@@ -3177,6 +3194,10 @@ function claimFailureRisk(r) {
  *  对无额度号同样成立（防抖与解冻出路见 noteFrozenQuotaSeen 注释）。 */
 function noteClaimRisk(id) {
   const now = Date.now();
+  // 风控新号（<24h）复测降为一天一次（24h 基底）：已知风控号的复测只喂 WAF IP 热度
+  // 与熔断 distinct 计数（凑满 2h 窗 3 distinct 即全车队暂停 2-24h，健康新号错礼包窗）；
+  // 老号维持 3h±50% 原节律（解冻证据机 b/c 走额度刷新面，两条路径互不影响）
+  const riskBase = isNewAccount(id) ? 24 * 3600e3 : 3 * 60 * 60 * 1000;
   // 全局熔断统一在此喂给：本函数全部调用点都经 riskInText/claimFailureRisk 门禁
   // （手动查询/单领/claimAll/自动轮/claim://result），三分支都是已确认的真实撞墙
   // ——手动来源的撞墙同样加固 IP 画像、预示自动轮即将撞墙（「同轨」未竟部分）；
@@ -3201,7 +3222,7 @@ function noteClaimRisk(id) {
   // 不记 streak——b/c) 证据机不盘点手动冻结，streak 只是它的观测计数
   if (isFrozen(id) && !autoFrozenAt[id]) {
     autoClaimCooldown[id] = Math.max(autoClaimCooldown[id] ?? 0,
-      now + autoClaimGap(3 * 60 * 60 * 1000));
+      now + autoClaimGap(riskBase));
     saveClaimCooldown();
     // 撞墙顺延的可观测反馈（现象二暴露面）：与「已自动冻结/风控解除」toast 同风格。
     // 参数只读刚写入的冷却值（恒为数），accountName/localeTag/t 均安全调用不抛异常，
@@ -3213,15 +3234,15 @@ function noteClaimRisk(id) {
   if ((autoRiskLastAt[id] ?? 0) < now - 24 * 3600e3) autoRiskStreak[id] = 0;
   autoRiskLastAt[id] = now;
   autoRiskStreak[id] = (autoRiskStreak[id] || 0) + 1;
-  if (autoFrozenAt[id]) { // 顺延停靠：只延长不缩短——本函数自身写入恒 ≤4.5h，外来更长退避（1005 nextAt/失败翻倍）原样保留，不被风控信号压短
+  if (autoFrozenAt[id]) { // 顺延停靠：只延长不缩短——本函数自身写入恒 ≤36h（风控新号 24h 基底 / 老号 3h±50%），外来更长退避（1005 nextAt/失败翻倍）原样保留，不被风控信号压短
     autoClaimCooldown[id] = Math.max(autoClaimCooldown[id] ?? 0,
-      now + autoClaimGap(3 * 60 * 60 * 1000));
+      now + autoClaimGap(riskBase));
     saveClaimCooldown();
     return;
   }
   frozenIds.add(id);
   autoFrozenAt[id] = now;
-  autoClaimCooldown[id] = now + autoClaimGap(3 * 60 * 60 * 1000);
+  autoClaimCooldown[id] = now + autoClaimGap(riskBase);
   saveFrozen(); saveAutoFrozen(); saveClaimCooldown();
   toast(t("m.autoFrozenToast", { name: accountName(id) }), "warn", t("m.autoFrozenDetail"));
   render();
@@ -3517,7 +3538,9 @@ async function autoClaimTick() {
           // 资格规则若变，级联/安全网仍会重新覆盖到它
           const a = (state?.accounts || []).find((x) => x.id === id);
           const created = Date.parse(String(a?.created_at || "").replace(" ", "T")) || 0;
-          const isNew = created && Date.now() - created < CLAIM_NEW_MS;
+          // 风控新号（autoFrozenAt）允许空手证词降级——与 claimTierOf 的 T3 出列一致；
+          // 非风控新号保留豁免（礼包随时可能发放，不可提前证词化）
+          const isNew = created && Date.now() - created < CLAIM_NEW_MS && !autoFrozenAt[id];
           if (id !== state?.active_account_id && !isNew && !claimLedger[id]?.global) {
             claimLedger[id] = { ...(claimLedger[id] || {}), globalEmpty: Date.now() };
             saveClaimLedger();
@@ -3644,6 +3667,19 @@ function tierChipHtml(tier, code) {
 function giftBadgeFor(id) {
   const h = healthMapOf().get(id);
   return h?.hasGift ? `<span class="gift-badge" title="${esc(healthLabel("gift"))}">${ic("gift", 12)}</span>` : "";
+}
+
+/** 「新入库」分档标记：疑风控（红，吸收 风控 tag）/ 无资格（灰，上游 1004 判定）/
+ *  中性（默认）。风控坐实的号不再显示中性「新入库」——它已不是诊断态 */
+function newTagHtml(a) {
+  if (!isNewEnrolled(a)) return "";
+  if (autoFrozenAt[a.id]) {
+    return `<span class="tag-new risk" title="${esc(t("m.tagNewRiskTitle"))}">${t("list.newTagRisk")}</span>`;
+  }
+  if (hasClaimNotEligible(a.id)) {
+    return `<span class="tag-new noelig" title="${esc(t("m.tagNewNoEligibleTitle"))}">${t("list.newTagNoElig")}</span>`;
+  }
+  return `<span class="tag-new" title="${esc(t("m.tagNewTitle"))}">${t("list.newTag")}</span>`;
 }
 
 function tierBadgeFor(id) {
@@ -4193,7 +4229,7 @@ function render(force = false) {
         ${healthDotHtml(h)}
         ${slim ? "" : `<span class="notch" style="background:${notchColor(a.id)}"></span>`}
         <div class="row-main"${ui.density === "compact" ? ` click="actions.toggleRow(event)" title="${esc(slim ? t("list.expandTitle") : t("list.collapseTitle"))}"` : ""}>
-          <div class="row-name">${ui.density === "compact" ? `<span class="row-chev${slim ? "" : " open"}">${ic("chevDown", 12)}</span>` : ""}${tierBadgeFor(a.id)}<span class="rn-text" title="${esc(displayName)} · ${t("btn.rename")}" click="actions.rename('${a.id}')">${giftBadgeFor(a.id)}${esc(displayName)}</span>${isNewEnrolled(a) ? `<span class="tag-new" title="${esc(t("m.tagNewTitle"))}">${t("list.newTag")}</span>` : ""}${isFrozen(a.id) && autoFrozenAt[a.id] ? `<span class="tag-risk" title="${esc(t("m.tagRiskTitle"))}">${t("list.riskTag")}</span>` : ""}${isFrozen(a.id) && !autoFrozenAt[a.id] ? `<span class="tag-dock" title="${esc(t("m.tagDockTitle"))}">${t("list.dockTag")}</span>` : ""}${isArchived(a.id) ? `<span class="tag-arch" title="${esc(t("m.archivedDetail"))}">${t("list.archivedTag")}</span>` : ""}${a.has_user_info === false ? `<span class="tag-relogin" title="${esc(t("btn.reloginTitle"))}">${t("btn.relogin")}</span>` : ""}${expSoon}</div>
+          <div class="row-name">${ui.density === "compact" ? `<span class="row-chev${slim ? "" : " open"}">${ic("chevDown", 12)}</span>` : ""}${tierBadgeFor(a.id)}<span class="rn-text" title="${esc(displayName)} · ${t("btn.rename")}" click="actions.rename('${a.id}')">${giftBadgeFor(a.id)}${esc(displayName)}</span>${newTagHtml(a)}${isFrozen(a.id) && autoFrozenAt[a.id] && !isNewEnrolled(a) ? `<span class="tag-risk" title="${esc(t("m.tagRiskTitle"))}">${t("list.riskTag")}</span>` : ""}${isFrozen(a.id) && !autoFrozenAt[a.id] ? `<span class="tag-dock" title="${esc(t("m.tagDockTitle"))}">${t("list.dockTag")}</span>` : ""}${isArchived(a.id) ? `<span class="tag-arch" title="${esc(t("m.archivedDetail"))}">${t("list.archivedTag")}</span>` : ""}${a.has_user_info === false ? `<span class="tag-relogin" title="${esc(t("btn.reloginTitle"))}">${t("btn.relogin")}</span>` : ""}${expSoon}</div>
           <div class="row-meta">${meta}</div>
         </div>
         <div class="row-info">${showChip ? quotaChipHtml(a.id, h) : ""}</div>
@@ -4271,7 +4307,7 @@ function render(force = false) {
       <span class="notch" style="background:${notchColor(a.id)}"></span>
       <div class="card-head">
         <div class="card-id">
-          <div class="row-name">${seq != null ? `<span class="card-seq" title="${esc(t("list.seqTitle"))}">${seq}</span>` : ""}${giftBadgeFor(a.id)}<span class="rn-text" title="${esc(displayName)} · ${t("btn.rename")}" click="actions.rename('${a.id}')">${esc(displayName)}</span>${isNewEnrolled(a) ? `<span class="tag-new" title="${esc(t("m.tagNewTitle"))}">${t("list.newTag")}</span>` : ""}${isFrozen(a.id) && autoFrozenAt[a.id] ? `<span class="tag-risk" title="${esc(t("m.tagRiskTitle"))}">${t("list.riskTag")}</span>` : ""}${isFrozen(a.id) && !autoFrozenAt[a.id] ? `<span class="tag-dock" title="${esc(t("m.tagDockTitle"))}">${t("list.dockTag")}</span>` : ""}${isArchived(a.id) ? `<span class="tag-arch" title="${esc(t("m.archivedDetail"))}">${t("list.archivedTag")}</span>` : ""}</div>
+          <div class="row-name">${seq != null ? `<span class="card-seq" title="${esc(t("list.seqTitle"))}">${seq}</span>` : ""}${giftBadgeFor(a.id)}<span class="rn-text" title="${esc(displayName)} · ${t("btn.rename")}" click="actions.rename('${a.id}')">${esc(displayName)}</span>${newTagHtml(a)}${isFrozen(a.id) && autoFrozenAt[a.id] && !isNewEnrolled(a) ? `<span class="tag-risk" title="${esc(t("m.tagRiskTitle"))}">${t("list.riskTag")}</span>` : ""}${isFrozen(a.id) && !autoFrozenAt[a.id] ? `<span class="tag-dock" title="${esc(t("m.tagDockTitle"))}">${t("list.dockTag")}</span>` : ""}${isArchived(a.id) ? `<span class="tag-arch" title="${esc(t("m.archivedDetail"))}">${t("list.archivedTag")}</span>` : ""}</div>
           <div class="row-meta">${meta}</div>
         </div>
         <span class="card-side">
@@ -4670,8 +4706,8 @@ function autoArchiveTick() {
     // 是 noFutureQuota，有未到期额度的号本就不会满足，冻结只是「停泊」不阻止退役。
     // 注意：冻结前积累的 deadSince 保留不清（上方只清归档号），解冻/归档互不重置。
     if (a.is_active) continue;
-    // 新入库宽限（建号 48h 内）：套餐可能尚未发放或激活被拦——这是要「看见」的
-    // 诊断态（新入库 tag），不是耗尽；这类号由建号超期规则兜底
+    // 新入库宽限（建号 24h 内，与 CLAIM_NEW_MS 同口径）：权益数小时内到账，这是要
+    // 「看见」的诊断态（新入库 tag），不是耗尽；这类号由建号超期/耗尽时钟规则兜底
     const createdTs = Date.parse(String(a.created_at || "").replace(" ", "T"));
     if (Number.isFinite(createdTs) && now - createdTs < CLAIM_NEW_MS) continue;
     if (noFutureQuota(a.id)) {
