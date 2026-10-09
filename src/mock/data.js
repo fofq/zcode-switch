@@ -45,6 +45,8 @@ function acct(id, name, opts = {}) {
     is_active: !!opts.active,
     has_config: opts.hasConfig !== false,
     has_user_info: opts.hasUserInfo !== false,
+    // mock 的 account_api_key 全部走本地假 key（零网络）→ 对齐「有本地 plan key」档
+    has_plan_key: opts.hasPlanKey !== false,
     identity: {
       provider: "zai",
       username: opts.username ?? name,

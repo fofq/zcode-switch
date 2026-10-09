@@ -53,6 +53,10 @@ struct PendingClaim {
 
 static PENDING_CLAIM: Mutex<Option<PendingClaim>> = Mutex::new(None);
 
+/// 全库复制 key 停止标志：cancel_all_keys 置位，all_account_api_keys 在下一个账号之前检查；
+/// 标志在「命令开始处」与「收工后」都清掉（与 mock 一致），防旧标志把下次运行秒停。
+static ALL_KEYS_CANCEL: AtomicBool = AtomicBool::new(false);
+
 fn pending_guard() -> std::sync::MutexGuard<'static, Option<PendingClaim>> {
     match PENDING_CLAIM.lock() {
         Ok(g) => g,
@@ -391,8 +395,30 @@ async fn two_api_test() -> twoapi::TestResult {
 }
 
 #[tauri::command]
-async fn all_account_api_keys() -> Result<Vec<store::AccountKeyLine>, String> {
-    store::all_account_api_keys(&Paths::detect())
+async fn all_account_api_keys(app: AppHandle) -> Result<store::AllKeysResult, String> {
+    // 命令开始处先复位取消标志（与 mock 语义一致，tauri-mock.js:219「命令开始处复位」）：
+    // cancel_all_keys 是无条件置位——用户恰在 sweep 收尾瞬间点停止时，cancel 会落在
+    // 上一条命令「收工清标志」之后，旧标志若带进下次运行，i=0 即被秒停（0 行 +
+    // cancelled:true，前端误报「未取到 key」）。开始处复位让残留标志只失效于本次
+    ALL_KEYS_CANCEL.store(false, Ordering::Relaxed);
+    // 无本地 plan key 的账号会现场铸 key（网络调用），必须放阻塞线程避免卡 UI；
+    // 每个账号处理完 emit 一次进度（all-keys-progress），取消走 ALL_KEYS_CANCEL 标志
+    let res = tauri::async_runtime::spawn_blocking(move || {
+        let emit = |p: &store::AllKeysProgress| { let _ = app.emit("all-keys-progress", p); };
+        store::all_account_api_keys(&Paths::detect(), &ALL_KEYS_CANCEL, Some(&emit))
+    })
+    .await
+    .map_err(|e| format!("内部任务失败: {e}"))??;
+    ALL_KEYS_CANCEL.store(false, Ordering::Relaxed); // 收工再清一遍，两次运行之间不留脏标志
+    Ok(res)
+}
+
+/// 停止进行中的全库复制 key：运行中的 sweep 在下一个账号之前退出，命令提前返回
+/// { lines（截断）， cancelled: true }。无副作用 —— 没在跑时置了标志也无妨：
+/// 下一次 all_account_api_keys 在「命令开始处」复位（与 mock 一致），不会被旧标志秒停
+#[tauri::command]
+async fn cancel_all_keys() {
+    ALL_KEYS_CANCEL.store(true, Ordering::Relaxed);
 }
 
 #[tauri::command]
@@ -1564,6 +1590,7 @@ pub fn run() {
             two_api_usage,
             two_api_test,
             all_account_api_keys,
+            cancel_all_keys,
             claim_preview,
             claim_refresh,
             claim_start,

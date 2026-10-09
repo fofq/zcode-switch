@@ -1587,6 +1587,7 @@ select.two-input { cursor: pointer; }
 }
 .bulk-bar .bulk-n { font-size: 13px; color: var(--amber); font-weight: 600; white-space: nowrap; }
 .bulk-bar .btn-ghost { height: 28px; padding: 0 10px; font-size: 13px; }
+.bulk-bar .btn-ghost.running { animation: tog-pulse 1.6s ease-in-out infinite; }
 .bulk-bar .btn-ghost.danger { border-color: var(--red-dim); color: var(--red); }
 .bulk-bar .btn-ghost.danger:hover { background: rgba(196, 118, 111, .12); }
 

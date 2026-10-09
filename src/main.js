@@ -357,6 +357,17 @@ async function copyText(text) {
 }
 
 let quotaSweep = { running: false, phase: "quota", eligibility: false, done: 0, total: 0, cancel: false };
+// 全局复制 key sweep（工具栏 copyall）：进度由后端 all-keys-progress 事件驱动；
+// 「再点停止」走 cancel_all_keys 命令——后端在下一个账号之前停掉并提前返回截断结果
+let keysSweep = { running: false, done: 0, total: 0 };
+// 批量条两个非破坏性按钮（刷新 / 复制 key）：只作用于选中集，状态独立、
+// 不与全库 quotaSweep 混用（批量刷新的账号可以含归档号）
+let bulkRefresh = { running: false, done: 0, total: 0, cancel: false };
+let bulkKeys = { running: false, done: 0, total: 0 };
+// 单号复制 key 在途（copyApiKey）：连点两下 = 两次并发铸造，同样计入互锁
+let keyCopyInFlight = false;
+let keysProgFrame = false; // all-keys-progress 合帧：本地 key 段无 sleep、事件成串，180 次连发 render 会卡
+
 // 顶部「刷新」按钮当前应显示的提示（资格阶段 / 额度阶段）
 function refreshAllTitle() {
   if (!quotaSweep.running) return t("btn.refreshAllTitle");
@@ -366,6 +377,20 @@ function refreshAllBadge() {
   if (!quotaSweep.running) return "";
   const n = quotaSweep.done;
   return n > 0 ? `<span class="tb-badge">${n}</span>` : "";
+}
+function keysSweepTitle() {
+  if (!keysSweep.running) return t("btn.copyAllKeys");
+  return t("list.copyAllRunning", { done: keysSweep.done, total: keysSweep.total });
+}
+function keysSweepBadge() {
+  if (!keysSweep.running) return "";
+  const n = keysSweep.done;
+  return n > 0 ? `<span class="tb-badge">${n}</span>` : "";
+}
+// 工具栏「复制全部 key」按钮：全量重建与 patchProgressDom 共用一份（progress-sig 变化走就地补丁）
+function copyallBtnHtml() {
+  return `<button class="icon-btn tb-btn tb-copyall${keysSweep.running ? " running" : ""}" data-copyall-btn click="actions.copyAllKeys()"
+      aria-label="${esc(keysSweepTitle())}" title="${esc(keysSweepTitle())}">${ic("copy", 17)}${keysSweepBadge()}</button>`;
 }
 
 // 低额度自动切换
@@ -1622,6 +1647,8 @@ function bulkBarHtml() {
     <span class="lh-sp"></span>
     <button class="btn-ghost has-ic" click="actions.doBulkFreeze(${allFrozen ? "false" : "true"})">${ic("snow", 13)} ${allFrozen ? t("list.bulkUnfreeze") : t("list.bulkFreeze")}</button>
     <button class="btn-ghost has-ic" click="actions.doBulkArchive(${allArchived ? "false" : "true"})">${ic("box", 13)} ${allArchived ? t("list.bulkUnarchive") : t("list.bulkArchive")}</button>
+    <button class="btn-ghost has-ic${bulkRefresh.running ? " running" : ""}" click="actions.doBulkRefresh()">${ic("refresh", 13)} ${bulkRefresh.running ? t("list.bulkRefreshRunning", { done: bulkRefresh.done, total: bulkRefresh.total }) : t("list.bulkRefresh")}</button>
+    <button class="btn-ghost has-ic${bulkKeys.running ? " running" : ""}" click="actions.doBulkCopyKeys()">${ic("copy", 13)} ${bulkKeys.running ? t("list.bulkCopyKeyRunning", { done: bulkKeys.done, total: bulkKeys.total }) : t("list.bulkCopyKey")}</button>
     <button class="btn-ghost danger has-ic" click="actions.askBulkDelete()">${ic("x", 13)} ${t("list.bulkDelete")}</button>
     <button class="btn-ghost" click="actions.clearSelection()">${t("list.clearSel")}</button>
   </div>`;
@@ -2166,12 +2193,15 @@ const actions = {
     });
   },
 
-  /** 刷新额度（纯额度扫描；领取资格刷新只属于自动领取轮，避免同窗口双倍请求）；再点一次 = 停止 */
+  /** 刷新额度（纯额度扫描；领取资格刷新只属于自动领取轮，避免同窗口双倍请求）；再点一次 = 停止。
+   *  与批量刷新互锁：两条 1.2s±40% 的 quota 流并发时到达速率翻倍（busy 20s 只去
+   *  重同号，不限量），批量刷新运行中拒启动全库 */
   async refreshAll() {
     if (quotaSweep.running) {
       quotaSweep.cancel = true;
       return;
     }
+    if (bulkRefresh.running) { toast(t("list.sweepBulkRefreshBusy"), "warn"); return; }
     const ids = (state?.accounts || []).filter((a) => !isArchived(a.id)).map((a) => a.id);
     if (!ids.length) return;
     // 当前使用中的账号优先刷新：全库刷新一个周期很久，而决定“要不要切”的正是活跃账号
@@ -2215,6 +2245,87 @@ const actions = {
       if (!cancelled) sweepTick();
       if (state?.auto_switch) autoSwitchTick(true);
     }
+  },
+
+  /** 批量刷新选中集：节律与 refreshAll 完全一致（1.2s±40% quick）。
+   *  基于选择集，归档号天然包含——手动刷新本来就是归档号唯一的拉取来源
+   *  （刷新后不排自动重试）。与全库 refreshAll 互锁拒并发：两流各自的 1.2s±40%
+   *  叠加后配额端点到达速率翻倍，越出 WAF 标定节拍（busy 20s 保护窗只去重
+   *  同号，压不了量；refreshAll 排除归档号，选归档号批量时两流完全独立）。
+   *  再点一次 = 停止 */
+  async doBulkRefresh() {
+    const ids = selectedIds();
+    if (!ids.length) return;
+    if (bulkRefresh.running) { bulkRefresh.cancel = true; return; }
+    if (quotaSweep.running) { toast(t("list.bulkRefreshSweepBusy"), "warn"); return; }
+    bulkRefresh = { running: true, done: 0, total: ids.length, cancel: false };
+    render();
+    let cancelled = false;
+    try {
+      for (const id of ids) {
+        if (bulkRefresh.cancel) { cancelled = true; break; }
+        await loadAcctQuota(id, { quick: true });
+        bulkRefresh.done++;
+        if (!isTyping()) render();
+        await new Promise((r) => setTimeout(r, 1200 + Math.random() * 800));
+      }
+    } finally {
+      cancelled = cancelled || bulkRefresh.cancel;
+      const done = bulkRefresh.done;
+      bulkRefresh = { running: false, done: 0, total: 0, cancel: false };
+      // toast 复用全库刷新的结果键：停止 / 完成（批量场景无「恢复」统计，不带追加段）
+      if (cancelled) toast(t("list.toastSweepCancelled", { n: done }));
+      else toast(t("list.toastSweepDone", { n: done }));
+      render();
+    }
+  },
+
+  /** 批量复制选中集的 key：逐个 account_api_key（无本地 key 时后端现场铸造，
+   *  铸造失败回退 JWT 行带标记）。节奏分档——本地 key 账号该命令零网络，
+   *  300~500ms 小间隔纯节奏；无本地 key 的号每次 invoke 都是网络铸造，
+   *  必须落到 1.2s±40% 车队节拍（同 refreshAll / 全库 sweep 的铸造节奏），
+   *  按 state 里的 has_plan_key 逐号分档（口径与后端铸造分支一致）。
+   *  与全库 copyall 互锁：两条铸造流并发时实际铸造间隔会被压回 0.3s，
+   *  全库 sweep 运行中直接拒启动。全库请用工具栏的 copyall（带取消）。
+   *  小间隔场景不做在途取消：运行中再点直接忽略 */
+  async doBulkCopyKeys() {
+    const ids = selectedIds();
+    if (!ids.length) return;
+    if (bulkKeys.running) return;
+    if (keysSweep.running) { toast(t("list.bulkKeysSweepBusy"), "warn"); return; }
+    bulkKeys = { running: true, done: 0, total: ids.length };
+    const accOf = new Map((state?.accounts || []).map((a) => [a.id, a]));
+    const lines = [];
+    let jwt = 0, missing = 0;
+    try {
+      for (const id of ids) {
+        let r = null;
+        try { r = await invoke("account_api_key", { id }); } catch { r = null; }
+        const acc = accOf.get(id);
+        const name = acc?.name || id;
+        if (r?.apiKey) {
+          lines.push(r.kind === "jwt"
+            ? `${name}  ${r.apiKey}  ${t("list.apiKeyJwtTag")}`
+            : `${name}  ${r.apiKey}`);
+          if (r.kind === "jwt") jwt++;
+        } else missing++;
+        bulkKeys.done++;
+        render();
+        // 有本地 plan key = 该命令零网络，小间隔纯节奏；否则本次 invoke 已是
+        // 现场铸造（网络 POST biz），下一号必须等满铸造节拍。查不到的号按
+        // 无本地 key 从慢——宁可多等，不可连发铸造
+        await new Promise((r2) => setTimeout(r2, acc?.has_plan_key ? 300 + Math.random() * 200 : 1200 + Math.random() * 800));
+      }
+    } finally {
+      bulkKeys = { running: false, done: 0, total: 0 };
+    }
+    if (!lines.length) { toast(t("list.apiKeyNone"), "warn"); render(); return; }
+    const ok = await copyText(lines.join("\n"));
+    if (!ok) { toast(t("list.copyFail"), "err"); render(); return; }
+    toast(t("list.bulkKeysCopied", { n: lines.length })
+      + (jwt ? t("list.apiKeysCopiedJwt", { m: jwt }) : "")
+      + (missing ? t("list.bulkKeysMissing", { m: missing }) : ""));
+    render();
   },
 
   async delete(id) {
@@ -2728,6 +2839,10 @@ const actions = {
   },
 
   async copyApiKey(id) {
+    // 互锁：全库 sweep / 批量复制在飞时不再并发第 3 条铸造流（单号一次铸造
+    // 若插进两条 1.2s 节拍的间隙，连发特征就破了）；在途连点同样拦掉
+    if (keysSweep.running || bulkKeys.running || keyCopyInFlight) { toast(t("list.copyKeyBusy"), "warn"); return; }
+    keyCopyInFlight = true;
     try {
       const r = await invoke("account_api_key", { id });
       if (!r?.apiKey) { toast(t("list.apiKeyNone"), "warn"); return; }
@@ -2740,7 +2855,7 @@ const actions = {
       }
       if (await copyText(r.apiKey)) toast(`${t("list.apiKeyCopied")}（${r.label || "?"}）\n${t("list.apiKeyCopiedHint")}`);
       else toast(t("list.copyFail"), "err");
-    } catch (e) { toast(stripErr(e), "err"); }
+    } catch (e) { toast(stripErr(e), "err"); } finally { keyCopyInFlight = false; }
   },
 
   openTwoApi() { openTwoApiModal(); },
@@ -2809,16 +2924,43 @@ const actions = {
     }
   },
 
-  /** 一键复制所有账号的 API Key（名称 + key 逐行；JWT 兜底行带标记，避免误拿去 paas/v4） */
+  /** 一键复制所有账号的 API Key（名称 + key 逐行；JWT 兜底行带标记，避免误拿去 paas/v4）。
+   *  全库 sweep：无本地 plan key 的账号由后端现场铸造（铸造是唯一的网络源，
+   *  节奏 1.2s±40% 由后端 pending_pace 保证）；本地 key 账号段零网络、进度事件
+   *  会成串（all-keys-progress 监听已 rAF 合帧）。再点一次 = 停止：
+   *  cancel_all_keys 让后端在下一个账号之前停掉，命令提前返回截断结果
+   *  （cancelled: true），已拿到的部分行照抄进剪贴板。
+   *  与批量复制互锁：两条铸造流并发时实际铸造间隔会被压回 0.3s，
+   *  批量复制运行中拒启动 sweep */
   async copyAllKeys() {
+    if (keysSweep.running) {
+      keysSweep.cancelNote = true;
+      invoke("cancel_all_keys").catch(() => {});
+      return;
+    }
+    if (bulkKeys.running) { toast(t("list.copyAllBulkKeysBusy"), "warn"); return; }
     try {
-      const rows = await invoke("all_account_api_keys");
-      const lines = (rows || []).filter((r) => r.hasKey)
-        .map((r) => `${r.name}  ${r.apiKey}${r.kind === "jwt" ? "  " + t("list.apiKeyJwtTag") : ""}`);
+      keysSweep = { running: true, done: 0, total: 0 };
+      render();
+      const r = await invoke("all_account_api_keys");
+      const rows = r?.lines || [];
+      const lines = rows.filter((x) => x.hasKey)
+        .map((x) => `${x.name}  ${x.apiKey}${x.kind === "jwt" ? "  " + t("list.apiKeyJwtTag") : ""}`);
+      const jwt = rows.filter((x) => x.hasKey && x.kind === "jwt").length;
       if (!lines.length) { toast(t("list.apiKeyNone"), "warn"); return; }
       const ok = await copyText(lines.join("\n"));
-      toast(ok ? t("list.apiKeysCopied", { n: lines.length }) : t("list.copyFail"), ok ? "ok" : "err");
-    } catch (e) { toast(stripErr(e), "err"); }
+      if (r?.cancelled) {
+        // 被自己停止：已得部分行已入剪贴板，告知截断位置
+        toast(ok ? t("list.toastKeysSweepCancelled", { n: lines.length }) : t("list.copyFail"), ok ? "ok" : "err");
+      } else {
+        toast(ok
+          ? t("list.apiKeysCopied", { n: lines.length }) + (jwt ? t("list.apiKeysCopiedJwt", { m: jwt }) : "")
+          : t("list.copyFail"), ok ? "ok" : "err");
+      }
+    } catch (e) { toast(stripErr(e), "err"); } finally {
+      keysSweep = { running: false, done: 0, total: 0 };
+      render();
+    }
   },
 
   async twoToggle() {
@@ -3924,7 +4066,7 @@ function renderSignature() {
   ]);
 }
 function renderProgressSig() {
-  return JSON.stringify([quotaSweep, claimAllState, [...twoUsageMap.entries()]]);
+  return JSON.stringify([quotaSweep, claimAllState, keysSweep, bulkRefresh, bulkKeys, [...twoUsageMap.entries()]]);
 }
 
 function giftBtnHtml(claimableCount) {
@@ -4017,6 +4159,10 @@ function patchProgressDom() {
         aria-label="${t("btn.refreshAll")}" title="${esc(refreshAllTitle())}">
         ${ic("refresh", 17)}${refreshAllBadge()}
       </button>`);
+    // 复制全部 key / 批量条按钮：keysSweep/bulkRefresh/bulkKeys 进了 progress-sig，
+    // 结构不变时只走就地补丁（同 sweep 按钮模式），运行中标题/badge/脉冲类才能跟上
+    replace("[data-copyall-btn]", copyallBtnHtml());
+    replace(".bulk-bar", bulkBarHtml());
   }
   const claimableCount = (state?.accounts || []).filter((a) => !isArchived(a.id) && claimablePlansOf(a.id).length > 0).length;
   if (claimableCount > 0 || claimAllState.running) {
@@ -4403,10 +4549,7 @@ function render(force = false) {
           : `<button class="icon-btn tb-btn tb-launch" click="actions.launch()" ${s.zcode_path_ok ? "" : "disabled"} aria-label="${t("btn.launchZcode")}" title="${t("btn.launchZcode")}">${ic("play", 16)}</button>`}
         <button class="icon-btn tb-btn tb-twoapi${s.two_api_on ? " on" : ""}" click="actions.openTwoApi()"
           aria-label="${t("two.title")}" title="${t("two.title")}">${ic("plug", 17)}</button>
-        ${(s.accounts.length > 0)
-          ? `<button class="icon-btn tb-btn tb-copyall" click="actions.copyAllKeys()"
-              aria-label="${t("btn.copyAllKeys")}" title="${t("btn.copyAllKeys")}">${ic("copy", 17)}</button>`
-          : ""}
+        ${(s.accounts.length > 0) ? copyallBtnHtml() : ""}
         <button class="icon-btn tb-btn tb-settings" click="actions.openSettings()" aria-label="${t("common.settings")}" title="${t("common.settings")}">${ic("sliders", 17)}</button>
       </div>
     </section>
@@ -4541,6 +4684,18 @@ listen("oauth://done", (ev) => {
 
 listen("state-changed", () => {
   refresh().then(() => { if (!uiLocked()) render(); }).catch(() => {});
+});
+
+// 全库复制 key 的进度：后端每处理完一个账号 emit 一次。本地 key 账号段无 sleep、
+// 事件会成串（180 号 = 180 连发），必须 rAF 合帧，否则连发 render 卡顿——
+// refreshAll 每账号间隔 1.2s+ 天然无此问题，这里不同。前端只用 done/total
+listen("all-keys-progress", (ev) => {
+  const p = ev.payload || {};
+  keysSweep.done = p.done || 0;
+  keysSweep.total = p.total || 0;
+  if (uiLocked() || keysProgFrame) return;
+  keysProgFrame = true;
+  requestAnimationFrame(() => { keysProgFrame = false; if (!uiLocked()) render(); });
 });
 
 // ===== 客户端日志信号（zsignals）：事件驱动 + 5s 兜底轮询 =====

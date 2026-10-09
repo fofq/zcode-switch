@@ -70,6 +70,10 @@ window.__MOCK_DRAIN_QUOTA__ = (id) => drainQuota(id);
 // 部分到期：只把第一个礼物套餐拨过期（多套餐场景不应整号归档）
 window.__MOCK_EXPIRE_GIFT__ = (id) => expireGift(id);
 
+// 全库复制 key 的取消标志：cancel_all_keys 置位，all_account_api_keys 在「下一个账号之前」
+// 检查并提前返回截断结果（cancelled: true）；命令开始时复位，防上次取消残留
+let allKeysCancelled = false;
+
 // 各命令的 mock 实现；返回 null/对象都行，未列出的命令回退为 null 并告警
 const commands = {
   async app_version() { return "1.6.0-preview"; },
@@ -208,11 +212,34 @@ const commands = {
 
   async account_api_key({ id }) {
     await delay(300);
-    const acc = mockAccounts().find((a) => a.id === id);
-    return { apiKey: fakeKey(id), label: "GLM-5.3-Flash", provider: "zai", kind: "api" };
+    // 形状对齐真实契约（ApiKeyInfo camelCase）：kind 是 "plan"|"jwt"，前端判的是 kind === "jwt"
+    return { apiKey: fakeKey(id), label: "平台 Key", baseUrl: "", provider: "zai", kind: "plan" };
   },
   async all_account_api_keys() {
-    return mockAccounts().map((a) => ({ id: a.id, name: a.name, apiKey: fakeKey(a.id), hasKey: true, kind: "api" }));
+    allKeysCancelled = false; // 命令开始处复位：防上次取消残留导致本次立即被停
+    const accounts = mockAccounts();
+    const total = accounts.length;
+    const lines = [];
+    let jwt = 0;
+    for (let i = 0; i < total; i++) {
+      if (allKeysCancelled) break; // 「下一个账号之前」停掉
+      const a = accounts[i];
+      // 末行模拟「铸造失败回退 start-plan JWT」：key 拼 eyJ 前缀 + mintError，
+      // 让浏览器预览能点到 JWT 标记行 / 结果 toast 的 {m} 追加段
+      const isJwt = i === total - 1;
+      lines.push(isJwt
+        ? { name: a.name, apiKey: "eyJ" + fakeKey(a.id), hasKey: true, provider: "zai", kind: "jwt", mintError: "getCustomerInfo: HTTP 401 unauthorized" }
+        : { name: a.name, apiKey: fakeKey(a.id), hasKey: true, provider: "zai", kind: "plan" });
+      if (isJwt) jwt++;
+      // 每处理完一个账号 emit 一次（前端 rAF 合帧；15ms 模拟无 sleep 的本地 key 段成串连发）
+      emit("all-keys-progress", { done: i + 1, total, minted: 0, jwt });
+      await delay(15);
+    }
+    return { lines, cancelled: allKeysCancelled };
+  },
+  async cancel_all_keys() {
+    allKeysCancelled = true;
+    return null;
   },
 
   async export_pick_path({ id }) {

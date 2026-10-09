@@ -11,7 +11,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
 #[cfg(windows)]
@@ -267,6 +267,10 @@ pub struct AccountSummary {
     pub is_active: bool,
     pub has_config: bool,
     pub has_user_info: bool,
+    /// 快照里有没有本账号自己铸过并存下来的平台 key（判定口径与 account_api_key 的
+    /// 现场铸造分支完全一致：有 = 该命令零网络，无 = 调用即触发网络铸造）。
+    /// 前端批量复制据此分档节奏：本地 key 号走小间隔，需铸造号落到 1.2s±40% 车队节拍
+    pub has_plan_key: bool,
     pub identity: zcrypto::Identity,
     pub group: Option<String>,
 }
@@ -1577,24 +1581,105 @@ pub struct AccountKeyLine {
     pub has_key: bool,
     pub provider: String,
     pub kind: String,
+    /// 有值 = 该 key 是 JWT 兜底而非平台 key（语义同 ApiKeyInfo.mint_error）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mint_error: Option<String>,
 }
 
-/// 一键复制所有 API Key / 免费模型 key 池用：只做本地解析，不逐个发网络请求。
-pub fn all_account_api_keys(paths: &Paths) -> Result<Vec<AccountKeyLine>, String> {
+/// 全库复制 key 的进度事件载荷（每处理完一个账号 emit 一次 "all-keys-progress"）。
+/// 前端只用 done/total；minted/jwt 供结果 toast 参考。
+#[derive(serde::Serialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct AllKeysProgress {
+    pub done: u32,
+    pub total: u32,
+    pub minted: u32,
+    pub jwt: u32,
+}
+
+/// 全库复制 key 的结果。cancelled=true = 用户点了停止，lines 是截断的部分结果。
+#[derive(serde::Serialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct AllKeysResult {
+    pub lines: Vec<AccountKeyLine>,
+    pub cancelled: bool,
+}
+
+/// 与 account_api_key 的 L1545 守卫同语义：快照里有没有本账号自己铸过并存下来的平台 key。
+fn has_local_plan_key(acc: &Account) -> bool {
+    acc.api_key.as_deref().map(str::trim).map(|k| k.len() > 20) == Some(true)
+}
+
+/// 全库复制 key（复制 key 按钮 / 工具栏全局复制）：对本地没存 plan key 的账号
+/// 走 account_api_key 现场铸一把（铸造失败回退 start-plan JWT，不丢行），
+/// 铸造之间有节奏限制（1.2s + 0~0.8s 抖动，同 refreshAll 参数）；cancel 在
+/// 「下一个账号之前」检查一次。进度经 on_progress 逐号上报。
+pub fn all_account_api_keys(
+    paths: &Paths,
+    cancel: &std::sync::atomic::AtomicBool,
+    on_progress: Option<&dyn Fn(&AllKeysProgress)>,
+) -> Result<AllKeysResult, String> {
+    use std::sync::atomic::Ordering;
     let accounts = list_accounts(paths)?;
-    Ok(accounts
-        .iter()
-        .map(|a| {
-            let info = local_api_key(a, &paths.home);
-            AccountKeyLine {
-                name: a.name.clone(),
-                api_key: info.as_ref().map(|i| i.api_key.clone()).unwrap_or_default(),
-                has_key: info.is_some(),
-                provider: info.as_ref().map(|i| i.provider.clone()).unwrap_or_default(),
-                kind: info.as_ref().map(|i| i.kind.clone()).unwrap_or_default(),
-            }
-        })
-        .collect())
+    let total = accounts.len() as u32;
+    let mut lines: Vec<AccountKeyLine> = Vec::with_capacity(accounts.len());
+    let mut minted: u32 = 0;
+    let mut jwt: u32 = 0;
+    let mut cancelled = false;
+    // 上一号铸过 key（网络源）就等节奏：本地 key 的账号不解锁，保证两次铸造间隔 ≥ 1.2s
+    let mut pending_pace = false;
+    for (i, acc) in accounts.iter().enumerate() {
+        if cancel.load(Ordering::Relaxed) {
+            cancelled = true;
+            break;
+        }
+        let want_network = !has_local_plan_key(acc);
+        if want_network && pending_pace {
+            let jitter = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.subsec_nanos())
+                .unwrap_or(0)
+                % 800;
+            std::thread::sleep(Duration::from_millis(1200 + u64::from(jitter)));
+        }
+        // 单号失败（load 错 / 铸造错）跳过不中断全库；铸造失败已在 account_api_key 里 flowlog 记账
+        let info = account_api_key(paths, &acc.id).ok();
+        let (has_key, api_key, provider, kind, mint_error) = match info.as_ref() {
+            Some(x) => (true, x.api_key.clone(), x.provider.clone(), x.kind.clone(), x.mint_error.clone()),
+            None => (false, String::new(), String::new(), String::new(), None),
+        };
+        if want_network && kind == "plan" {
+            minted += 1;
+        }
+        if kind == "jwt" {
+            jwt += 1;
+        }
+        lines.push(AccountKeyLine {
+            name: acc.name.clone(),
+            api_key,
+            has_key,
+            provider,
+            kind,
+            mint_error,
+        });
+        if want_network {
+            pending_pace = true;
+        }
+        if let Some(cb) = on_progress {
+            cb(&AllKeysProgress {
+                done: i as u32 + 1,
+                total,
+                minted,
+                jwt,
+            });
+        }
+    }
+    crate::flowlog::log(
+        "mint",
+        "all_keys_done",
+        &format!("total={total} minted={minted} jwt={jwt} cancelled={cancelled}"),
+    );
+    Ok(AllKeysResult { lines, cancelled })
 }
 
 /// 免费模型 key 池（2API 用）：返回 (provider, api_key) 列表 + 最后一次铸造失败的诊断。
@@ -2097,6 +2182,7 @@ pub fn get_state(paths: &Paths) -> Result<AppState, String> {
             is_active: active_idx == Some(i),
             has_config: a.config.is_some(),
             has_user_info: crate::claim::telemetry_user_id(&paths.home, &a.credentials).is_some(),
+            has_plan_key: has_local_plan_key(a),
             identity: idt.clone(),
             group: a.group.clone(),
         })
