@@ -1643,7 +1643,8 @@ pub fn all_account_api_keys(
             std::thread::sleep(Duration::from_millis(1200 + u64::from(jitter)));
         }
         // 单号失败（load 错 / 铸造错）跳过不中断全库；铸造失败已在 account_api_key 里 flowlog 记账
-        let info = account_api_key(paths, &acc.id).ok();
+        // account_api_key 返回 Result<Option<_>>：.ok() 外 Option 包内 Option，必须 flatten 再解构
+        let info = account_api_key(paths, &acc.id).ok().flatten();
         let (has_key, api_key, provider, kind, mint_error) = match info.as_ref() {
             Some(x) => (true, x.api_key.clone(), x.provider.clone(), x.kind.clone(), x.mint_error.clone()),
             None => (false, String::new(), String::new(), String::new(), None),
