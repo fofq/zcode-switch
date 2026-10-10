@@ -51,6 +51,17 @@ window.__MOCK_PUSH_GIFT_INSTANCE__ = (planId, name) => {
 const mockQuotaFlap = new Set();
 window.__MOCK_SET_QUOTA_FLAP__ = (id) => mockQuotaFlap.add(id);
 
+// 观测退化：命中集合的账号额度查询持续失败（times 省略=一直失败，直到 clear）。
+// 验证 quota-fail 审计 / hardDown 盲判 / 盲切限速（观测通道退化路径）
+const mockQuotaFail = new Map(); // id -> 剩余失败次数 | Infinity
+window.__MOCK_SET_QUOTA_FAIL__ = (id, times = Infinity) => mockQuotaFail.set(id, times);
+window.__MOCK_CLEAR_QUOTA_FAIL__ = (id) => mockQuotaFail.delete(id);
+
+// 信号停摆：live_signals 返回不可用/陈旧（客户端进程退出、日志静默的 mock 形态），
+// 前端自然回落到 HTTP 轮询路径——盲判前置条件「日志不可信」的注入开关
+let mockSignalsDead = false;
+window.__MOCK_SET_SIGNALS_DEAD__ = (v) => { mockSignalsDead = !!v; };
+
 // 报价已撤：下一次对该号的 claim_start 抛 {gone, plans} 载荷（与真实后端 claim_start
 // 的 err.claim.gone 载荷同形），验证礼盒图标的就地自愈
 const mockClaimGone = new Set();
@@ -83,6 +94,12 @@ const commands = {
 
   async get_account_quota({ id }) {
     await delay(220 + Math.random() * 260);
+    // 查询失败注入：与真实后端同形的 "net:" 前缀（errCode 会解析成 net）
+    const left = mockQuotaFail.get(id);
+    if (left) {
+      if (left !== Infinity) mockQuotaFail.set(id, left - 1);
+      throw "net:模拟额度查询失败（mock 注入）";
+    }
     // 空快照抖动模拟：命中一次返回「成功但空」，下次恢复真实数据。
     // 故意不带 source——balance 路径的空概览就是这种形态（is_empty=true, source=""）
     if (mockQuotaFlap.has(id)) {
@@ -264,6 +281,14 @@ const commands = {
   async two_api_test() { await delay(500); return { ok: true, localOk: true, localMs: 12, e2eOk: true, e2eMs: 233 }; },
 
   async live_signals() {
+    if (mockSignalsDead) {
+      return {
+        available: false, log_path: "", log_at_ms: 0, pools: [], pools_at_ms: 0,
+        prev_pools: [], prev_at_ms: 0, plan_available: null, plan_at_ms: 0,
+        model: null, model_at_ms: 0, provider: null, last_request_at_ms: 0,
+        last_applied_at_ms: null, requests: 0, parse_errors: 0, plans: [], plans_at_ms: 0,
+      };
+    }
     const at = Date.now() - 20_000;
     const prevAt = Date.now() - 35_000;
     const pools = [

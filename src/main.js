@@ -4,7 +4,7 @@ import { esc, toast, openPwModal, openConfirmModal, openProviderModal, installDe
 import { ic } from "./icons.js";
 import { init, t, has, lang, localeTag, stripErr, errCode } from "./i18n.js";
 import { HEALTH_ORDER, healthOf, filterAccounts, sortAccounts, bucketAccounts, summarize, modelKeyMatch, quotaBarParts, planExpired, planIsGift, PENDING_WINDOW_MS, entitlementGiftMap } from "./list.js";
-import { AS_DEFAULTS, poolStats, poolStatsFromSignals, poolsRate, sampleFrom, pushSample, etaOf, evaluate, fmtEta, giftFirstBasis } from "./autoswitch.js";
+import { AS_DEFAULTS, poolStats, poolStatsFromSignals, poolsRate, sampleFrom, pushSample, etaOf, evaluate, fmtEta, giftFirstBasis, blindBlocked, noteBlindSwitch, noteSightedSwitch } from "./autoswitch.js";
 
 // 纯浏览器预览：无 Tauri 后端（普通浏览器开 dev server）时注入 mock IPC 再继续启动；
 // 生产构建里 import.meta.env.DEV 为 false，整段会被剔除，Tauri 真机零影响
@@ -409,6 +409,10 @@ let switchLock = false;
 let lastAutoSwitchAt = 0;
 let autoSwitchNote = "";
 let lastHotWarnAt = 0;
+// 盲切限速状态：观测通道退化（查询连续失败）时防止 hardDown 无界连切（treadmill）。
+// 只在「没有任何可用数据佐证」的 hardDown 上计数；证据型触发不走预算（见 autoswitch.js）。
+let blindGuard = { streak: 0, holdUntil: 0, lastAt: 0 };
+let lastBlindHoldLogAt = 0;
 
 // ---- 客户端日志信号（zsignals）：秒级、零额外请求 ----
 // liveSignals 只在「当前登录账号」上可信（日志是客户端自己的），候选号一律用 HTTP 数据
@@ -1747,6 +1751,9 @@ async function loadAcctQuota(id, opts = {}) {
     const prevHadQuota = (cur.data?.plans || []).some(hasRem) || hasRem(cur.data);
     if (emptySnap && prevHadQuota) {
       const tries = (quotaFlapRetry[id] = (quotaFlapRetry[id] || 0) + 1);
+      // 可诊断性：成功但空的快照（数据面抖动）也进审计——「刷新刷不新」的另一半原因，
+      // 与 quota-fail 一起让观测退化窗口可归因（10-11 排查实证：此前两者无法区分）
+      asAuditPush("quota-flap", { id, tries, quick: !!opts.quick });
       if (tries <= 3 && !isArchived(id)) {
         setTimeout(() => { loadAcctQuota(id, { force: true }).finally(() => scheduleNext(id)); }, 2500 + Math.random() * 3000);
       } else if (!isArchived(id)) {
@@ -1793,6 +1800,12 @@ async function loadAcctQuota(id, opts = {}) {
     const code = errCode(e);
     acctQuota[id] = { data: cur.data || null, err: stripErr(e), code, busy: false };
     quotaFailStreak[id] = (quotaFailStreak[id] || 0) + 1;
+    // 可诊断性：失败原因/错误码进 auto-sw 审计（此前只有事件名，分不清「查询失败」与「空快照」，
+    // 观测退化窗口无法定位根因——10-11 排查实证）
+    asAuditPush("quota-fail", {
+      id, active: !!state?.accounts?.find((a) => a.id === id && a.is_active),
+      code: code || "other", streak: quotaFailStreak[id], msg: stripErr(e).slice(0, 80),
+    });
     // 解冻证据要求「连续」刷新：失败一次就双计数清零
     if (autoFrozenAt[id]) { autoUnfreezeHits[id] = 0; autoUnfreezeEmpty[id] = 0; }
     // 拉取失败（429/3012/网络）→ 指数退避（6s → 12s → 24s → …；成功清零），
@@ -5184,13 +5197,24 @@ async function autoSwitchTick(manual = false) {
     // b) 刷新成功但数据面判死（is_empty「业务成功但空」/ 套餐全部过期）——此时 pct 必然为空，
     //    否则只会落进 wait noData 死寂，永远不切（这正是礼物批量到期后的形态）。
     const dataDead = hm.get(active.id)?.level === "dead";
-    const hardDown = dataDead
-      || (ageMs > AS_DEFAULTS.activeStaleMs && (quotaFailStreak[active.id] || 0) >= 2);
+    const failStreak = quotaFailStreak[active.id] || 0;
+    const failCode = acctQuota[active.id]?.code || "";
+    // 凭据类确定性失败（401 业务码/HTTP / token 过期 / 无凭据）：有据可依的不可用——
+    // 切走即写入新凭据能修好，不计入盲切预算；只有「查不到」（网络/风控/未知）才算盲。
+    // 同样要求样本陈旧：JWT 客户端轮换竞态下的瞬时 401 不得触发误切。
+    const authFail = ageMs > AS_DEFAULTS.activeStaleMs && AUTH_CODES.has(failCode);
+    // 「盲」hardDown：没有任何数据佐证、纯靠「连续查不到 + 样本陈旧」推断（观测退化）；
+    // dataDead 是服务端明确回答的判死（is_empty / 全过期），属于有据可依的硬信号。
+    // 两者分开：盲切要受限速预算约束（blindGuard），有据的切不受限（见下方闸门）
+    const blindDown = !dataDead && !authFail && ageMs > AS_DEFAULTS.activeStaleMs && failStreak >= 2;
+    const hardDown = dataDead || authFail || blindDown;
     cur = {
       pct: ap.pct, etaSec: apiEta(active.id), level: levelOf(ap.pct, thr),
       tokens: ap.tokens ?? null,
       thr: thr * (ap.thrScale ?? 1),
       ageMs, stale: ageMs > AS_DEFAULTS.activeStaleMs, source: sampleSrc, hardDown,
+      hardDownBlind: blindDown,
+      hdWhy: dataDead ? "dead" : authFail ? `auth(${failCode})` : blindDown ? `streak${failStreak}@${Math.round(ageMs / 1000)}s` : "",
     };
   }
   if (!lg && ap.flowed) cur.flowed = true;
@@ -5199,6 +5223,8 @@ async function autoSwitchTick(manual = false) {
   // 旧额度/烧速作废，立即切到最佳非停靠候选（manual 绕过冷却与保护窗）
   if (isFrozen(active.id) || isArchived(active.id)) {
     cur.hardDown = true;
+    cur.hardDownBlind = false; // 用户拍板的切走意图，不占盲切预算
+    cur.hdWhy = "intent";
     cur.pct = null;
     cur.tokens = null;
   }
@@ -5259,6 +5285,20 @@ async function autoSwitchTick(manual = false) {
   }
   if (d.action === "refresh") { noteForDecision(d); forceRefresh(active.id); return true; }
   if (d.action === "wait") { noteForDecision(d); return true; }
+  // 盲切限速闸：观测退化时 hardDown 只是推断证据，连续连切只会白烧 hot 切换成本
+  //（每次让客户端重新评估 ~40s）。预算用尽即进停窗，等待数据恢复；证据型触发
+  // （zero/eta/planDown）与手动意图不受限——那些有真实数据或用户拍板依托。
+  if (d.action === "switch" && d.reason === "hardDown" && !manual && cur.hardDownBlind && blindBlocked(blindGuard, now)) {
+    if (now - lastBlindHoldLogAt > 5 * 60 * 1000) {
+      lastBlindHoldLogAt = now;
+      asAuditPush("blind-hold", {
+        id: active.id, streak: blindGuard.streak,
+        waitSec: Math.max(0, Math.round((blindGuard.holdUntil - now) / 1000)),
+      });
+    }
+    noteChanged(t("as.noteBlindHold"));
+    return true;
+  }
   await doAutoSwitch(d, active, cur, lg);
   return true;
 }
@@ -5288,6 +5328,8 @@ async function doAutoSwitch(d, active, cur, lg) {
   try {
     let target = null;
     let preflights = 0;
+    let pfErr = 0;                 // 预校验中「刷新仍失败」被挡的候选数
+    let pfFlap = 0;                // 预校验中「成功但空/数据没变新」被挡的候选数（可诊断性）
     for (const c of d.ranked || []) {
       // 切换瞬间的硬闸：候选评估与真正切换之间隔着预校验（秒级），期间用户冻结/
       // 归档了该号就必须跳过——「停靠的号绝不接收自动切换」不依赖评估时刻的快照
@@ -5299,11 +5341,15 @@ async function doAutoSwitch(d, active, cur, lg) {
         // 重活窗口也保底 1 次预校验（只够榜首）：彻底禁用会让切换在窗口期完全饿死
         if (preflights >= (heavy ? 1 : AS_DEFAULTS.maxPreflight)) continue;
         preflights++;
+        const atBefore = quotaSampleAt[c.id] || 0;
         await loadAcctQuota(c.id, { force: true, quick: true });
         // 本次刷新仍失败（网络/风控/业务码500无套餐）→ 该候选视为不可用。
         // 必须先查 err 再读数：失败路径会保留旧数据，直接读 pct 等于拿过期前的
         // 高百分比给死号放行（礼物批量到期日就是这么切进死号的）
-        if (acctQuota[c.id]?.err) continue;
+        if (acctQuota[c.id]?.err) { pfErr++; continue; }
+        // 「成功但空」的防抖路径不会推进采样时间（数据没变新）：预校验把它当
+        // 不可验证——否则 flap 期间保留的旧高百分比又会被当作切换依据切进看不见的号
+        if (!((quotaSampleAt[c.id] || 0) > atBefore)) { pfFlap++; continue; }
         const fresh = pctPairOf(c.id);
         // 刷不到（网络/风控/无数据）→ 该候选视为不可用，绝不拿旧数据当依据切过去
         c.pct = fresh.pct;
@@ -5324,7 +5370,7 @@ async function doAutoSwitch(d, active, cur, lg) {
       if (okPct && better) { target = c; break; }
     }
     if (!target) {
-      asAuditPush("preflight-fail", { from: active.id, tried: preflights, want: d.ranked?.length || 0 });
+      asAuditPush("preflight-fail", { from: active.id, tried: preflights, want: d.ranked?.length || 0, err: pfErr, flap: pfFlap });
       noteChanged(t("as.noteCandStale"));
       return;
     }
@@ -5366,8 +5412,15 @@ async function doAutoSwitch(d, active, cur, lg) {
         pct: pctShown == null ? null : Math.round(pctShown * 10) / 10,
         curTokens: cur.tokens ?? null, toTokens: best.tokens ?? null,
         etaSec: d.etaSec == null ? null : Math.round(d.etaSec),
-        src: lg ? "log" : "api", hot: !!r?.hot, preflight: preflights, ms: Date.now() - started,
+        src: lg ? "log" : "api", hot: !!r?.hot, preflight: preflights,
+        err: pfErr, flap: pfFlap,                     // 被「查询失败 / 空快照」挡掉的候选数
+        hd: cur.hardDown ? (cur.hdWhy || "") : "",    // hardDown 的依据：dead / streak@age / intent
+        blind: d.reason === "hardDown" && !!cur.hardDownBlind,
+        ms: Date.now() - started,
       });
+      // 盲切预算：只有「无数据佐证的 hardDown」计一次；任何有据/手动切换都清零计数
+      if (d.reason === "hardDown" && cur.hardDownBlind) noteBlindSwitch(blindGuard, Date.now());
+      else noteSightedSwitch(blindGuard);
       await refresh();
       pokeAccount(best.id);
       armClaimCheck(best.id); // 自动切换同样触发新当前账号的领取检查（T0 优先）

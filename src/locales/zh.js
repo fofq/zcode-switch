@@ -434,6 +434,7 @@ export const zh = {
   "as.noteCooldown": "刚切过一次，冷却中暂不重复切换",
   "as.noteNoImprove": "其它账号剩余不比当前更多，暂不切换",
   "as.noteCandStale": "候选账号数据刷新后已不再达标，暂不切换",
+  "as.noteBlindHold": "额度观测异常：盲切限速中（等待数据恢复，防无效连切）",
   "as.needHotToast": "危险：额度已接近耗尽，但 ZCode 正在运行且未开热切换",
   "as.needHotDesc": "打开「热切换」才能在 ZCode 运行时自动切号（热切换只改登录文件、不杀进程）",
   "as.fail": "自动切换失败：{err}",

@@ -17,6 +17,10 @@ import {
   evaluate,
   fmtEta,
   AS_DEFAULTS,
+  blindBlocked,
+  noteBlindSwitch,
+  noteSightedSwitch,
+  BLIND_GAP_MS,
 } from "../src/autoswitch.js";
 
 let failed = 0;
@@ -467,6 +471,60 @@ const r11f = evaluate({ ...base,
   opts: { ...base.opts, giftOrder: "auto" },
 });
 eq(r11f.action, "none", "礼物全没后按常规口径判定，健康就不动");
+
+// ---------- 盲切限速（观测退化防 hardDown 无界连切 treadmill） ----------
+
+// 12a. 第 1 次盲切放行（单个真实死号要能正常切走）；连续第 2 次 → 停窗 5min
+const bg = { streak: 0, holdUntil: 0, lastAt: 0 };
+eq(blindBlocked(bg, t0), false, "未发生盲切 → 不限速");
+noteBlindSwitch(bg, t0);
+eq(blindBlocked(bg, t0 + 1000), false, "第 1 次盲切后仍放行（有据可依的死号不误伤）");
+noteBlindSwitch(bg, t0 + 2000);
+eq(blindBlocked(bg, t0 + 3000), true, "连续第 2 次盲切 → 进入停窗");
+eq(blindBlocked(bg, t0 + 2000 + 5 * 60_000 - 1), true, "停窗 5min 内仍限速");
+eq(blindBlocked(bg, t0 + 2000 + 5 * 60_000), false, "停窗到期 → 自动放行");
+
+// 12b. 指数升级与 30min 封顶：连续盲切不打断时 hold 5/10/20/30/30…
+const bg2 = { streak: 0, holdUntil: 0, lastAt: 0 };
+let bgNow = t0;
+noteBlindSwitch(bg2, (bgNow += 1000)); // #1
+noteBlindSwitch(bg2, (bgNow += 1000)); // #2 → +5min
+eq(Math.round((bg2.holdUntil - bgNow) / 60000), 5, "第 2 次 → 5min 停窗");
+noteBlindSwitch(bg2, (bgNow += 1000)); // #3 → +10min
+eq(Math.round((bg2.holdUntil - bgNow) / 60000), 10, "第 3 次 → 10min 停窗");
+noteBlindSwitch(bg2, (bgNow += 1000)); // #4 → +20min
+noteBlindSwitch(bg2, (bgNow += 1000)); // #5 → +40min clamp 30
+eq(Math.round((bg2.holdUntil - bgNow) / 60000), 30, "停窗 30min 封顶");
+noteBlindSwitch(bg2, (bgNow += 1000)); // #6 → 仍 30min（max 合并）
+eq(Math.round((bg2.holdUntil - bgNow) / 60000), 30, "封顶后保持 30min");
+
+// 12c. 证据型切换（zero/eta/planDown/判死/手动）清零计数与停窗
+const bg3 = { streak: 3, holdUntil: t0 + 20 * 60_000, lastAt: t0 };
+eq(blindBlocked(bg3, t0 + 1000), true, "清零前处于限速");
+noteSightedSwitch(bg3);
+eq(blindBlocked(bg3, t0 + 1000), false, "证据型切换 → 立即解限");
+eq(bg3.streak, 0, "计数清零");
+
+// 12d. 冷静期：>30min 无盲切 = 新 episode（计数重开、旧停窗作废）
+const bg4 = { streak: 5, holdUntil: t0 + 30 * 60_000, lastAt: t0 };
+eq(blindBlocked(bg4, t0 + BLIND_GAP_MS + 1000), false, "冷静期后旧停窗作废");
+noteBlindSwitch(bg4, t0 + BLIND_GAP_MS + 1000);
+eq(bg4.streak, 1, "冷静期后计数重开");
+eq(bg4.holdUntil, 0, "新 episode 第 1 次不进停窗");
+
+// 12e. treadmill 仿真：用 10-10 实测的 16 次连切节律（分钟偏移）走一遍限速循环，
+// 连切应被显著收缩而不是照单全收（原始节律下 2.7 小时连切 16 次）
+const g5 = { streak: 0, holdUntil: 0, lastAt: 0 };
+const attempts = [0, 54, 57, 64, 71, 72, 76, 82, 84, 88, 90, 94, 96, 100, 103, 162].map((m) => t0 + m * 60_000);
+let allowed = 0;
+for (const at of attempts) {
+  if (!blindBlocked(g5, at)) {
+    allowed++;
+    noteBlindSwitch(g5, at);
+  }
+}
+ok(allowed <= 8, `实测节律 16 次连切 → 限速后 ≤8 次（实际 ${allowed}）`);
+ok(allowed >= 4, `真实需要的切换不被饿死（实际放行 ${allowed} 次）`);
 
 if (failed) {
   console.error(`\n✗ 自动切换决策自检失败：${failed} 项（通过 ${passed}）`);

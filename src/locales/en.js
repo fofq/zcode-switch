@@ -438,6 +438,7 @@ export const en = {
   "as.noteCooldown": "Just switched — cooling down, not switching again yet",
   "as.noteNoImprove": "No other account has more left — not switching",
   "as.noteCandStale": "Target no longer qualified after refresh — not switching",
+  "as.noteBlindHold": "Quota observation degraded — blind switches rate-limited (awaiting data recovery)",
   "as.needHotToast": "Danger: quota is nearly exhausted, but ZCode is running without hot switch",
   "as.needHotDesc": "Enable hot switch to let auto-switch work while ZCode runs (it only rewrites login files, never kills the app)",
   "as.fail": "Auto-switch failed: {err}",

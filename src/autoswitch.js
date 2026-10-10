@@ -503,6 +503,47 @@ export function evaluate(input) {
   return { action: "switch", reason, emergency: effEmergency, degrade: degraded, target: best, ranked, etaSec };
 }
 
+// ---------- 盲切限速（观测退化的防连切保护） ----------
+// hardDown 里的「连续查询失败 + 样本陈旧」是推断裂证据：观测通道整体退化时，
+// 全库频繁连切只会把每次 hot 切换的成本（客户端一次 ~40s 重评估）乘上 N，
+// 切到的号同样查不动，纯属无效震荡（10-10 实测 2.7 小时内连切 16 次）。
+// 策略：连续盲切 ≥2 次进指数停窗（5/10/20/30min 封顶）；证据型切换
+// （zero/eta/planDown/dataDead/手动）不被限速、且清零计数；30 分钟无盲切=新 episode。
+
+/** 冷静间隔：超过它没有盲切，视为观测恢复、计数与停窗从头算 */
+export const BLIND_GAP_MS = 30 * 60 * 1000;
+
+/** 盲切是否被限速（g = {streak, holdUntil, lastAt}，main.js 持有可变实例） */
+export function blindBlocked(g, now) {
+  if (!g || !g.holdUntil) return false;
+  if (g.lastAt && now - g.lastAt > BLIND_GAP_MS) return false; // episode 已过
+  return now < g.holdUntil;
+}
+
+/** 记一次已完成的盲切：连续第 n 次（n≥2）→ 停窗 5·2^(n-2) 分钟，30min 封顶 */
+export function noteBlindSwitch(g, now) {
+  if (!g) return g;
+  if (g.lastAt && now - g.lastAt > BLIND_GAP_MS) {
+    g.streak = 0;
+    g.holdUntil = 0;
+  }
+  g.streak = (g.streak || 0) + 1;
+  g.lastAt = now;
+  if (g.streak >= 2) {
+    const hold = Math.min(30 * 60 * 1000, 5 * 60 * 1000 * 2 ** (g.streak - 2));
+    g.holdUntil = Math.max(g.holdUntil || 0, now + hold);
+  }
+  return g;
+}
+
+/** 证据型切换（zero/eta/planDown/判死/手动）→ 清零盲切计数与停窗 */
+export function noteSightedSwitch(g) {
+  if (!g) return g;
+  g.streak = 0;
+  g.holdUntil = 0;
+  return g;
+}
+
 /** ETA 的人类可读文案（供 tooltip 用；无 i18n 依赖） */
 export function fmtEta(sec) {
   if (sec == null || !isFinite(sec)) return null;
