@@ -4,7 +4,7 @@ import { esc, toast, openPwModal, openConfirmModal, openProviderModal, installDe
 import { ic } from "./icons.js";
 import { init, t, has, lang, localeTag, stripErr, errCode } from "./i18n.js";
 import { HEALTH_ORDER, healthOf, filterAccounts, sortAccounts, bucketAccounts, summarize, modelKeyMatch, quotaBarParts, planExpired, planIsGift, PENDING_WINDOW_MS, entitlementGiftMap } from "./list.js";
-import { AS_DEFAULTS, poolStats, poolStatsFromSignals, poolsRate, sampleFrom, pushSample, etaOf, evaluate, fmtEta, giftFirstBasis, blindBlocked, noteBlindSwitch, noteSightedSwitch } from "./autoswitch.js";
+import { AS_DEFAULTS, poolStats, poolStatsFromSignals, poolsRate, sampleFrom, pushSample, etaOf, evaluate, fmtEta, giftFirstBasis, blindBlocked, noteBlindSwitch, noteSightedSwitch, worstDrainingOf, needsPreflight } from "./autoswitch.js";
 
 // 纯浏览器预览：无 Tauri 后端（普通浏览器开 dev server）时注入 mock IPC 再继续启动；
 // 生产构建里 import.meta.env.DEV 为 false，整段会被剔除，Tauri 真机零影响
@@ -602,6 +602,11 @@ function logStats() {
   const rate = prevAt > lastAutoSwitchAt + 1000
     ? poolsRate(liveSignals.prev_pools, prevAt, pools, at, model)
     : null;
+  // worstHit 兜底触发的「有消耗证据」门：最紧池在最近两个可信快照间还在下降
+  const prevSt = prevAt > lastAutoSwitchAt + 1000 && Array.isArray(liveSignals.prev_pools)
+    ? poolStatsFromSignals(liveSignals.prev_pools, model, entGift)
+    : null;
+  const worstDraining = !!(prevSt && st.worstPct != null && prevSt.worstPct != null && st.worstPct < prevSt.worstPct);
   // ETA 用「该模型全部池的剩余之和 / 合计速率」：与 poolsRate 同口径，池变动（补发/过期）不会把速率算歪
   let etaSec = null;
   if (rate && st.totalTokens != null && st.totalTokens > 0 && rate.rate > 0) etaSec = st.totalTokens / rate.rate;
@@ -611,7 +616,7 @@ function logStats() {
     etaSec = st.giftTokens / rate.rate;
   }
   // plan 信号用自己的新鲜窗口：余额可信而 plan 是旧账号残留时不得触发
-  return { ...st, rate, etaSec, at, planUnavailable: planSignalUsable() };
+  return { ...st, rate, etaSec, at, worstDraining, planUnavailable: planSignalUsable() };
 }
 /** 该账号 HTTP 口径的池统计（与旧行为一致：命中关注模型则只看该模型） */
 function apiStats(id, model = effectiveFocusModel()) {
@@ -1732,7 +1737,9 @@ async function loadAcctQuota(id, opts = {}) {
   try {
     // quick（批量刷新/扫库）：后端不因“成功但空”而 sleep 2.5s 重查——
     // 50 个空号就是 +125s，首次刷新会被拖到几分钟；心跳照发，前端按「待激活」短周期复查
-    const data = await invoke("get_account_quota", { id, quick: !!opts.quick });
+    // timeoutSecs（切换预校验）：快查通道——短超时、不重试、频道全败即失败，
+    // 观测退化时把单号 20-45s 的查询压到个位数秒（10-10 慢切审计实证）
+    const data = await invoke("get_account_quota", { id, quick: !!opts.quick, timeoutSecs: opts.timeoutSecs ?? null });
     // 套餐结构防抖：偶发解析抖动会返回“无 plans 只有裸 items”的降级概览，
     // 让明细在 完整套餐组/裸池条 之间来回跳变。套餐不会凭空消失（只会带
     // expired 标记留存），沿用上次的 plans 结构即可。
@@ -5189,6 +5196,7 @@ async function autoSwitchTick(manual = false) {
       tokens: b && b.tokens != null ? b.tokens : (lg.totalTokens ?? null),
       thr: thr * (b?.thrScale ?? 1),
       ageMs: Math.max(0, now - (lg.at || now)), stale: false,
+      worstPct: lg.worstPct, worstDraining: !!lg.worstDraining,
       planUnavailable: !!lg.planUnavailable, source: sampleSrc,
     };
   } else {
@@ -5215,6 +5223,7 @@ async function autoSwitchTick(manual = false) {
       ageMs, stale: ageMs > AS_DEFAULTS.activeStaleMs, source: sampleSrc, hardDown,
       hardDownBlind: blindDown,
       hdWhy: dataDead ? "dead" : authFail ? `auth(${failCode})` : blindDown ? `streak${failStreak}@${Math.round(ageMs / 1000)}s` : "",
+      worstPct: ap.worstPct, worstDraining: worstDrainingOf(quotaHist[active.id]),
     };
   }
   if (!lg && ap.flowed) cur.flowed = true;
@@ -5330,6 +5339,41 @@ async function doAutoSwitch(d, active, cur, lg) {
     let preflights = 0;
     let pfErr = 0;                 // 预校验中「刷新仍失败」被挡的候选数
     let pfFlap = 0;                // 预校验中「成功但空/数据没变新」被挡的候选数（可诊断性）
+    // —— 预校验规划：需要现查的候选（排名序，封顶）并行发起 ——
+    // 串行版在观测退化时单号 20-45s × 2 把整次切换拖到 30-90s（10-10 审计实证：
+    // ms 28.9/32.1/40.2/56.5/69.7/70.9/88.9s 全部 preflight:2）；并行 + 快查通道
+    // （短超时、不重试、失败快进快出，见 loadAcctQuota 的 timeoutSecs）把代价压到
+    // 单次查询量级。干净缓存（≤5min 且最近刷新成功）直接信任，不再现查——常规
+    // 轮询本就是 ~5min 一轮，这条把「陈旧候选几乎必然触发预校验」从常态里去掉。
+    const needVerify = new Set();  // 需要预校验才能当依据的候选 id（含封顶外，跳过）
+    const pfSet = [];              // 实际发起预校验的候选（排名序）
+    for (const c of d.ranked || []) {
+      if (needsPreflight(c.ageMs, !acctQuota[c.id]?.err, ageLimit)) {
+        needVerify.add(c.id);
+        if (pfSet.length < (heavy ? 1 : AS_DEFAULTS.maxPreflight)) pfSet.push(c);
+      }
+    }
+    if (pfSet.length) {
+      preflights = pfSet.length;
+      await Promise.all(pfSet.map(async (c) => {
+        const atBefore = quotaSampleAt[c.id] || 0;
+        await loadAcctQuota(c.id, { force: true, quick: true, timeoutSecs: AS_DEFAULTS.preflightTimeoutSec });
+        // 刷新仍失败（网络/风控/业务码）→ 本次不可验证。失败路径会保留旧数据，
+        // 直接读 pct 等于拿过期前的高百分比给死号放行（礼物批量到期日就是这么切进死号的）
+        if (acctQuota[c.id]?.err) { pfErr++; return; }
+        // 「成功但空」的防抖路径不推进采样时间（数据没变新）：同样不可验证——
+        // 否则 flap 期间保留的旧高百分比又会被当作切换依据切进看不见的号
+        if (!((quotaSampleAt[c.id] || 0) > atBefore)) { pfFlap++; return; }
+        const fresh = pctPairOf(c.id);
+        if (fresh.pct == null) return; // 刷到但无可用池 → 不能当依据
+        needVerify.delete(c.id);
+        c.pct = fresh.pct;
+        c.flowed = fresh.flowed;
+        c.tokens = fresh.tokens ?? null;
+        c.thr = thr * (fresh.thrScale ?? 1);
+        c.ageMs = 0;
+      }));
+    }
     for (const c of d.ranked || []) {
       // 切换瞬间的硬闸：候选评估与真正切换之间隔着预校验（秒级），期间用户冻结/
       // 归档了该号就必须跳过——「停靠的号绝不接收自动切换」不依赖评估时刻的快照
@@ -5337,28 +5381,7 @@ async function doAutoSwitch(d, active, cur, lg) {
         asAuditPush("skip-parked", { id: c.id, reason: isFrozen(c.id) ? "frozen" : "archived" });
         continue;
       }
-      if (c.ageMs > ageLimit) {
-        // 重活窗口也保底 1 次预校验（只够榜首）：彻底禁用会让切换在窗口期完全饿死
-        if (preflights >= (heavy ? 1 : AS_DEFAULTS.maxPreflight)) continue;
-        preflights++;
-        const atBefore = quotaSampleAt[c.id] || 0;
-        await loadAcctQuota(c.id, { force: true, quick: true });
-        // 本次刷新仍失败（网络/风控/业务码500无套餐）→ 该候选视为不可用。
-        // 必须先查 err 再读数：失败路径会保留旧数据，直接读 pct 等于拿过期前的
-        // 高百分比给死号放行（礼物批量到期日就是这么切进死号的）
-        if (acctQuota[c.id]?.err) { pfErr++; continue; }
-        // 「成功但空」的防抖路径不会推进采样时间（数据没变新）：预校验把它当
-        // 不可验证——否则 flap 期间保留的旧高百分比又会被当作切换依据切进看不见的号
-        if (!((quotaSampleAt[c.id] || 0) > atBefore)) { pfFlap++; continue; }
-        const fresh = pctPairOf(c.id);
-        // 刷不到（网络/风控/无数据）→ 该候选视为不可用，绝不拿旧数据当依据切过去
-        c.pct = fresh.pct;
-        c.flowed = fresh.flowed;
-        c.tokens = fresh.tokens ?? null;
-        c.thr = thr * (fresh.thrScale ?? 1);
-        c.ageMs = 0;
-        if (c.pct == null) continue;
-      }
+      if (needVerify.has(c.id)) continue; // 预校验未过（失败/空快照/无数据/超出封顶）
       const cThr = c.thr != null && isFinite(c.thr) ? c.thr : thr;
       const okPct = d.degrade ? c.pct > 0 : c.pct >= cThr;
       // 与 evaluate 同口径：双方 token 可比按绝对余量比，否则按百分比；

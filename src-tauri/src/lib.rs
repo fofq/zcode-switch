@@ -287,10 +287,10 @@ fn activation_heartbeat(paths: &Paths, id: &str) {
 }
 
 #[tauri::command]
-async fn get_account_quota(id: String, quick: Option<bool>) -> Result<quota::QuotaOverview, String> {
+async fn get_account_quota(id: String, quick: Option<bool>, timeout_secs: Option<u64>) -> Result<quota::QuotaOverview, String> {
     let paths = Paths::detect();
     let id2 = id.clone();
-    let mut ov = tauri::async_runtime::spawn_blocking(move || store::account_quota(&paths, &id2))
+    let mut ov = tauri::async_runtime::spawn_blocking(move || store::account_quota(&paths, &id2, timeout_secs))
         .await
         .map_err(|e| format!("内部任务失败: {e}"))??;
     if ov.source == "snapshot_empty" {
@@ -306,7 +306,7 @@ async fn get_account_quota(id: String, quick: Option<bool>) -> Result<quota::Quo
                 return None;
             }
             std::thread::sleep(std::time::Duration::from_millis(2500));
-            store::account_quota(&paths, &id2).ok()
+            store::account_quota(&paths, &id2, timeout_secs).ok()
         })
         .await;
         if let Ok(Some(fresh)) = retry {

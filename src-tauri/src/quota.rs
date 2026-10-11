@@ -404,14 +404,39 @@ fn billing_headers(url: &str, token: &str, mid: Option<&str>) -> Vec<(String, St
     }
 }
 
-fn http_get_json(url: &str, token: &str, mid: Option<&str>, retry_429: bool) -> Result<Value, String> {
+/// 额度查询的网络档位：
+/// - 标准档（[`QueryNet::standard`]）：20s 超时、429/3012 重试链、频道全败后走
+///   兜底 token 链——历史行为保持不变；
+/// - 快查档（[`QueryNet::fast`]，切换预校验专用）：短超时、不重试、频道全败即失败。
+///   背景：预校验的慢是「长超时 × 重试链 × 多频道 × 兜底链」叠出来的（10-10 审计
+///   实证：慢切换 ms 28.9–88.9s 全部耗在 2 次串行预校验上），快查档把单号查询
+///   压到个位数秒，失败快进快出，等下一轮决策。
+#[derive(Clone, Copy, Debug)]
+pub struct QueryNet {
+    pub timeout_secs: u64,
+    pub allow_retry: bool,
+    /// 频道（channels）全败后是否继续走候选 token 兜底链（第二串长耗时的来源）
+    pub allow_fallback: bool,
+}
+
+impl QueryNet {
+    pub fn standard() -> Self {
+        Self { timeout_secs: 20, allow_retry: true, allow_fallback: true }
+    }
+    /// 快查档：3–20s 可调（前端预校验传 8s）
+    pub fn fast(timeout_secs: u64) -> Self {
+        Self { timeout_secs: timeout_secs.clamp(3, 20), allow_retry: false, allow_fallback: false }
+    }
+}
+
+fn http_get_json(url: &str, token: &str, mid: Option<&str>, retry_429: bool, timeout_secs: u64) -> Result<Value, String> {
     let retry_delays = [500u64, 1500, 4000];
     let agent = crate::http_agent();
     let headers = billing_headers(url, token, mid);
     let mut last_err: Option<String> = None;
     let mut backoff: std::slice::Iter<'_, u64> = if retry_429 { retry_delays.iter() } else { [].iter() };
     loop {
-        let mut req = agent.get(url).timeout(Duration::from_secs(20));
+        let mut req = agent.get(url).timeout(Duration::from_secs(timeout_secs));
         for (k, v) in &headers {
             req = req.set(k, v);
         }
@@ -535,8 +560,8 @@ fn query_with_token_via(token: &str, fetch: &FetchFn) -> Result<QuotaOverview, S
     Err(best_err.unwrap_or_else(|| crate::i18n::tr("err.quota.fail")))
 }
 
-fn query_with_token(token: &str, mid: Option<&str>) -> Result<QuotaOverview, String> {
-    query_with_token_via(token, &|url, tok| http_get_json(url, tok, mid, true))
+fn query_with_token(token: &str, mid: Option<&str>, net: QueryNet) -> Result<QuotaOverview, String> {
+    query_with_token_via(token, &|url, tok| http_get_json(url, tok, mid, net.allow_retry, net.timeout_secs))
 }
 
 fn business_ok(v: &Value) -> bool {
@@ -545,7 +570,7 @@ fn business_ok(v: &Value) -> bool {
     (code.is_none() || code == Some(200) || code == Some(0)) && success != Some(false)
 }
 
-pub fn query_quota(tokens: &[String], mid: Option<&str>) -> Result<QuotaOverview, String> {
+pub fn query_quota(tokens: &[String], mid: Option<&str>, net: QueryNet) -> Result<QuotaOverview, String> {
     if tokens.is_empty() {
         return Err(crate::i18n::coded("quota_no_token", "err.quota.no_token", &[]));
     }
@@ -553,7 +578,7 @@ pub fn query_quota(tokens: &[String], mid: Option<&str>) -> Result<QuotaOverview
     let mut first_business: Option<String> = None;
     let mut auth_fail = 0usize;
     for t in tokens {
-        match query_with_token(t, mid) {
+        match query_with_token(t, mid, net) {
             Ok(ov) => return Ok(ov),
             Err(e) => {
                 if e.contains("401") {
@@ -566,9 +591,13 @@ pub fn query_quota(tokens: &[String], mid: Option<&str>) -> Result<QuotaOverview
         }
     }
     if auth_fail > 0 && auth_fail == tokens.len() {
-        sleep(Duration::from_millis(1500));
-        if let Ok(ov) = query_with_token(&tokens[0], mid) {
-            return Ok(ov);
+        // 401 复验（sleep + 整轮重查）是常规档的容错；快查档不排队（失败快进快出，
+        // 本轮预校验该候选直接跳过，等下一轮决策）
+        if net.allow_retry {
+            sleep(Duration::from_millis(1500));
+            if let Ok(ov) = query_with_token(&tokens[0], mid, net) {
+                return Ok(ov);
+            }
         }
         return Err(crate::i18n::coded("token_expired", "err.token.expired", &[]));
     }
@@ -886,22 +915,24 @@ fn merge_parts(parts: Vec<QuotaOverview>) -> QuotaOverview {
     }
 }
 
-fn query_channels(channels: &[Channel], mid: Option<&str>) -> Result<QuotaOverview, String> {
-    query_channels_via(channels, &|url, tok| http_get_json(url, tok, mid, true))
+fn query_channels(channels: &[Channel], mid: Option<&str>, net: QueryNet) -> Result<QuotaOverview, String> {
+    query_channels_via(channels, &|url, tok| http_get_json(url, tok, mid, net.allow_retry, net.timeout_secs))
 }
 
 pub fn quota_for_live(home: &Path, creds: &Value, config: Option<&Value>) -> Result<QuotaOverview, String> {
-    quota_for(home, creds, config, None, false)
+    quota_for(home, creds, config, None, false, QueryNet::standard())
 }
 
 /// 快照账号：mid 传账号自己的 virtual_device_mid（切号时也正是它被写进 live telemetry）。
+/// net 由调用方选择：标准档（常规刷新）或快查档（切换预校验，见 [`QueryNet`]）。
 pub fn quota_for_snapshot(
     home: &Path,
     creds: &Value,
     config: Option<&Value>,
     mid: Option<&str>,
+    net: QueryNet,
 ) -> Result<QuotaOverview, String> {
-    quota_for(home, creds, config, mid, true)
+    quota_for(home, creds, config, mid, true, net)
 }
 
 fn quota_for(
@@ -910,17 +941,25 @@ fn quota_for(
     config: Option<&Value>,
     mid: Option<&str>,
     snapshot: bool,
+    net: QueryNet,
 ) -> Result<QuotaOverview, String> {
     let secret = zcrypto::default_secret(home);
     let new_gen = crate::store::new_gen_provider_config(&crate::store::resolve_data_root(home));
     let channels = pick_channels(creds, config, &secret, new_gen);
     if !channels.is_empty() {
-        if let Ok(ov) = query_channels(&channels, mid) {
-            return Ok(mark_snapshot_empty(ov, snapshot));
+        match query_channels(&channels, mid, net) {
+            Ok(ov) => return Ok(mark_snapshot_empty(ov, snapshot)),
+            Err(e) => {
+                // 快查档：频道已试且全败 → 不再走兜底 token 链（那是第二串长耗时的来源）；
+                // 预校验失败即跳过本轮，等下一次常规刷新/下一轮决策
+                if !net.allow_fallback {
+                    return Err(e);
+                }
+            }
         }
     }
     let tokens = candidate_tokens(creds, config, &secret, new_gen);
-    query_quota(&tokens, mid).map(|ov| mark_snapshot_empty(ov, snapshot))
+    query_quota(&tokens, mid, net).map(|ov| mark_snapshot_empty(ov, snapshot))
 }
 
 /// 快照账号“业务成功但空”：服务端没有任何套餐/额度数据。

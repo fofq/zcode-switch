@@ -24,10 +24,15 @@ export const AS_DEFAULTS = {
   activeStaleMs: 45 * 1000,
   /** 候选样本最大年龄（毫秒）：超龄先做切换前预校验 */
   targetFreshMs: 120 * 1000,
+  /** 「干净缓存」信任档（毫秒）：样本 ≤ 该年龄且最近一次刷新成功 → 免预校验直接可用。
+   *  常规轮询本就是 ~5min 一轮，这条把慢切的最大来源（陈旧候选串行预校验）从常态去掉 */
+  trustFreshMs: 5 * 60 * 1000,
   /** 刚切完的保护窗（毫秒）：防止重复触发 */
   hardGraceMs: 20 * 1000,
-  /** 单次决策最多做几次候选预校验（网络开销上限） */
-  maxPreflight: 2,
+  /** 单次决策最多做几次候选预校验（网络开销上限；并行发起） */
+  maxPreflight: 3,
+  /** 预校验额度查询的超时（秒）：快查通道（短超时、不重试、失败快进快出） */
+  preflightTimeoutSec: 8,
 };
 
 /** 额度池条目分类：只保留「额度池/模型」条目，跳过 提示次数 / 使用时长 这类窗口 */
@@ -417,6 +422,31 @@ export function rankTargets(cands, opts = AS_DEFAULTS) {
   return { ranked, degraded: !ok.length && alive.length > 0 };
 }
 
+/** 最紧池是否「最近仍在下降」：取最近两个有 worstPct 的采样，后者小于前者才算。
+ * 用途：worstPct 兜底触发的「有消耗证据」门——长期停在低位的僵尸池（停驻不前）
+ * 不算证据，避免把「最紧池已见底但账号照常工作」误判成即将阻塞（8.16 伪紧急教训）。 */
+export function worstDrainingOf(hist) {
+  if (!Array.isArray(hist)) return false;
+  let latest = null;
+  for (let i = hist.length - 1; i >= 0; i--) {
+    const w = hist[i]?.worstPct;
+    if (w == null || !isFinite(w)) continue;
+    if (latest == null) { latest = w; continue; }
+    return latest < w; // 最新 < 前一条 = 还在下降
+  }
+  return false;
+}
+
+/** 候选是否需要网络预校验：超过正常新鲜门槛且不满足「干净缓存」信任档。
+ * 信任档 = 样本 ≤ trustFreshMs 且最近一次刷新成功（clean）——常规轮询本来就
+ * 5min 一轮，这条与「绝不拿旧数据冒险」不冲突（err/连败的号仍会现查），却把
+ * 慢切的最大来源（陈旧候选串行预校验 30-90s，10-10 审计实证）从常态路径去掉。 */
+export function needsPreflight(ageMs, clean, ageLimit, opts = AS_DEFAULTS) {
+  if (!(Number(ageMs) > ageLimit)) return false;
+  if (clean && Number(ageMs) <= (opts.trustFreshMs ?? AS_DEFAULTS.trustFreshMs)) return false;
+  return true;
+}
+
 /**
  * 纯决策：要不要切、切哪一类目标、什么原因。
  * 网络相关的「切换前预校验」由调用方按 ranked 顺序做（本函数不做 IO）。
@@ -445,6 +475,7 @@ export function evaluate(input) {
   const etaSec = cur?.etaSec != null && isFinite(cur.etaSec) ? cur.etaSec : null;
   // 礼物优先时 cur 带规模折算后的阈值（thr），常规口径回落全局阈值
   const curThr = cur?.thr != null && isFinite(cur.thr) ? cur.thr : thr;
+  const worstPct = cur?.worstPct == null || !isFinite(cur.worstPct) ? null : cur.worstPct;
 
   // 数据新鲜度：陈旧样本不当真值，先要求刷新
   // （例外：「计划不可用」是客户端自己的硬信号、hardDown 是连续刷新失败的硬信号，
@@ -457,15 +488,22 @@ export function evaluate(input) {
   const zero = pct != null && pct <= 0;
   const etaHit = etaSec != null && etaSec <= opts.marginSec;
   const pctHit = pct != null && pct <= curThr;
-  const trigger = hardDown || planDown || zero || pctHit || etaHit || auth;
+  // 兜底（worstHit）：ETA 不可得（时间维度没有证据）时，最紧池跌破阈值且最近仍在
+  // 下降 → 保守触发。乐观口径（bestPct）在「窄池被宽池掩盖」时给不出信号，这条补上；
+  // 但已耗尽池（≤0）与停在低位的僵尸池（最近无下降）不触发——8.16 伪紧急教训。
+  // 非紧急：没时间证据就不着急，照走冷却与「严格更好」门槛。
+  const worstHit = etaSec == null && worstPct != null && worstPct > 0
+    && worstPct <= curThr && cur?.worstDraining === true;
+  const trigger = hardDown || planDown || zero || pctHit || etaHit || auth || worstHit;
   if (!trigger) {
     // 陈旧但还判定为安全 → 依然要求刷新一次（避免用旧数当"安全"证据）
     if (cur?.stale && pctRaw != null) return { action: "refresh", reason: "staleSafe", etaSec };
     return { action: "none", reason: "ok", etaSec };
   }
-  const reason = hardDown ? "hardDown" : planDown ? "planDown" : auth ? "auth" : zero ? "zero" : etaHit ? "eta" : "pct";
-  // 紧急 = 预测式 / 硬信号：不受冷却限制（否则刚切过去就烧完的号要干等）
-  const emergency = reason !== "pct";
+  const reason = hardDown ? "hardDown" : planDown ? "planDown" : auth ? "auth" : zero ? "zero" : etaHit ? "eta" : pctHit ? "pct" : "worst";
+  // 紧急 = 预测式 / 硬信号：不受冷却限制（否则刚切过去就烧完的号要干等）；
+  // worstHit 是「无时间证据的保守兜底」，按非紧急处理（进冷却与严格更好门槛）
+  const emergency = reason !== "pct" && reason !== "worst";
   if (!manual && !emergency && now - lastSwitchAt < opts.cooldownMs) {
     return { action: "wait", reason: "cooldown", etaSec };
   }

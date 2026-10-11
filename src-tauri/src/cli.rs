@@ -161,7 +161,7 @@ pub fn run(args: &[String]) -> (String, i32) {
         },
         "quota" => {
             let res = match flag(rest, "--id") {
-                Some(id) => account_quota(&paths, &id),
+                Some(id) => account_quota(&paths, &id, None),
                 None => live_quota(&paths),
             };
             match res {

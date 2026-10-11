@@ -21,6 +21,8 @@ import {
   noteBlindSwitch,
   noteSightedSwitch,
   BLIND_GAP_MS,
+  worstDrainingOf,
+  needsPreflight,
 } from "../src/autoswitch.js";
 
 let failed = 0;
@@ -525,6 +527,49 @@ for (const at of attempts) {
 }
 ok(allowed <= 8, `实测节律 16 次连切 → 限速后 ≤8 次（实际 ${allowed}）`);
 ok(allowed >= 4, `真实需要的切换不被饿死（实际放行 ${allowed} 次）`);
+
+// ---------- worstPct 兜底触发（ETA 不可得时的保守口径） ----------
+
+// 13a. worstDrainingOf：最近两个有值采样出现下降才算「还在消耗」
+const mkSample = (w, at) => sampleFrom({ bestPct: 60, worstPct: w, totalTokens: null, worstTokens: null, bestTokens: null }, at);
+eq(worstDrainingOf([mkSample(8, t0), mkSample(5, t0 + 60_000)]), true, "最紧池下降 → 有消耗证据");
+eq(worstDrainingOf([mkSample(5, t0), mkSample(5, t0 + 60_000)]), false, "停驻不前 → 无证据");
+eq(worstDrainingOf([mkSample(5, t0), mkSample(8, t0 + 60_000)]), false, "回升（补发）不算消耗");
+eq(worstDrainingOf([mkSample(8, t0), mkSample(5, t0 + 60_000), mkSample(5, t0 + 120_000)]), false, "下降后停驻 → 最新一对持平不触发");
+eq(worstDrainingOf([mkSample(8, t0)]), false, "单采样无法确认消耗");
+eq(worstDrainingOf([]), false, "空历史不触发");
+
+// 13b. ETA 不可得 + 最紧池跌破阈值且还在降 → 保守兜底触发（非紧急，走冷却与严格更好门槛）
+const worstCur = { pct: 60, etaSec: null, level: "ok", ageMs: 1000, worstPct: 10, worstDraining: true };
+const r13b = evaluate({ ...base, cur: { ...worstCur }, candidates: [cand("B", 90)] });
+eq(r13b.action, "switch", "worstHit 兜底触发切换");
+eq(r13b.reason, "worst", "原因=worst");
+eq(r13b.emergency, false, "worstHit 非紧急（无时间证据不着急）");
+const r13b2 = evaluate({ ...base, lastSwitchAt: base.now - 30_000, cur: { ...worstCur }, candidates: [cand("B", 90)] });
+eq(r13b2.action, "wait", "worstHit 受冷却约束");
+eq(r13b2.reason, "cooldown", "worstHit 冷却原因=cooldown");
+
+// 13b-2. 已耗尽池（0）不算「即将阻塞」——8.16 伪紧急教训：僵尸池不得触发
+const r13b3 = evaluate({ ...base, cur: { ...worstCur, worstPct: 0 }, candidates: [cand("B", 90)] });
+eq(r13b3.action, "none", "worstPct=0 不触发（已耗尽池非即将阻塞）");
+// 13b-3. 无下降证据（停驻）→ 不触发
+const r13b4 = evaluate({ ...base, cur: { ...worstCur, worstDraining: false }, candidates: [cand("B", 90)] });
+eq(r13b4.action, "none", "停驻僵尸池不触发");
+// 13b-4. ETA 可得（充裕）时由时间口径统治，worstHit 不接管
+const r13b5 = evaluate({ ...base, cur: { ...worstCur, etaSec: 3600 }, candidates: [cand("B", 90)] });
+eq(r13b5.action, "none", "ETA 充裕时 worstHit 不接管");
+// 13b-5. worstHit 也要求候选严格更好（防拿更差的号替换）
+const r13b6 = evaluate({ ...base, cur: { ...worstCur, pct: 90 }, candidates: [cand("B", 50)] });
+eq(r13b6.action, "wait", "worstHit 也要求候选严格更好");
+eq(r13b6.reason, "noImprove", "worstHit 改善不足原因=noImprove");
+
+// 13c. needsPreflight：信任档 = 干净缓存（≤5min 且最近刷新成功）免预校验
+eq(needsPreflight(60_000, true, AS_DEFAULTS.targetFreshMs), false, "新鲜样本不需预校验");
+eq(needsPreflight(4 * 60_000, true, AS_DEFAULTS.targetFreshMs), false, "干净缓存 ≤5min → 信任档免预校验");
+eq(needsPreflight(4 * 60_000, false, AS_DEFAULTS.targetFreshMs), true, "有失败痕迹（err）→ 仍需预校验");
+eq(needsPreflight(6 * 60_000, true, AS_DEFAULTS.targetFreshMs), true, "超过信任档（>5min）→ 需预校验");
+eq(needsPreflight(2 * 60_000, true, 5 * 60_000), false, "重活窗口（5min 门槛）内干净缓存同样免验");
+eq(needsPreflight(6 * 60_000, true, 5 * 60_000), true, "重活窗口超门槛 → 仍需预校验");
 
 if (failed) {
   console.error(`\n✗ 自动切换决策自检失败：${failed} 项（通过 ${passed}）`);
