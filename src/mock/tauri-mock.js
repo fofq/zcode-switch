@@ -50,6 +50,7 @@ window.__MOCK_PUSH_GIFT_INSTANCE__ = (planId, name) => {
 // 空快照抖动：下一次对该号的额度查询返回「成功但空」（验证空快照防抖）
 const mockQuotaFlap = new Set();
 window.__MOCK_SET_QUOTA_FLAP__ = (id) => mockQuotaFlap.add(id);
+window.__MOCK_CLEAR_QUOTA_FLAP__ = (id) => mockQuotaFlap.delete(id);
 
 // 观测退化：命中集合的账号额度查询持续失败（times 省略=一直失败，直到 clear）。
 // 验证 quota-fail 审计 / hardDown 盲判 / 盲切限速（观测通道退化路径）
