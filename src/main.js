@@ -1749,14 +1749,23 @@ async function loadAcctQuota(id, opts = {}) {
     // 空快照防抖：上游对部分账号的 billing/balance 在「满额」与「成功但空」之间抖动
     // （套餐可见性跟随激活心跳，服务端间歇性返回空快照）。空概览有三种形态：
     // source="snapshot_empty"（快照渠道标记）/ source=""（balance 路径）/ 多渠道拼接，
-    // 因此只认 is_empty 这个跨形态稳定的标志。一次空快照不得推翻已见过的真实额度——
-    // 保留旧数据展示并补一次非 quick 复查（后端非 quick 路径会补激活心跳 + 2.5s 重查，
-    // 可见性即恢复）。快速复查封顶 3 次后转 ~30min 慢复查，期间绝不把「曾有过额度」的
-    // 号判死：76 号 hardDown 误切、重启后新号掉进额度耗尽分组，都是这条路径的受害者。
+    // 因此只认 is_empty 这个跨形态稳定的标志。旧数据仍有未到期套餐时，一次空快照
+    // 不得推翻已见过的真实额度——保留旧数据展示并补一次非 quick 复查（后端非 quick
+    // 路径会补激活心跳 + 2.5s 重查，可见性即恢复）。快速复查封顶 3 次后转 ~30min
+    // 慢复查，期间绝不把「曾有过额度」的号判死：76 号 hardDown 误切、重启后新号掉进
+    // 额度耗尽分组，都是这条路径的受害者。
     const emptySnap = data?.is_empty === true;
     const hasRem = (x) => Number(x?.remaining ?? 0) > 0 || (x?.items || []).some((i) => Number(i.remaining ?? 0) > 0);
     const prevHadQuota = (cur.data?.plans || []).some(hasRem) || hasRem(cur.data);
-    if (emptySnap && prevHadQuota) {
+    // 全过期放行（10-13 取证修复）：旧数据显示「全是已过期套餐」时空快照是终态而非
+    // 可见性抖动——套餐到期后服务器必回空，继续防抖会让这些号永久停在「已过期+残留条」
+    // （实证：quota-flap tries 滚到 25-30、清空永不落地）。放行后空快照走正常落地路径
+    // （is_empty 清空；此后若再领到新套餐，恢复提示照常）。无 plans 的旧数据判不了
+    // 过期，维持防抖（保守）。
+    const prevPlans = cur.data?.plans || [];
+    const prevAllExpired = prevPlans.length > 0 && prevPlans.every((p) => planExpired(p));
+    const expiredClear = emptySnap && prevHadQuota && prevAllExpired;
+    if (emptySnap && prevHadQuota && !prevAllExpired) {
       const tries = (quotaFlapRetry[id] = (quotaFlapRetry[id] || 0) + 1);
       // 可诊断性：成功但空的快照（数据面抖动）也进审计——「刷新刷不新」的另一半原因，
       // 与 quota-fail 一起让观测退化窗口可归因（10-11 排查实证：此前两者无法区分）
@@ -1772,6 +1781,10 @@ async function loadAcctQuota(id, opts = {}) {
       if (!uiLocked()) render();
       return;
     }
+    // 到期清空放行：旧数据「全过期+残留」被空快照推翻 == 清空落地（修复前这条路径
+    // 被防抖挡住，只会记 quota-flap、清空永不发生）。tries=此前累计被挡次数，
+    // 便于对账「已过期长期不清空」的修复点
+    if (expiredClear) asAuditPush("quota-expired-clear", { id, tries: quotaFlapRetry[id] || 0 });
     quotaFlapRetry[id] = 0;
     acctQuota[id] = { data, err: null, code: null, busy: false };
     // 自动冻结号的解冻证据记账：确定耗尽立即解除 / 健康与空数据双计数（见 noteFrozenQuotaSeen）
