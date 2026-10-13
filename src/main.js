@@ -4889,6 +4889,8 @@ function autoArchiveTick() {
     toast(t("m.autoUnarchivedToast", { n: recovered.length }), "ok",
       t("m.autoUnarchivedDetail", { names }));
   }
+  // 归档号残留结算（独立于归档规则开关）：把「全过期」的归档号旧数据落定为已清空
+  settleArchivedQuota();
   let tracking = false;
   for (const a of state?.accounts || []) {
     if (isArchived(a.id)) { if (deadSince[a.id]) { delete deadSince[a.id]; tracking = true; } continue; }
@@ -4944,6 +4946,39 @@ function autoArchiveTick() {
   toast(t("m.autoArchivedToast", { n: hits.length }), "ok",
     t("m.autoArchivedDetail", { names }) + t("m.autoArchivedHint"));
   render();
+}
+
+// 归档号额度结算（10-14）：归档号零自动请求 → 没机会收到「成功但空」把旧数据里的
+// 「已过期+残留」清掉（手动刷新才走 loadAcctQuota，修复 A 覆盖不到这条）。这里用本地
+// 确定性判据（全部套餐已过期；与 noFutureQuota 同口径）把归档号残留数据落定为已清空
+// 展示态，不发任何网络请求——归档语义（零自动请求）保持不变。数据形态 is_empty +
+// source="archived_settled"（与服务器空快照区分，供取证），逐号记 quota-archived-clear
+// 审计。手动解除归档后走正常刷新（若又有新套餐会照常恢复提示）。
+function settleArchivedQuota() {
+  let changed = 0;
+  for (const [id, q] of Object.entries(acctQuota)) {
+    if (!isArchived(id)) continue; // 非归档号由服务器确认路径（到期清空放行）处理
+    const d = q?.data;
+    if (!d || d.is_empty === true || q.busy) continue;
+    const plans = d.plans || [];
+    if (!plans.length || !plans.every((p) => planExpired(p))) continue; // 判不了/还有未到期 → 不动
+    acctQuota[id] = {
+      data: {
+        is_empty: true, source: "archived_settled", items: [], plans: [],
+        refreshed_at: d.refreshed_at ?? null,
+        total: null, used: null, remaining: null, percent_used: null, plan_tier: null, plan_expire: null,
+      },
+      err: null, code: null, busy: false,
+    };
+    asAuditPush("quota-archived-clear", { id, plans: plans.length });
+    changed++;
+  }
+  if (changed) {
+    markQuotaCacheDirty();
+    flushQuotaCache();
+    if (!uiLocked()) render();
+  }
+  return changed;
 }
 
 // 额度状态持久化：重启不丢「上次已知额度/烧速样本」，启动按优先级补刷而不是全量同时打接口
@@ -5535,14 +5570,19 @@ async function sweepTick() {
     // 再按优先级铺开首刷——活跃号立即、有额度号前 2.5 分钟错开、耗尽号延续 60-120 分钟节奏
     // （不停刷：礼物发放时刻并不固定）。冷启动无缓存才退回旧的全量刷新
     const seeded = loadQuotaCache();
+    // 归档号残留结算：启动即在首帧前把「全过期」的归档号旧数据落定为已清空（本地、
+    // 零请求）；运行期由 autoArchiveTick 每 tick 兜底
+    settleArchivedQuota();
     enrollAccounts();
     if (seeded > 0) seedStartupDue();
     // 缓存里以「成功但空」收尾的账号：套餐可见性抖动的受害者（billing/balance 间歇
     // 返回空快照，等一次激活心跳才恢复）。启动即补非 quick 验证（后端会补心跳 +
-    // 2.5s 重查），不等 dead 分组 5-90 分钟的首刷——这就是「重启后要手动刷新才恢复」的根因
+    // 2.5s 重查），不等 dead 分组 5-90 分钟的首刷——这就是「重启后要手动刷新才恢复」的根因。
+    // 归档号除外（10-14）：归档语义=零自动请求，其空态由 settleArchivedQuota 本地落定；
+    // 不排除的话每次启动会对 ~140 个「已归档+空」号各发一次校验 + 激活心跳（00:44 实况）
     let flapVerifyIdx = 0;
     for (const [id, q] of Object.entries(acctQuota)) {
-      if (q?.data?.is_empty === true) {
+      if (q?.data?.is_empty === true && !isArchived(id)) {
         setTimeout(() => { loadAcctQuota(id, { force: true }).finally(() => scheduleNext(id)); }, 3000 + flapVerifyIdx * 2500);
         flapVerifyIdx++;
       }

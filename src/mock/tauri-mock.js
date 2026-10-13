@@ -57,6 +57,10 @@ window.__MOCK_CLEAR_QUOTA_FLAP__ = (id) => mockQuotaFlap.delete(id);
 const mockQuotaFail = new Map(); // id -> 剩余失败次数 | Infinity
 window.__MOCK_SET_QUOTA_FAIL__ = (id, times = Infinity) => mockQuotaFail.set(id, times);
 window.__MOCK_CLEAR_QUOTA_FAIL__ = (id) => mockQuotaFail.delete(id);
+// 额度查询调用记录（冒烟断言用）：get_account_quota 每次调用记一条（id+时间），
+// 上限 500 条——「归档号零自动请求」等不变量断言依赖它（archived-settle 冒烟）
+const mockQuotaCalls = [];
+window.__MOCK_QUOTA_CALLS__ = mockQuotaCalls;
 
 // 信号停摆：live_signals 返回不可用/陈旧（客户端进程退出、日志静默的 mock 形态），
 // 前端自然回落到 HTTP 轮询路径——盲判前置条件「日志不可信」的注入开关
@@ -94,6 +98,8 @@ const commands = {
   async get_state() { return JSON.parse(JSON.stringify(mockState)); },
 
   async get_account_quota({ id }) {
+    mockQuotaCalls.push({ id, t: Date.now() });
+    if (mockQuotaCalls.length > 500) mockQuotaCalls.splice(0, mockQuotaCalls.length - 500);
     await delay(220 + Math.random() * 260);
     // 查询失败注入：与真实后端同形的 "net:" 前缀（errCode 会解析成 net）
     const left = mockQuotaFail.get(id);
@@ -355,7 +361,9 @@ window.__MOCK_EMIT__ = emit;
 try {
   if (!localStorage.getItem("zsw-frozen-ids")) localStorage.setItem("zsw-frozen-ids", JSON.stringify(["acct-15"]));
   if (!localStorage.getItem("zsw-archived-ids")) localStorage.setItem("zsw-archived-ids", JSON.stringify(["acct-12"]));
-  localStorage.removeItem("zsw-quota-cache-v1");
+  // 预览默认每次加载清掉额度缓存（上次会话改动不残留）；冒烟需要跨 reload 验证启动路径
+  // （归档结算）时先置 __MOCK_KEEP_QUOTA_CACHE__=1 保留缓存（archived-settle 冒烟用）
+  if (!localStorage.getItem("__MOCK_KEEP_QUOTA_CACHE__")) localStorage.removeItem("zsw-quota-cache-v1");
 } catch { /* 隐私模式等场景忽略 */ }
 
 console.info("[mock] Tauri IPC 垫片已就绪（纯浏览器预览模式）");
